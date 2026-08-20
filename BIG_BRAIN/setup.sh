@@ -9,8 +9,6 @@ alias run='ros2 launch robot bringup.launch.py'
 alias auto_run='ros2 launch robot bringup.launch.py slam:=true nav2:=true'
 alias sim_run='ros2 launch robot sim_bringup.launch.py'
 alias sim_auto_run='ros2 launch robot sim_bringup.launch.py slam:=true nav2:=true'
-alias run_yolo='src/yolo_vision/.venv/bin/python3 src/yolo_vision/yolo_vision/yolo_node.py'
-
 alias build='colcon build --packages-select robot' 
 alias remove='rm -rf build/robot install/robot'
 alias install_dep='rosdep update && rosdep install --from-paths src --ignore-src -r -y'

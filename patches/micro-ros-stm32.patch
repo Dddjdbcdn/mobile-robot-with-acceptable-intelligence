@@ -1,0 +1,41 @@
+diff --git a/microros_static_library/library_generation/colcon.meta b/microros_static_library/library_generation/colcon.meta
+index 5bb8eff..b87f954 100755
+--- a/microros_static_library/library_generation/colcon.meta
++++ b/microros_static_library/library_generation/colcon.meta
+@@ -43,10 +43,12 @@
+                 "-DRMW_UXRCE_MAX_NODES=1",
+                 "-DRMW_UXRCE_MAX_PUBLISHERS=10",
+                 "-DRMW_UXRCE_MAX_SUBSCRIPTIONS=5",
+-                "-DRMW_UXRCE_MAX_SERVICES=1",
+-                "-DRMW_UXRCE_MAX_CLIENTS=1",
++                "-DRMW_UXRCE_MAX_SERVICES=8",
++                "-DRMW_UXRCE_MAX_CLIENTS=2",
+                 "-DRMW_UXRCE_MAX_HISTORY=4",
+-                "-DRMW_UXRCE_TRANSPORT=custom"
++                "-DRMW_UXRCE_TRANSPORT=custom",
++                "-DRMW_UXRCE_MAX_GUARD_CONDITION=10",
++                "-DRMW_UXRCE_MAX_WAIT_SETS=10"
+             ]
+         }
+     }
+diff --git a/microros_static_library_ide/library_generation/colcon.meta b/microros_static_library_ide/library_generation/colcon.meta
+index dd24e96..649b654 100644
+--- a/microros_static_library_ide/library_generation/colcon.meta
++++ b/microros_static_library_ide/library_generation/colcon.meta
+@@ -43,10 +43,12 @@
+                 "-DRMW_UXRCE_MAX_NODES=1",
+                 "-DRMW_UXRCE_MAX_PUBLISHERS=10",
+                 "-DRMW_UXRCE_MAX_SUBSCRIPTIONS=5",
+-                "-DRMW_UXRCE_MAX_SERVICES=1",
+-                "-DRMW_UXRCE_MAX_CLIENTS=1",
++                "-DRMW_UXRCE_MAX_SERVICES=8",
++                "-DRMW_UXRCE_MAX_CLIENTS=2",
+                 "-DRMW_UXRCE_MAX_HISTORY=4",
+-                "-DRMW_UXRCE_TRANSPORT=custom"
++                "-DRMW_UXRCE_TRANSPORT=custom",
++                "-DRMW_UXRCE_MAX_GUARD_CONDITION=10",
++                "-DRMW_UXRCE_MAX_WAIT_SETS=10"
+             ]
+         }
+     }
+

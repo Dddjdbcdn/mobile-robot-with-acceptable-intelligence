@@ -41,6 +41,10 @@ log/
 .settings/
 Debug/
 Release/
+MICRO_ROS/Drivers/
+MICRO_ROS/Middlewares/
+MICRO_ROS/startup_*.s
+MICRO_ROS/*_FLASH.ld
 
 # Downloaded third-party repositories
 BIG_BRAIN/src/micro_ros_setup/

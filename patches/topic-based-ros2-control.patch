@@ -1,0 +1,79 @@
+diff --git a/doc/user.md b/doc/user.md
+index e9a342d..fdb7be0 100644
+--- a/doc/user.md
++++ b/doc/user.md
+@@ -16,6 +16,8 @@ The topic_based system interface has a few `ros2_control` urdf tags to customize
+ 
+ * joint_commands_topic: (default: "/robot_joint_command"). Example: `<param name="joint_commands_topic">/my_topic_joint_commands</param>`.
+ * joint_states_topic: (default: "/robot_joint_states"). Example: `<param name="joint_states_topic">/my_topic_joint_states</param>`.
++* joint_commands_qos: (default: "RELIABLE"). QoS profile for the joint commands publisher. Supported values: "BEST_EFFORT", "RELIABLE", "SENSOR_DATA", "SYSTEM_DEFAULT". Example: `<param name="joint_commands_qos">BEST_EFFORT</param>`.
++* joint_states_qos: (default: "SENSOR_DATA"). QoS profile for the joint states subscriber. Supported values: "BEST_EFFORT", "RELIABLE", "SENSOR_DATA", "SYSTEM_DEFAULT". Example: `<param name="joint_states_qos">BEST_EFFORT</param>`.
+ * trigger_joint_command_threshold: (default: 1e-5). Used to avoid spamming the joint command topic when the difference between the current joint state and the joint command is smaller than this value, set to -1 to always send the joint command. Example: `<param name="trigger_joint_command_threshold">0.001</param>`.
+ * sum_wrapped_joint_states: (default: "false"). Used to track the total rotation for joint states the values reported on the `joint_commands_topic` wrap from 2*pi to -2*pi when rotating in the positive direction. (Isaac Sim only reports joint states from 2*pi to -2*pi) Example: `<param name="sum_wrapped_joint_states">true</param>`.
+ 
+@@ -34,6 +36,8 @@ If your robot description support mock_components you only need to change `<plug
+                 <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+                 <param name="joint_commands_topic">/topic_based_joint_commands</param>
+                 <param name="joint_states_topic">/topic_based_joint_states</param>
++                <param name="joint_commands_qos">BEST_EFFORT</param>
++                <param name="joint_states_qos">BEST_EFFORT</param>
+                 <param name="sum_wrapped_joint_states">true</param>
+             </hardware>
+             <joint name="joint_1">
+diff --git a/src/topic_based_system.cpp b/src/topic_based_system.cpp
+index 67a9ec9..d973b35 100644
+--- a/src/topic_based_system.cpp
++++ b/src/topic_based_system.cpp
+@@ -134,6 +134,31 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
+     return default_value;
+   };
+ 
++  // Helper function to parse QoS profile from string
++  const auto get_qos_profile = [](const std::string& qos_string) -> rclcpp::QoS {
++    if (qos_string == "BEST_EFFORT")
++    {
++      return rclcpp::QoS(10).best_effort();
++    }
++    else if (qos_string == "RELIABLE")
++    {
++      return rclcpp::QoS(10).reliable();
++    }
++    else if (qos_string == "SENSOR_DATA")
++    {
++      return rclcpp::SensorDataQoS();
++    }
++    else if (qos_string == "SYSTEM_DEFAULT")
++    {
++      return rclcpp::SystemDefaultsQoS();
++    }
++    else
++    {
++      // Default to RELIABLE with depth 10
++      return rclcpp::QoS(10);
++    }
++  };
++
+   // Add random ID to prevent warnings about multiple publishers within the same node
+   rclcpp::NodeOptions options;
+   options.arguments({ "--ros-args", "-r", "__node:=topic_based_ros2_control_" + info_.name });
+@@ -145,10 +170,17 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
+     trigger_joint_command_threshold_ = std::stod(it->second);
+   }
+ 
++  // Get QoS profiles from parameters
++  std::string joint_commands_qos_str = get_hardware_parameter("joint_commands_qos", "RELIABLE");
++  std::string joint_states_qos_str = get_hardware_parameter("joint_states_qos", "SENSOR_DATA");
++
++  rclcpp::QoS joint_commands_qos = get_qos_profile(joint_commands_qos_str);
++  rclcpp::QoS joint_states_qos = get_qos_profile(joint_states_qos_str);
++
+   topic_based_joint_commands_publisher_ = node_->create_publisher<sensor_msgs::msg::JointState>(
+-      get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), rclcpp::QoS(1));
++      get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), joint_commands_qos);
+   topic_based_joint_states_subscriber_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+-      get_hardware_parameter("joint_states_topic", "/robot_joint_states"), rclcpp::SensorDataQoS(),
++      get_hardware_parameter("joint_states_topic", "/robot_joint_states"), joint_states_qos,
+       [this](const sensor_msgs::msg::JointState::SharedPtr joint_state) { latest_joint_state_ = *joint_state; });
+ 
+   // if the values on the `joint_states_topic` are wrapped between -2*pi and 2*pi (like they are in Isaac Sim)
+

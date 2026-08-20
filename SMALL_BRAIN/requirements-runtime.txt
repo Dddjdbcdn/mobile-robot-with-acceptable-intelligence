@@ -18,5 +18,6 @@ torch==2.5.1+cpu
 torchvision==0.20.1+cpu
 transformers==4.37.2
 typeguard==4.4.4
+ultralytics==8.4.121
 websockets==16.0
 yapf==0.40.2

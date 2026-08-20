@@ -1,0 +1,14 @@
+diff --git a/astra_camera/launch/astra.launch.xml b/astra_camera/launch/astra.launch.xml
+index d3b9c15..3e94a40 100644
+--- a/astra_camera/launch/astra.launch.xml
++++ b/astra_camera/launch/astra.launch.xml
+@@ -32,7 +32,7 @@
+     <arg name="flip_ir" default="false"/>
+     <arg name="ir_qos" default="default"/>
+     <arg name="ir_camera_info_qos" default="default"/>
+-    <arg name="publish_tf" default="true"/>
++    <arg name="publish_tf" default="false"/>
+     <arg name="tf_publish_rate" default="10.0"/>
+     <arg name="ir_info_url" default=""/>
+     <arg name="color_info_url" default=""/>
+

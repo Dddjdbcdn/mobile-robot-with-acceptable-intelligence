@@ -1,0 +1,47 @@
+diff --git a/nav2_costmap_2d/plugins/range_sensor_layer.cpp b/nav2_costmap_2d/plugins/range_sensor_layer.cpp
+index ffbe8a3e..b925f720 100644
+--- a/nav2_costmap_2d/plugins/range_sensor_layer.cpp
++++ b/nav2_costmap_2d/plugins/range_sensor_layer.cpp
+@@ -362,11 +362,21 @@ void RangeSensorLayer::updateCostmap(
+   // Limit Bounds to Grid
+   bx0 = std::max(0, bx0);
+   by0 = std::max(0, by0);
+-  bx1 = std::min(static_cast<int>(size_x_), bx1);
+-  by1 = std::min(static_cast<int>(size_y_), by1);
++  bx1 = std::min(static_cast<int>(size_x_) - 1, bx1);
++  by1 = std::min(static_cast<int>(size_y_) - 1, by1);
+ 
+-  for (unsigned int x = bx0; x <= (unsigned int)bx1; x++) {
+-    for (unsigned int y = by0; y <= (unsigned int)by1; y++) {
++  // The sensor cone may be completely outside the costmap.
++  // In that case there are no cells to update.
++  if (bx0 > bx1 || by0 > by1) {
++    return;
++  }
++
++  for (unsigned int x = static_cast<unsigned int>(bx0);
++    x <= static_cast<unsigned int>(bx1); x++)
++  {
++    for (unsigned int y = static_cast<unsigned int>(by0);
++      y <= static_cast<unsigned int>(by1); y++)
++    {
+       bool update_xy_cell = true;
+ 
+       // Unless inflate_cone_ is set to 100 %, we update cells only within the
+diff --git a/nav2_planner/src/planner_server.cpp b/nav2_planner/src/planner_server.cpp
+index 680140a4..80a69ed3 100644
+--- a/nav2_planner/src/planner_server.cpp
++++ b/nav2_planner/src/planner_server.cpp
+@@ -713,9 +713,11 @@ void PlannerServer::isPathValid(
+         cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE))
+       {
+         response->is_valid = false;
++        response->invalid_pose_indices.push_back(static_cast<int32_t>(i));
+         break;
+       } else if (cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
+         response->is_valid = false;
++        response->invalid_pose_indices.push_back(static_cast<int32_t>(i));
+         break;
+       }
+     }
+
