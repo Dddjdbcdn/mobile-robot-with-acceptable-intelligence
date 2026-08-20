@@ -1,0 +1,72 @@
+slam_toolbox:
+  ros__parameters:
+
+    # Plugin params
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ROS Parameters
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan
+    use_map_saver: true
+    mode: mapping 
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02 #if 0 never publishes odometry
+    map_update_interval: 10.0 # less frequent reduces jitter
+    resolution: 0.05
+    restamp_tf: false
+    min_laser_range: 0.2 #for rastering images
+    max_laser_range: 10.0 #for rastering images
+    minimum_time_interval: 0.5
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000 #// program needs a larger stack size to serialize large maps
+    enable_interactive_mode: true
+
+    # General Parameters
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2 # distance change to drop a node (increase to reduce jitter)
+    minimum_travel_heading: 0.2 # angle change to drop a node
+    check_min_dist_and_heading_precisely: false
+    scan_buffer_size: 20 # number of scans to keep in buffer
+    scan_buffer_maximum_scan_distance: 8.0 # maximum distance to keep a scan in buffer
+    link_match_minimum_response_fine: 0.2 # increase to be more skeptical of link formation
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true 
+    loop_match_minimum_chain_size: 10 # number of high-scoring nodes needed to trust a loop        
+    loop_match_maximum_variance_coarse: 3.0  
+    loop_match_minimum_response_coarse: 0.7 # increase to be more skeptical of loop closure
+    loop_match_minimum_response_fine: 0.8 # increase to be more skeptical of loop closure
+
+    # Local scan matching
+    correlation_search_space_dimension: 0.3 # area to search
+    correlation_search_space_resolution: 0.01 # resolution of the search space
+    correlation_search_space_smear_deviation: 0.1 # blurring the wall
+
+    # Global loop closure
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # Scan Matcher Parameters
+    distance_variance_penalty: 0.6 # increase if we trust the odom     
+    angle_variance_penalty: 0.8 # increase if we trust the odom    
+
+    fine_search_angle_offset: 0.00349     
+    coarse_search_angle_offset: 0.349   
+    coarse_angle_resolution: 0.0349        
+    minimum_angle_penalty: 0.9 
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 2
+    occupancy_threshold: 0.1

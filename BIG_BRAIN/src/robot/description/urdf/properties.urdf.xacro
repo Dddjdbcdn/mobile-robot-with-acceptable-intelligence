@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Dimensions -->
+
+  <!-- Base  -->
+
+  <xacro:property name="base_length"   value="0.24"/>
+  <xacro:property name="base_width"   value="0.24"/>
+  <xacro:property name="base_height"   value="0.14"/>
+  <xacro:property name="mass_base" value="4"/>
+
+  <!-- Wheels -->
+
+  <xacro:property name="wheel_radius" value="0.0325"/>
+  <xacro:property name="wheel_thickness" value="0.026"/>
+  <xacro:property name="wheel_z_offset" value="0.0305"/> <!-- Wheel center to Base bottom -->
+  <xacro:property name="wheel_y_offset" value="0.012"/> <!-- Wheel inner to Base outer -->
+  <xacro:property name="wheel_x_offset" value="0.06"/> <!-- Wheel center to Base front -->
+  <xacro:property name="mass_wheel" value="0.1"/>
+  
+  <!-- Lidar -->
+
+  <xacro:property name="lidar_height" value="0.04"/>
+  <xacro:property name="lidar_radius" value="0.025"/>
+  <xacro:property name="lidar_z_offset" value="0.119"/> <!-- Lidar center to Base upper -->
+  <xacro:property name="lidar_x_offset" value="0.067"/> <!-- Lidar center to Base center -->
+
+  <!-- Depth Camera -->
+  <xacro:property name="camera_length" value="0.033"/>
+  <xacro:property name="camera_width" value="0.085"/>
+  <xacro:property name="camera_height" value="0.027"/>
+  <xacro:property name="camera_z_offset" value="0.028"/> <!-- Camera upper to Base upper -->
+  <xacro:property name="camera_x_offset" value="0.023"/> <!-- Camera front to Base front -->
+
+  <!-- TOF -->
+  <xacro:property name="tof_length" value="0.003"/>
+  <xacro:property name="tof_width" value="0.015"/>
+  <xacro:property name="tof_height" value="0.01"/>
+  <xacro:property name="tof_z_offset" value="0.01"/> <!-- TOF center to camera bottom -->
+  <xacro:property name="tof_x_offset" value="0.006"/> <!-- TOF centor to camera center -->
+
+  <!-- IMU -->
+  <xacro:property name="imu_z_offset" value="0.0"/> <!-- MPU to Base bottom -->
+
+  <!-- Ultrasonic -->
+  <xacro:property name="ultrasonic_x_offset" value="0.012"/> <!-- Ultrasonic center to Base front -->
+  <xacro:property name="side_ultrasonic_y_offset" value="0.105"/> <!-- Side ultrasonic center to Base center -->
+  <xacro:property name="ultrasonic_z_offset" value="0.012"/> <!-- Ultrasonic center to Base bottom -->
+
+  <xacro:property name="ultrasonic_z_angle" value="0.43"/> <!-- Side ultrasonic angle to Base front -->
+  <xacro:property name="ultrasonic_length" value="0.01"/>
+  <xacro:property name="ultrasonic_width" value="0.04"/>
+  <xacro:property name="ultrasonic_height" value="0.02"/>
+
+  <!-- Materials -->
+  <material name="blue">
+    <color rgba="0.2 0.4 0.8 1.0"/>
+  </material>
+
+  <material name="green">
+    <color rgba="0.2 0.7 0.3 1.0"/>
+  </material>
+
+  <material name="orange">
+    <color rgba="0.9 0.5 0.1 1.0"/>
+  </material>
+
+  <material name="red">
+    <color rgba="0.8 0.1 0.1 1.0"/>
+  </material>
+  
+
+</robot>

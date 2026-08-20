@@ -1,0 +1,79 @@
+[
+  {
+    "type": "function",
+    "name": "get_vision",
+    "description": "Capture and inspect the current camera frame. Use this when the user asks what is visible, whether something is visible, to look at object, describe the scene, or when visual context is needed before deciding what to do.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["reasoning","find_object","look_at_object"],
+          "description": "Type of action to do after vision inspection. Call find_object when the user asks whether an object is in view, or to search for it. Call look_at_object when the user asks to look or track an object. Call reasoning for other general questions"
+        },
+        "query": {
+          "type": ["string", "null"],
+          "description": "A self-contained visual inspection instruction that matches the user's requested output exactly. Keep the requested answer minimal unless the user asks for detail. Do not add unrelated environment description. The query must preserve the user's requested level of detail. By default, request the shortest direct answer that fully satisfies the user. Do not request a general scene description unless the user explicitly asks for one. Elaborate only when the user explicitly asks for details, explanation, description, reasoning, or a full scene analysis."
+        },
+        "target": {
+          "type": ["string", "null"],
+          "description": "The target object for find_object or look_at_object action. OUTPUT TARGET AS PLAIN TEXT only, no dict, array. Keep it as concise and accurate as possible."
+        }
+      },
+      "required": ["action","query","target"],
+      "additionalProperties": false
+    }
+  },
+  {
+  "type": "function",
+  "name": "inband_visual_search",
+  "description": "Verify whether the target is within the camera frame",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "result": {
+        "type": "string",
+        "description": "Use found when an object is visually clear or plausibly resembles the target. not_found means totally absent",
+        "enum": ["found","not_found"]
+      },
+      "target_hint": {
+        "type": "string",
+        "enum": ["front", "back", "left", "right", "none"],
+        "description": "The possible position of the target relative to the robot given by the user. OUTPUT NONE IF YOU FOUND THE TARGET, OR THE USER DOES NOT GIVE A HINT"
+      }
+    },
+    "required": [
+      "result",
+      "target_hint"
+    ],
+    "additionalProperties": false
+    }
+  },
+  {
+  "type": "function",
+  "name": "stop_visual_search",
+  "description": "Stop the running visual search",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+    }
+  },
+  {
+  "type": "function",
+  "name": "stop_object_tracking",
+  "description": "Call this when the user ask you to stop tracking an object",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+    }
+  },
+  {
+  "type": "function",
+  "name": "capture_depth",
+  "description": "Call this when the user ask you to capture the the depth of the current image. This would capture the current frame and run depth anything on it",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+    }
+  }
+]

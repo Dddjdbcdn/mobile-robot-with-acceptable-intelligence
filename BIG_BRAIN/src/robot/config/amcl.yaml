@@ -1,0 +1,56 @@
+amcl:
+  ros__parameters:
+    set_initial_pose: true
+    initial_pose: [0.0, 0.0, 0.0, 0.0]
+
+    base_frame_id: "base_footprint"
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    scan_topic: /scan
+
+    robot_model_type: "nav2_amcl::DifferentialMotionModel" # Different models have different parameters
+    laser_model_type: "likelihood_field" # better than "beam" for imperfect maps
+    laser_likelihood_max_dist: 2.0
+    pf_pub_visualization: true
+
+    # Approximated error of odometry
+    alpha1: 0.05 # rot from rot 
+    alpha2: 0.02 # rot from trans
+    alpha3: 0.05 # trans from trans
+    alpha4: 0.02 # trans from rot
+    alpha5: 0.0 # trans from sideway
+
+    #Update frequency
+    update_min_a: 0.2 # Mininum angle to trigger update
+    update_min_d: 0.2 # Mininum distance to trigger update
+
+    z_hit: 0.9 # Weight of the laser hitting known obstacles
+    z_rand: 0.1 # Weight of random noise, z_hit + z_rand = 1.0
+    sigma_hit: 0.1 # Weight of laser inaccuracy 
+ 
+    # Number of particles (increase for bigger maps, decrease for faster computation)
+    max_particles: 2000
+    min_particles: 500
+
+    # Recovery parameters (scatter more particles when fast memory drops below slow memory)
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
+
+    # Depends on Lidar and computer capabilities
+    laser_max_range: 100.0
+    laser_min_range: -1.0
+    max_beams: 100
+
+    pf_err: 0.05
+    pf_z: 0.99
+    random_seed: -1
+    resample_interval: 1
+    save_pose_rate: 0.5
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    introspection_mode: "disabled"
+
+map_server:
+  ros__parameters:
+    yaml_filename: "/home/nguyendang/ROS2/full-stack-mobile-robot-with-acceptable-intelligence/BIG_BRAIN/src/robot/map/my_map.yaml"
+    introspection_mode: "disabled"

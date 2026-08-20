@@ -1,0 +1,38 @@
+[
+    {
+        "type": "function",
+        "name": "update_memory",
+        "description": "Call this to save permanent information. Use 'facts' for general knowledge, and 'identity updates' for behavioral tweaks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["facts", "identity updates"],
+                    "description": "The category to save the information to."
+                },
+                "new_info": {
+                    "type": "string",
+                    "description": "The exact fact or behavioral tweak to remember."
+                }
+            },
+            "required": ["category", "new_info"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "fetch_memory",
+        "description": "Call this to search or retrieve stored facts, preferences, or identity tweaks from the memory database when the user asks about past context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["facts", "identity updates"],
+                    "description": "The category to look for the information."
+                }
+            },
+            "required": ["category"]
+        }
+    }
+]

@@ -1,0 +1,90 @@
+[
+    {
+        "type": "function",
+        "name": "blind_move",
+        "description": "Commands the robot to physically move by setting destination and velocity. YOU MUST CALL THIS WHEN THE USER TELL YOU TO ROTATE OR NUDGE",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "linear_velocity": {
+                    "type": "number",
+                    "description": "Forward/backward speed in meters per second (m/s). Range: [-0.5, 0.5]. Positive values move the robot forward, negative values move it backward. Try to keep the linear velocity absolute value above 0.05 m/s to overcome friction"
+                },
+                "distance": {
+                    "type": "number",
+                    "description": "Distance to travel linearly in meters (m). Range: [0.0,0.5]. The direction (forward or backward) is determined inside the linear velocity property."
+                },
+                "angular_velocity": {
+                    "type": "number",
+                    "description": "Rotational speed in radians per second (rad/s). Range: [-3.0, 3.0]. Positive values rotate counter-clockwise (left), negative values rotate clockwise (right). Try to keep the angular velocity absolute above value 0.5 rad/s to overcome friction"
+                },
+                "angle": {
+                    "type": "number",
+                    "description": "Angle to rotate in radians (rad). Range: [0.0, 6.283]. The direction (clockwise or counterclockwise) is determined inside the angular velocity property."
+                }
+            },
+            "required": [
+                "linear_velocity",
+                "distance",
+                "angular_velocity",
+                "angle"
+            ],
+            "additionalProperties": false
+        }
+    },
+    {
+        "type": "function",
+        "name": "navigate_to_pose",
+        "description": "Send a navigation goal to move the robot to a specific location. Coordinates are strictly relative to the robot's current position (x is forward, y is left). The robot will plan a path and move autonomously in the background. Returns immediately with a started status; you will receive a telemetry event when the destination is reached. Use stop_motors to abort.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "Distance to move FORWARD in meters. Positive values are in front of the robot, negative values are behind it."
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Distance to move LEFT in meters. Positive values are to the left of the robot, negative values are to the right."
+                },
+                "angle": {
+                    "type": "number",
+                    "description": "The final heading/yaw the robot should have upon arriving, measured in radians relative to its current forward direction. Use 0.0 to keep facing the same direction, or adjust based on where the robot needs to look."
+                }
+            },
+            "required": [
+                "x",
+                "y",
+                "angle"
+            ],
+            "additionalProperties": false
+        }
+    },
+    {
+        "type": "function",
+        "name": "approach_object",
+        "description": "Call this to start approaching an object.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "type": "function",
+        "name": "stop_motors",
+        "description": "Call this function to immediately stop motors and abort any navigation goal. Only use this upon request.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "type": "function",
+        "name": "center_robot",
+        "description": "Call this function when you want to rotate your robot body to align with the camera. Call this upon request or to get ready for approaching an object",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]

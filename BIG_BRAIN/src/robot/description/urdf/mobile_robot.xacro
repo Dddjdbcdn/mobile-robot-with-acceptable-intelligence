@@ -1,0 +1,266 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mobile_robot">
+
+  <xacro:include filename="inertia.urdf.xacro"/>
+  <xacro:include filename="properties.urdf.xacro"/>
+  <xacro:include filename="ros2_control.urdf.xacro"/>
+
+  <!-- ==================== Base Link ==================== -->
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+      <parent link="base_footprint"/>
+      <child link="base_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:property name="t" value="0.02"/>
+  
+  <xacro:property name="z_center" value="${wheel_radius + wheel_z_offset + base_height/2}"/>
+
+  <xacro:macro name="extrusion_beam" params="size_x size_y size_z pos_x pos_y pos_z">
+    <visual>
+      <origin xyz="${pos_x} ${pos_y} ${pos_z}" rpy="0 0 0"/>
+      <geometry><box size="${size_x} ${size_y} ${size_z}"/></geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="${pos_x} ${pos_y} ${pos_z}" rpy="0 0 0"/>
+      <geometry><box size="${size_x} ${size_y} ${size_z}"/></geometry>
+    </collision>
+  </xacro:macro>
+
+  <link name='base_link'>
+    
+    <xacro:extrusion_beam size_x="${t}" size_y="${t}" size_z="${base_height}" 
+                          pos_x="${base_length/2 - t/2}" pos_y="${base_width/2 - t/2}" pos_z="${z_center}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${t}" size_z="${base_height}" 
+                          pos_x="${base_length/2 - t/2}" pos_y="-${base_width/2 - t/2}" pos_z="${z_center}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${t}" size_z="${base_height}" 
+                          pos_x="-${base_length/2 - t/2}" pos_y="${base_width/2 - t/2}" pos_z="${z_center}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${t}" size_z="${base_height}" 
+                          pos_x="-${base_length/2 - t/2}" pos_y="-${base_width/2 - t/2}" pos_z="${z_center}"/>
+
+    <xacro:extrusion_beam size_x="${base_length - 2*t}" size_y="${t}" size_z="${t}" 
+                          pos_x="0" pos_y="${base_width/2 - t/2}" pos_z="${z_center + base_height/2 - t/2}"/>
+    <xacro:extrusion_beam size_x="${base_length - 2*t}" size_y="${t}" size_z="${t}" 
+                          pos_x="0" pos_y="-${base_width/2 - t/2}" pos_z="${z_center + base_height/2 - t/2}"/>
+    <xacro:extrusion_beam size_x="${base_length - 2*t}" size_y="${t}" size_z="${t}" 
+                          pos_x="0" pos_y="${base_width/2 - t/2}" pos_z="${z_center - base_height/2 + t/2}"/>
+    <xacro:extrusion_beam size_x="${base_length - 2*t}" size_y="${t}" size_z="${t}" 
+                          pos_x="0" pos_y="-${base_width/2 - t/2}" pos_z="${z_center - base_height/2 + t/2}"/>
+
+    <xacro:extrusion_beam size_x="${t}" size_y="${base_width - 2*t}" size_z="${t}" 
+                          pos_x="${base_length/2 - t/2}" pos_y="0" pos_z="${z_center + base_height/2 - t/2}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${base_width - 2*t}" size_z="${t}" 
+                          pos_x="-${base_length/2 - t/2}" pos_y="0" pos_z="${z_center + base_height/2 - t/2}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${base_width - 2*t}" size_z="${t}" 
+                          pos_x="${base_length/2 - t/2}" pos_y="0" pos_z="${z_center - base_height/2 + t/2}"/>
+    <xacro:extrusion_beam size_x="${t}" size_y="${base_width - 2*t}" size_z="${t}" 
+                          pos_x="-${base_length/2 - t/2}" pos_y="0" pos_z="${z_center - base_height/2 + t/2}"/>
+
+    <inertial>
+      <origin xyz="0 0 ${z_center}" rpy="0 0 0"/>
+      <mass value="${mass_base}"/>
+      <xacro:box_inertia mass="${mass_base}" x="${base_length}" y="${base_width}" z="${base_height}"/>
+    </inertial>
+  </link>
+
+  <!-- ==================== Left Wheel ==================== -->
+  <joint name='left_wheel_joint' type='continuous'>
+    <parent link='base_link'/>
+    <child link='left_wheel'/>
+    <origin xyz="${base_length/2 - wheel_x_offset} ${base_width/2 + wheel_y_offset + wheel_thickness/2} ${wheel_radius}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name='left_wheel'>
+    <visual>
+      <origin xyz="0 0 0" rpy="${-pi/2} 0 0"/>
+      <geometry><cylinder radius="${wheel_radius}" length="${wheel_thickness}"/></geometry>
+      <material name="blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <geometry><cylinder radius="${wheel_radius}" length="${wheel_thickness}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <mass value="${mass_wheel}"/>
+      <xacro:cylinder_inertia mass="${mass_wheel}" radius="${wheel_radius}" length="${wheel_thickness}"/>
+    </inertial>
+  </link>
+
+  <!-- ==================== Right Wheel ==================== -->
+  <joint name='right_wheel_joint' type='continuous'>
+    <parent link='base_link'/>
+    <child link='right_wheel'/>
+    <origin xyz="${base_length/2 - wheel_x_offset} ${-base_width/2 - wheel_y_offset - wheel_thickness/2} ${wheel_radius}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name='right_wheel'>
+    <visual>
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <geometry><cylinder radius="${wheel_radius}" length="${wheel_thickness}"/></geometry>
+      <material name="blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <geometry><cylinder radius="${wheel_radius}" length="${wheel_thickness}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <mass value="${mass_wheel}"/>
+      <xacro:cylinder_inertia mass="${mass_wheel}" radius="${wheel_radius}" length="${wheel_thickness}"/>
+    </inertial>
+  </link>
+  
+  <!-- ==================== Lidar ==================== -->
+
+<joint name="lidar_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="lidar"/>
+  <origin xyz="${-lidar_x_offset} 0 ${wheel_radius + wheel_z_offset + base_height + lidar_z_offset}" rpy="0 0 ${pi}"/>
+</joint>
+
+<link name="lidar">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry><cylinder radius="${lidar_radius}" length="${lidar_height}"/></geometry>
+    <material name="green"/>
+  </visual>
+   <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="${lidar_radius}" length="${lidar_height}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <xacro:cylinder_inertia mass="0.01" radius="${lidar_radius}" length="${lidar_height}"/>
+    </inertial>
+</link>
+
+<!-- ==================== Depth Camera ==================== -->
+
+<joint name="camera_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="camera_link"/>
+  <origin xyz="${base_length/2 - camera_x_offset} 0 ${wheel_radius + wheel_z_offset + base_height - camera_z_offset - camera_height/2}" rpy="0 0 0"/>
+</joint>
+
+<link name='camera_link'>
+    <visual>
+      <origin xyz="${-camera_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${camera_length} ${camera_width} ${camera_height}"/>
+      </geometry>
+      <material name="green"/>
+    </visual>
+    <collision>
+      <origin xyz="${-camera_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${camera_length} ${camera_width} ${camera_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="${-camera_length/2} 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <xacro:box_inertia mass="0.01" x="${camera_length}" y="${camera_width}" z="${camera_height}"/>
+    </inertial>
+  </link>
+
+<!-- ==================== Optical Frame ==================== -->
+<joint name="camera_depth_optical_joint" type="fixed">
+  <parent link="camera_link"/>
+  <child link="camera_depth_optical_frame"/>
+  <!-- Pitch -90° to rotate X→forward, Y→down, Z→right (depth camera convention) -->
+  <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+</joint>
+
+<link name="camera_depth_optical_frame"/>
+
+<!-- ==================== TOF ==================== -->
+
+<joint name="tof_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="tof_link"/>
+  <origin xyz="${base_length/2 - camera_x_offset + tof_x_offset} 0 ${wheel_radius + wheel_z_offset + base_height - camera_z_offset - camera_height - tof_z_offset}" rpy="0 0 0"/>
+</joint>
+
+<link name='tof_link'>
+    <visual>
+      <origin xyz="${-tof_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${tof_length} ${tof_width} ${tof_height}"/>
+      </geometry>
+      <material name="green"/>
+    </visual>
+    <collision>
+      <origin xyz="${-tof_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${tof_length} ${tof_width} ${tof_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="${-tof_length/2} 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <xacro:box_inertia mass="0.01" x="${tof_length}" y="${tof_width}" z="${tof_height}"/>
+    </inertial>
+</link>
+
+<!-- ==================== IMU ==================== -->
+<joint name="imu_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="imu_link"/>
+  <origin xyz="0 0 ${wheel_radius + wheel_z_offset + imu_z_offset}" rpy="0 0 0"/>
+</joint>
+
+<link name="imu_link"/>
+
+<!-- ==================== Ultrasonic Left ==================== -->
+<joint name="ultrasonic_left_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="ultrasonic_left_link"/>
+  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 ${ultrasonic_z_angle}"/>
+</joint>
+
+<link name="ultrasonic_left_link">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    </geometry>
+    <material name="green"/>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    </geometry>
+  </collision>
+  <inertial>
+    <mass value="0.01"/>
+    <xacro:box_inertia mass="0.01" x="${ultrasonic_length}" y="${ultrasonic_width}" z="${ultrasonic_height}"/>
+  </inertial>
+</link>
+
+<!-- ==================== Ultrasonic Right ==================== -->
+<joint name="ultrasonic_right_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="ultrasonic_right_link"/>
+  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${-side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 0.05"/>
+</joint>
+
+<link name="ultrasonic_right_link">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    </geometry>
+    <material name="green"/>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    </geometry>
+  </collision>
+  <inertial>
+    <mass value="0.01"/>
+    <xacro:box_inertia mass="0.01" x="${ultrasonic_length}" y="${ultrasonic_width}" z="${ultrasonic_height}"/>
+  </inertial>
+</link>
+</robot>

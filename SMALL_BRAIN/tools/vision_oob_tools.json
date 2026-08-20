@@ -1,0 +1,55 @@
+[
+  {
+  "type": "function",
+  "name": "assess_batch_search",
+  "description": "Assess robot-camera images during a broad scan.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "result": {
+        "type": "string",
+        "description": "Use candidate when an object is visually clear or plausibly resembles the target. Using 'candidate' will proceeds to further verification, so it can be called with moderate uncertainty. If you suspect parts of the object is present in the image, call 'candidate'; not_found means totally absent",
+        "enum": ["candidate","not_found"]
+      },
+      "confidence": {
+        "type": "number",
+        "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "candidate_image": {
+        "type": "string",
+        "description": "Best image containing the target among given images. Only use none for not_found",
+        "enum": ["image_1","image_2","image_3","none"]
+      },
+      "candidate_position": {
+        "description": "The normalized position of the target within the candidate_image. THIS POINT MUST AT LEAST TOUCH THE OBJECT YOU ARE DETECTING. YOU MUST USE EXACTLY THESE KEYS: x, y. DO NOT USE arrays. Remember, this is the position relative to your chosen candidate image. [0;0] means top left corner. [1:1] means bottom right corner. 0.0<x<0.5 means to the left. 0.0<y<0.5 means to the top. Only use null for not_found",
+        "type": ["object","null"],
+        "properties": {
+          "x": {"type": "number","minimum": 0,"maximum": 1},
+          "y": {"type": "number","minimum": 0,"maximum": 1}
+        },
+        "required": ["x","y"],
+        "additionalProperties": false
+      },
+      "evidence": {
+        "type": "string",
+        "description": "Brief visual evidence supporting the result and chosen image."
+      },
+      "scene_summary": {
+        "type": "string",
+        "description": "Brief summary of relevant objects and visibility conditions in the image set."
+      }
+    },
+    "required": [
+      "result",
+      "confidence",
+      "candidate_image",
+      "candidate_position",
+      "evidence",
+      "scene_summary"
+    ],
+    "additionalProperties": false
+    }
+  }
+]

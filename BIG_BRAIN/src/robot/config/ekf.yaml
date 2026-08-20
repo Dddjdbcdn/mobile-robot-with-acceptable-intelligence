@@ -1,0 +1,31 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 25.0
+    two_d_mode: true
+    publish_tf: true
+    transform_tolerance: 0.5
+    sensor_timeout: 0.5
+    publish_frequency: 25.0
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_footprint
+    world_frame: odom
+
+    odom0: diff_drive_controller/odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false, 
+                   false, false, false,  
+                   false, false, false]
+
+    imu0: /imu
+    
+    # Configuration matrix: [X, Y, Z, Roll, Pitch, Yaw, Vx, Vy, Vz, Vroll, Vpitch, Vyaw, Ax, Ay, Az]
+    imu0_config: [false, false, false,
+                  false, false, false, 
+                  false, false, false,
+                  false, false, true,  
+                  false,  false,  false] 
+
+    imu0_remove_gravitational_acceleration: false
