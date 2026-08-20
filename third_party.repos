@@ -19,19 +19,9 @@ repositories:
     url: https://github.com/PickNikRobotics/topic_based_ros2_control.git
     version: main
 
-  BIG_BRAIN/src/uros/drive_base:
-    type: git
-    url: https://github.com/micro-ROS/drive_base.git
-    version: master
-
   BIG_BRAIN/src/uros/micro-ROS-Agent:
     type: git
     url: https://github.com/micro-ROS/micro-ROS-Agent.git
-    version: jazzy
-
-  BIG_BRAIN/src/uros/micro_ros_msgs:
-    type: git
-    url: https://github.com/micro-ROS/micro_ros_msgs.git
     version: jazzy
 
   MICRO_ROS/micro_ros_stm32cubemx_utils:

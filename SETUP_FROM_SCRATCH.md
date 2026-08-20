@@ -58,9 +58,7 @@ others use `main`, `master`, or the GroundingDINO OpenVINO branch.
 | ros2_astra_camera (`master`) | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
 | sllidar_ros2 (`main`) | `BIG_BRAIN/src/sllidar_ros2` | RPLIDAR C1 |
 | topic_based_ros2_control (`main`) | `BIG_BRAIN/src/topic_based_ros2_control` | ROS control transport |
-| drive_base | `BIG_BRAIN/src/uros/drive_base` | micro-ROS drive interfaces |
-| micro-ROS-Agent | `BIG_BRAIN/src/uros/micro-ROS-Agent` | STM32-to-ROS agent |
-| micro_ros_msgs | `BIG_BRAIN/src/uros/micro_ros_msgs` | micro-ROS messages |
+| micro-ROS-Agent (`jazzy`) | `BIG_BRAIN/src/uros/micro-ROS-Agent` | STM32-to-ROS serial agent |
 | STM32 micro-ROS utils | `MICRO_ROS/micro_ros_stm32cubemx_utils` | firmware static library |
 | Depth Anything V2 | `SMALL_BRAIN/.../Depth-Anything-V2` | depth model source |
 | GroundingDINO | `SMALL_BRAIN/.../GroundingDINO` | open-vocabulary detection |
@@ -72,6 +70,11 @@ Import all of them from the repository root:
 cd "$ROBOT_ROOT"
 vcs import . < third_party.repos
 ```
+
+`drive_base` is not cloned because this robot uses the standard
+`sensor_msgs/JointState` type for wheel commands and states. The Agent requires
+`micro_ros_msgs`, but Jazzy provides that dependency as an apt package in
+section 2.3, so its source repository is not cloned either.
 
 ### 1.4 Clone only the required Nav2 packages
 
@@ -184,6 +187,7 @@ environment support:
 ```bash
 sudo apt install -y \
   ros-jazzy-desktop ros-dev-tools \
+  ros-jazzy-micro-ros-msgs \
   python3-pip python3-venv python3-dev \
   python3-colcon-common-extensions python3-rosdep python3-vcstool \
   build-essential cmake ninja-build pkg-config git curl wget rsync zstd
