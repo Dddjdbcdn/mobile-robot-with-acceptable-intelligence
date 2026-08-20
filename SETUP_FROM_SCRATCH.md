@@ -50,12 +50,12 @@ export ROBOT_ROOT="$PWD"
 
 `third_party.repos` uses readable branch names. Each setup clones the latest
 source from that branch. ROS-specific micro-ROS repositories use `jazzy`; the
-others use `main`, `master`, or the GroundingDINO OpenVINO branch.
+others use `main`, a compatibility branch, or the GroundingDINO OpenVINO branch.
 
 | Repository | Installed path | Purpose |
 |---|---|---|
 | micro_ros_setup (`jazzy`) | `BIG_BRAIN/src/micro_ros_setup` | ROS-side micro-ROS tooling |
-| ros2_astra_camera (`master`) | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
+| ros2_astra_camera (Jazzy PR branch) | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
 | sllidar_ros2 (`main`) | `BIG_BRAIN/src/sllidar_ros2` | RPLIDAR C1 |
 | topic_based_ros2_control (`main`) | `BIG_BRAIN/src/topic_based_ros2_control` | ROS control transport |
 | micro-ROS-Agent (`jazzy`) | `BIG_BRAIN/src/uros/micro-ROS-Agent` | STM32-to-ROS serial agent |
@@ -75,6 +75,15 @@ vcs import . < third_party.repos
 `sensor_msgs/JointState` type for wheel commands and states. The Agent requires
 `micro_ros_msgs`, but Jazzy provides that dependency as an apt package in
 section 2.3, so its source repository is not cloned either.
+
+The official Astra `master` branch does not yet contain its Jazzy/Kilted build
+fix. This manifest follows Robert Gruberski's `fix/astra-kilted-build` branch
+from upstream pull request #20:
+
+<https://github.com/orbbec/ros2_astra_camera/pull/20>
+
+The separate `patches/astra-camera.patch` only disables the driver's TF
+publication so the robot's own TF tree remains authoritative.
 
 ### 1.4 Clone only the required Nav2 packages
 
