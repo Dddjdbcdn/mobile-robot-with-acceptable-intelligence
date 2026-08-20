@@ -2,49 +2,54 @@ repositories:
   BIG_BRAIN/src/micro_ros_setup:
     type: git
     url: https://github.com/micro-ROS/micro_ros_setup.git
-    version: 526d0c54696d191ea6e99781e02d463ed5443314
-  BIG_BRAIN/src/nav2_src:
-    type: git
-    url: https://github.com/ros-navigation/navigation2.git
-    version: 3f71f94b105b6731953a137561e8c27acc3e3acf
+    version: jazzy
+
   BIG_BRAIN/src/ros2_astra_camera:
     type: git
     url: https://github.com/orbbec/ros2_astra_camera.git
-    version: 11f7daa20df22d9894f8f2e8d6080c161413144e
+    version: master
+
   BIG_BRAIN/src/sllidar_ros2:
     type: git
     url: https://github.com/Slamtec/sllidar_ros2.git
-    version: 34300099fadfc772965962dec837bf436706188f
+    version: main
+
   BIG_BRAIN/src/topic_based_ros2_control:
     type: git
     url: https://github.com/PickNikRobotics/topic_based_ros2_control.git
-    version: 6bd8d55e1c4ad3188770fe5c8b93b942bcede4a2
+    version: main
+
   BIG_BRAIN/src/uros/drive_base:
     type: git
     url: https://github.com/micro-ROS/drive_base.git
-    version: fc55ef35fbdb99c999ad6f9d5b5c6b6968093376
+    version: master
+
   BIG_BRAIN/src/uros/micro-ROS-Agent:
     type: git
     url: https://github.com/micro-ROS/micro-ROS-Agent.git
-    version: 52abdf5a9897637b2539cb1c239e1ec4fa92e01c
+    version: jazzy
+
   BIG_BRAIN/src/uros/micro_ros_msgs:
     type: git
     url: https://github.com/micro-ROS/micro_ros_msgs.git
-    version: e65ab21bd0733ebff2af6317d573cc584efa5893
+    version: jazzy
+
   MICRO_ROS/micro_ros_stm32cubemx_utils:
     type: git
     url: https://github.com/micro-ROS/micro_ros_stm32cubemx_utils.git
-    version: 0b6fc5cea80dfaba0455ac4e2a8db782d531291a
+    version: jazzy
+
   SMALL_BRAIN/vision_models/depthanything_tools/Depth-Anything-V2:
     type: git
     url: https://github.com/DepthAnything/Depth-Anything-V2.git
-    version: a561b849ebae10a6f5ef49e26c83cbbcd36c71bf
+    version: main
+
   SMALL_BRAIN/vision_models/groundingdino_tools/GroundingDINO:
     type: git
     url: https://github.com/wenyi5608/GroundingDINO.git
-    version: 459de5f93a18d5b09d3d84237fc83019c5cd97eb
+    version: wenyi5608-openvino
+
   SMALL_BRAIN/vision_models/sam2_tools/sam2:
     type: git
     url: https://github.com/facebookresearch/sam2.git
-    version: 2b90b9f5ceec907a1c18123530e92e794ad901a4
-
+    version: main

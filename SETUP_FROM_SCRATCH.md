@@ -46,18 +46,18 @@ cd "$HOME/ROS2/mobile-robot-with-acceptable-intelligence"
 export ROBOT_ROOT="$PWD"
 ```
 
-### 1.3 Clone the pinned third-party repositories
+### 1.3 Clone the latest third-party repositories
 
-`third_party.repos` records the exact tested revision of every external source
-repository:
+`third_party.repos` uses readable branch names. Each setup clones the latest
+source from that branch. ROS-specific micro-ROS repositories use `jazzy`; the
+others use `main`, `master`, or the GroundingDINO OpenVINO branch.
 
 | Repository | Installed path | Purpose |
 |---|---|---|
-| micro_ros_setup | `BIG_BRAIN/src/micro_ros_setup` | ROS-side micro-ROS tooling |
-| Navigation2 | `BIG_BRAIN/src/nav2_src` | locally modified Nav2 packages |
-| ros2_astra_camera | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
-| sllidar_ros2 | `BIG_BRAIN/src/sllidar_ros2` | RPLIDAR C1 |
-| topic_based_ros2_control | `BIG_BRAIN/src/topic_based_ros2_control` | ROS control transport |
+| micro_ros_setup (`jazzy`) | `BIG_BRAIN/src/micro_ros_setup` | ROS-side micro-ROS tooling |
+| ros2_astra_camera (`master`) | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
+| sllidar_ros2 (`main`) | `BIG_BRAIN/src/sllidar_ros2` | RPLIDAR C1 |
+| topic_based_ros2_control (`main`) | `BIG_BRAIN/src/topic_based_ros2_control` | ROS control transport |
 | drive_base | `BIG_BRAIN/src/uros/drive_base` | micro-ROS drive interfaces |
 | micro-ROS-Agent | `BIG_BRAIN/src/uros/micro-ROS-Agent` | STM32-to-ROS agent |
 | micro_ros_msgs | `BIG_BRAIN/src/uros/micro_ros_msgs` | micro-ROS messages |
@@ -73,18 +73,43 @@ cd "$ROBOT_ROOT"
 vcs import . < third_party.repos
 ```
 
-Only three Nav2 source packages are overridden. Keep those and omit the rest of
-the cloned Nav2 workspace:
+### 1.4 Clone only the required Nav2 packages
+
+Navigation2 is one Git repository containing many ROS packages. The three
+required packages are directories inside that monorepo, not three separate Git
+repositories. Use a shallow, blob-filtered sparse clone so Git downloads the
+latest Jazzy source and populates only the selected package directories:
 
 ```bash
-git -C BIG_BRAIN/src/nav2_src sparse-checkout init --cone
+cd "$ROBOT_ROOT"
+
+git clone \
+  --depth 1 \
+  --filter=blob:none \
+  --sparse \
+  --single-branch \
+  --branch jazzy \
+  https://github.com/ros-navigation/navigation2.git \
+  BIG_BRAIN/src/nav2_src
+
 git -C BIG_BRAIN/src/nav2_src sparse-checkout set \
   nav2_behavior_tree nav2_costmap_2d nav2_planner
 ```
 
-### 1.4 Apply the project changes to third-party source
+The working tree now contains only:
 
-The upstream repositories are pinned, then changed using the small patch files
+```text
+BIG_BRAIN/src/nav2_src/nav2_behavior_tree/
+BIG_BRAIN/src/nav2_src/nav2_costmap_2d/
+BIG_BRAIN/src/nav2_src/nav2_planner/
+```
+
+Git cone mode may also retain a few small files from the root of the Navigation2
+repository. It does not populate the other Nav2 package directories.
+
+### 1.5 Apply the project changes to third-party source
+
+The cloned upstream repositories are changed using the small patch files
 committed under `patches/`:
 
 ```bash
@@ -103,14 +128,16 @@ git -C MICRO_ROS/micro_ros_stm32cubemx_utils apply \
   ../../patches/micro-ros-stm32.patch
 ```
 
-Confirm that every checkout is at its pinned revision and that only the expected
+Confirm that every checkout is on its expected branch and that only the expected
 patch changes are present:
 
 ```bash
 vcs status .
 ```
 
-Do not replace these revisions with arbitrary latest branches.
+This setup deliberately tracks the latest branch versions. An upstream update
+can eventually make a patch fail or introduce a build error. If that happens,
+update the affected patch for the new upstream source.
 
 ---
 
@@ -633,7 +660,8 @@ Do not publish a map if it reveals a private home, laboratory, or facility.
 
 - [ ] The GitHub repository clones without Git LFS or missing first-party code.
 - [ ] `vcs import . < third_party.repos` completes.
-- [ ] All five files under `patches/` apply successfully.
+- [ ] The sparse Nav2 checkout contains only the three required packages.
+- [ ] All four patch commands complete successfully.
 - [ ] `source /opt/ros/jazzy/setup.bash` works.
 - [ ] `colcon build` completes in `BIG_BRAIN`.
 - [ ] All six critical ROS packages report a prefix.

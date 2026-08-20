@@ -11,9 +11,10 @@ This repository contains a physical two-wheel robot split across three layers:
 
 For a new Ubuntu installation, follow [SETUP_FROM_SCRATCH.md](SETUP_FROM_SCRATCH.md)
 from section 1 through the final acceptance checklist. Do not assume a plain
-clone contains model binaries: third-party source is pinned in
-`third_party.repos`, local upstream changes live in `patches/`, and runtime
-models are restored or exported separately.
+clone contains model binaries: third-party source branches are listed in
+`third_party.repos`, only the required Nav2 packages are sparse-cloned, local
+upstream changes live in `patches/`, and runtime models are restored or
+exported separately.
 
 ## Repository policy
 
