@@ -52,5 +52,4 @@ amcl:
 
 map_server:
   ros__parameters:
-    yaml_filename: "/home/nguyendang/ROS2/full-stack-mobile-robot-with-acceptable-intelligence/BIG_BRAIN/src/robot/map/my_map.yaml"
     introspection_mode: "disabled"

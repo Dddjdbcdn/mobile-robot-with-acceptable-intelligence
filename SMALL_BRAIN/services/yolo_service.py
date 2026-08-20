@@ -1,8 +1,6 @@
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
+from pathlib import Path
+
 from ultralytics import YOLO
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import json
 import struct
 import math
@@ -12,8 +10,13 @@ import numpy as np
 
 class YoloService():
     def __init__(self, camera):
-        pose_model_path = "/home/nguyendang/ROS2/full-stack-mobile-robot-with-acceptable-intelligence/BIG_BRAIN/src/yolo_vision/yolo11m-pose_openvino_model/"
-        DJ_custom_model_path = "/home/nguyendang/ROS2/full-stack-mobile-robot-with-acceptable-intelligence/BIG_BRAIN/src/yolo_vision/yoloe-11m_openvino_model/"
+        model_dir = (
+            Path(__file__).resolve().parents[1]
+            / "vision_models"
+            / "yolo_tools"
+        )
+        pose_model_path = model_dir / "yolo11m-pose_openvino_model"
+        DJ_custom_model_path = model_dir / "yoloe-11m_openvino_model"
 
         self.DJ_custom_model = YOLO(DJ_custom_model_path, task="detect")
         self.pose_model = YOLO(pose_model_path, task="pose")

@@ -1,0 +1,88 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ROS 2 and native build products
+build/
+install/
+log/
+*.o
+*.a
+*.so
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.d
+
+# STM32CubeIDE-generated local metadata
+.mxproject
+.settings/
+Debug/
+Release/
+
+# Downloaded third-party repositories
+BIG_BRAIN/src/micro_ros_setup/
+BIG_BRAIN/src/nav2_src/
+BIG_BRAIN/src/ros2_astra_camera/
+BIG_BRAIN/src/sllidar_ros2/
+BIG_BRAIN/src/topic_based_ros2_control/
+BIG_BRAIN/src/uros/
+MICRO_ROS/micro_ros_stm32cubemx_utils/
+SMALL_BRAIN/vision_models/depthanything_tools/Depth-Anything-V2/
+SMALL_BRAIN/vision_models/groundingdino_tools/GroundingDINO/
+SMALL_BRAIN/vision_models/sam2_tools/sam2/
+
+# AI checkpoints and exported model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.tflite
+*.blob
+*.npz
+*.ts
+**/weights/
+**/checkpoints/
+**/models/
+**/openvino_models/
+**/*_openvino_model/
+**/*_openvino_model_*/
+
+# Inference/compiler caches and runtime output
+**/.ov_cache*/
+**/ov_cache/
+SMALL_BRAIN/results/
+SMALL_BRAIN/database/memory.json
+*.db
+*.sqlite
+*.sqlite3
+
+# ROS bags, logs, and diagnostics
+*.bag
+*.db3
+*.mcap
+kernel.errors.txt

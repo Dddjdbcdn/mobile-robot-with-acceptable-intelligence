@@ -29,6 +29,11 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     # Get the launch directory
     bringup_dir = get_package_share_directory('nav2_bringup')
+    default_bt_xml = os.path.join(
+        get_package_share_directory('robot'),
+        'config',
+        'behavior_approach.xml',
+    )
 
     namespace = LaunchConfiguration('namespace')
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -62,7 +67,10 @@ def generate_launch_description():
     remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
 
     # Create our own temporary YAML files that include substitutions
-    param_substitutions = {'autostart': autostart}
+    param_substitutions = {
+        'autostart': autostart,
+        'default_nav_to_pose_bt_xml': default_bt_xml,
+    }
 
     configured_params = ParameterFile(
         RewrittenYaml(
