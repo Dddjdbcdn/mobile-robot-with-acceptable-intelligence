@@ -459,9 +459,13 @@ test -d MICRO_ROS/Drivers
 test -d MICRO_ROS/Middlewares
 test -f MICRO_ROS/startup_stm32g474xx.s
 test -f MICRO_ROS/STM32G474xx_FLASH.ld
+```
+
+These generated files remain local and are ignored by Git.
 
 Delete the TIM7 callback in main.c after building the project from CubeMX (it is ticked in motor.c)
 
+```bash
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
@@ -475,10 +479,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   /* USER CODE END Callback 1 */
 }
-
 ```
-
-These generated files remain local and are ignored by Git.
 
 ### 5.3 Build the micro-ROS static library
 
@@ -521,8 +522,10 @@ The current project expects this device:
 
 Create `/etc/udev/rules.d/99-stm32-low-latency.rules`:
 
-sudo nano /etc/udev/rules.d/99-stm32-low-latency.rules
 
+```bash
+sudo nano /etc/udev/rules.d/99-stm32-low-latency.rules
+```
 
 ```udev
 ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", MODE:="0660", GROUP:="dialout", RUN+="/bin/stty -F /dev/%k 921600 raw -echo -crtscts -ixon -ixoff"
@@ -540,7 +543,9 @@ BIG_BRAIN/setup.sh
 
 Create `/etc/udev/rules.d/rplidar.rules`:
 
+```bash
 sudo nano /etc/udev/rules.d/rplidar.rules
+```
 
 ```udev
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0660", GROUP:="dialout", SYMLINK+="rplidar"
