@@ -270,7 +270,11 @@ rosdep update
 grep -qxF 'source /opt/ros/jazzy/setup.bash' "$HOME/.bashrc" || \
   echo 'source /opt/ros/jazzy/setup.bash' >> "$HOME/.bashrc"
 
+grep -qxF 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' "$HOME/.bashrc" || \
+  echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> "$HOME/.bashrc"
+
 source /opt/ros/jazzy/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ros2 --help >/dev/null
 ```
 
@@ -455,6 +459,23 @@ test -d MICRO_ROS/Drivers
 test -d MICRO_ROS/Middlewares
 test -f MICRO_ROS/startup_stm32g474xx.s
 test -f MICRO_ROS/STM32G474xx_FLASH.ld
+
+Delete the TIM7 callback in main.c after building the project from CubeMX (it is ticked in motor.c)
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM7)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
 ```
 
 These generated files remain local and are ignored by Git.
@@ -500,6 +521,9 @@ The current project expects this device:
 
 Create `/etc/udev/rules.d/99-stm32-low-latency.rules`:
 
+sudo nano /etc/udev/rules.d/99-stm32-low-latency.rules
+
+
 ```udev
 ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", MODE:="0660", GROUP:="dialout", RUN+="/bin/stty -F /dev/%k 921600 raw -echo -crtscts -ixon -ixoff"
 ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", ATTR{power/control}="on"
@@ -515,6 +539,8 @@ BIG_BRAIN/setup.sh
 ### 6.2 RPLIDAR C1
 
 Create `/etc/udev/rules.d/rplidar.rules`:
+
+sudo nano /etc/udev/rules.d/rplidar.rules
 
 ```udev
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0660", GROUP:="dialout", SYMLINK+="rplidar"

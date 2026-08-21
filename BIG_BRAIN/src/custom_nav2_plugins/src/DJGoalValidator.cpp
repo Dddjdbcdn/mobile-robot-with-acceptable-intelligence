@@ -46,7 +46,7 @@ public:
 
     const auto goal_cost = sampleCost(global_cost_client, goal, true);
 
-    if (!goal_cost.success || goal_cost.cost == 254.0) { 
+    if (!goal_cost.success || goal_cost.cost >= 254.0) { 
 
       ++failure_count;
       RCLCPP_WARN(node->get_logger(), "[DJGoalValidator]: 🥊 Goal is inside obstacle with cost %f! Failure count: %d",goal_cost.cost, failure_count);

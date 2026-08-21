@@ -264,7 +264,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   * @retval None
   */
 
-
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
