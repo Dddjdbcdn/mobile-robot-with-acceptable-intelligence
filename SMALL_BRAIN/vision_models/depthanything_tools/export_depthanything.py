@@ -1,29 +1,55 @@
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent
+
+# IMPORTANT:
+# Use the metric-depth implementation, not the root relative-depth model.
+DAV2_REPO = ROOT / "Depth-Anything-V2" / "metric_depth"
+
+if not DAV2_REPO.is_dir():
+    raise FileNotFoundError(
+        f"Depth Anything V2 metric-depth repo not found: {DAV2_REPO}"
+    )
+
+sys.path.insert(0, str(DAV2_REPO))
 
 import openvino as ov
 import torch
 
 from depth_anything_v2.dpt import DepthAnythingV2
 
+""" Download check point
+
+mkdir -p checkpoints
+
+wget -O checkpoints/depth_anything_v2_metric_hypersim_vitb.pth \
+  "https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Hypersim-Base/resolve/main/depth_anything_v2_metric_hypersim_vitb.pth?download=true"
+
+"""
 
 # Both values must be divisible by 14.
-NET_H = 630
-NET_W = 1120
+NET_H = 504
+NET_W = 896
 
 SCENE = "indoor"  # Change to "outdoor" when using VKITTI.
 
 CONFIG = {
     "indoor": {
-        "checkpoint": "checkpoints/depth_anything_v2_metric_hypersim_vitb.pth",
+        "checkpoint": ROOT
+        / "checkpoints"
+        / "depth_anything_v2_metric_hypersim_vitb.pth",
         "max_depth": 20.0,
     },
     "outdoor": {
-        "checkpoint": "checkpoints/depth_anything_v2_metric_vkitti_vits.pth",
+        "checkpoint": ROOT
+        / "checkpoints"
+        / "depth_anything_v2_metric_vkitti_vits.pth",
         "max_depth": 80.0,
     },
 }
 
-# MODEL_CONFIG = {
+# MODEL_CONFIG = {che
 #     "encoder": "vits",
 #     "features": 64,
 #     "out_channels": [48, 96, 192, 384],
@@ -41,7 +67,7 @@ def main() -> None:
         raise ValueError("NET_H and NET_W must both be divisible by 14.")
 
     scene_config = CONFIG[SCENE]
-    checkpoint = Path(scene_config["checkpoint"])
+    checkpoint = scene_config["checkpoint"]
 
     if not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
@@ -71,7 +97,7 @@ def main() -> None:
         input=[1, 3, NET_H, NET_W],
     )
 
-    output_dir = Path("openvino_models")
+    output_dir = ROOT / "openvino_models"
     output_dir.mkdir(exist_ok=True)
 
     output_path = output_dir / (

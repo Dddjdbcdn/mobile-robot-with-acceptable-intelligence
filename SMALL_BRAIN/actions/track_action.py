@@ -234,10 +234,9 @@ def normalize_object_target(target):
 
 
 class ObjectTrackingManager():
-    def __init__(self, csrt_tracker,grounding_dino,sam2,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
+    def __init__(self, csrt_tracker,grounding_dino,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
-        self.sam2 = sam2
         self.zmq_req_lock = zmq_req_lock
         self.zmq_req_socket = zmq_req_socket
         self.zmq_pub_socket = zmq_pub_socket

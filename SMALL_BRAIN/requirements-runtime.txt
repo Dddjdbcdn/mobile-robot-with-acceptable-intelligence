@@ -21,3 +21,4 @@ typeguard==4.4.4
 ultralytics==8.4.121
 websockets==16.0
 yapf==0.40.2
+onnx==1.17.0

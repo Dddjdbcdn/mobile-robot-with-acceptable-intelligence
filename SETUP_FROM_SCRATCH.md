@@ -406,7 +406,31 @@ SMALL_BRAIN/vision_models/yolo_tools/export_yolo_pose.py
 The model export workflow is still under development. Confirm that an export's
 output filename matches the path above before starting the full application.
 
-### 4.4 Validate the environment
+### 4.4 Configure display (If using SSH)
+
+Run this on the remote desktop terminal:
+
+```bash
+tr '\0' '\n' < /proc/$(pgrep -u nguyendang -n gnome-shell)/environ | grep -E 'DISPLAY|XAUTHORITY|WAYLAND_DISPLAY'
+```
+
+You should get:
+
+```bash
+DISPLAY=:0
+XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.XXXXXX
+WAYLAND_DISPLAY=wayland-0
+```
+Then add these export into your local host bash.rc:
+
+```bash
+export DISPLAY=:0
+export XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.XXXXXX
+export QT_QPA_PLATFORM=xcb
+export OPENAI_API_KEY='replace-with-your-key'
+```
+
+### 4.5 Validate the environment
 
 ```bash
 cd "$ROBOT_ROOT"
@@ -667,6 +691,7 @@ source venv/bin/activate
 
 export OPENAI_API_KEY='replace-with-your-key'
 export DISPLAY=:0
+export XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.KWNEU3
 export QT_QPA_PLATFORM=xcb
 
 python main.py

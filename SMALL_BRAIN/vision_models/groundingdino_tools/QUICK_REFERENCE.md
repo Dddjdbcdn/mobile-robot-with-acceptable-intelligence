@@ -6,6 +6,13 @@
 source venv/bin/activate
 ```
 
+## Download Swin-T checkpoint
+
+mkdir -p weights
+
+wget -O weights/groundingdino_swint_ogc.pth \
+  https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+
 ## Export once
 ```bash
 python groundingdino_openvino_onnx.py export \

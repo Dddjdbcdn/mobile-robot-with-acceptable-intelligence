@@ -32,7 +32,7 @@ from services.camera_stream import CameraStream, send_camera_image
 
 from services.csrt_tracker import CSRTTrackingManager
 from services.depthanything_service import DepthAnythingService
-from services.sam2_service import SAM2OpenVINOService
+from services.sam2_service import SAM2OpenVINOService # unused
 
 
 context = zmq.asyncio.Context()
@@ -71,8 +71,6 @@ GROUNDING_DINO_CONFIG = Path("vision_models/groundingdino_tools/GroundingDINO/gr
 GROUNDING_DINO_MODEL = Path("vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml")
 
 DEPTH_ANYTHING_MODEL = Path("vision_models/depthanything_tools/openvino_models/dav2_metric_indoor_vitb_896x504_fp16.xml")
-
-SAM2_MODEL = Path("vision_models/sam2_tools/models/sam2.1_hiera_b+_openvino")
 
 tool_tasks: set[asyncio.Task[Any]] = set()
 
@@ -400,12 +398,6 @@ async def main():
         depth_scale=0.508
     )
 
-    sam2 = SAM2OpenVINOService(
-        model_dir="./vision_models/sam2_tools/models/sam2.1_base_plus_openvino_v3",
-        device="GPU",
-        numpy_color_format="BGR",
-    )
-
     csrt_tracker = CSRTTrackingManager(
         camera=camera,
         max_initial_replay_frames=15
@@ -414,7 +406,6 @@ async def main():
     object_tracking_manager = ObjectTrackingManager(
         csrt_tracker=csrt_tracker,
         grounding_dino=grounding_dino,
-        sam2=sam2,
         zmq_req_lock=zmq_req_lock,
         zmq_req_socket=zmq_req_socket,
         zmq_pub_socket=zmq_pub_socket,
@@ -446,7 +437,6 @@ async def main():
 
     grounding_dino.start_background()
     depth_anything.start_background()
-    sam2.start_background()
 
     async def wait_for_dino():
         await grounding_dino.wait_until_ready()
@@ -454,9 +444,6 @@ async def main():
     async def wait_for_depth():
         await depth_anything.wait_until_ready()
         print("✅ DEPTH ANYTHING IS READY")
-    async def wait_for_sam2():
-        await sam2.wait_until_ready()
-        print("✅ SAM2 IS READY")
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
@@ -521,7 +508,6 @@ async def main():
                 display_camera_loop(camera,csrt_tracker),
                 wait_for_dino(),
                 wait_for_depth(),
-                wait_for_sam2()
             )
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed by server.")

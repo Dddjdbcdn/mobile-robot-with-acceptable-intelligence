@@ -7,14 +7,22 @@ box corners are passed as point labels 2/3 to ``sam_prompt_encoder`` with
 The decoder exports low-resolution logits; resizing to the source image is done
 outside OpenVINO for easier parity testing.
 
+Download checkpoint:
+
+mkdir -p checkpoints
+
+wget -O checkpoints/sam2.1_hiera_base_plus.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
+
+Export:
+
 python export_sam2_openvino.py \
-    --sam2-repo ./sam2 \
-    --config 'configs/sam2.1/sam2.1_hiera_b+.yaml' \
-    --checkpoint ./sam2/checkpoints/sam2.1_hiera_base_plus.pt \
-    --output-dir ./models/sam2.1_base_plus_openvino_v3 \
-    --no-fp16 \
-    --no-multimask
-    
+  --sam2-repo ./sam2 \
+  --config 'configs/sam2.1/sam2.1_hiera_b+.yaml' \
+  --checkpoint ./checkpoints/sam2.1_hiera_base_plus.pt \
+  --output-dir ./models/sam2.1_base_plus_openvino_v3_fp16 \
+  --fp16 \
+  --no-multimask
 """
 from __future__ import annotations
 
