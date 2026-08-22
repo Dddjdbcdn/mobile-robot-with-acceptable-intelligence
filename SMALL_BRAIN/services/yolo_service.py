@@ -1,5 +1,4 @@
 from pathlib import Path
-
 from ultralytics import YOLO
 import json
 import struct
@@ -7,6 +6,8 @@ import math
 import zmq
 import threading
 import numpy as np
+import time
+import asyncio
 
 class YoloService():
     def __init__(self, camera):
@@ -24,16 +25,13 @@ class YoloService():
         self.conf_threshold = 0.3
         self.vision_mode = "dj"
         self.camera = camera
-        self.warmup_models()
 
         self.detections = []
+        self.inference_thread = threading.Thread(target=self.timer_callback, daemon=True)
+        self.running = False
+        self.fps = 10.0
 
-        self.frame_lock = threading.Lock()
-
-        timer_period = 0.1
-        self.inference_timer = threading.Thread(target=self.timer_callback, daemon=True)
-
-    def warmup_models(self):
+    def start_background(self):
         dummy_frame = np.zeros(
             (320, 640, 3),
             dtype=np.uint8
@@ -52,32 +50,58 @@ class YoloService():
                 verbose=False,
             )
 
+        self.running = True
+        self.inference_thread.start()
+
+    async def wait_until_ready(self):
+        while not self.running:
+            await asyncio.sleep(0.05)
+
     def timer_callback(self):
-        frame = self.camera.latest.tracking_bgr if self.camera.latest else None
+        while self.running:
+            loop_start = time.perf_counter()
 
-        detections = []
+            latest = self.camera.latest
 
-        if self.vision_mode in ("dj", "both"):
-            dj_results = self.DJ_custom_model.predict(
-                source=frame,
-                device="intel:gpu",
-                verbose=False,
-            )
-            detections.extend(
-                self.parse_dj(dj_results[0])
-            )
+            if latest is None:
+                time.sleep(0.01)
+                continue
 
-        if self.vision_mode in ("pose", "both"):
-            pose_results = self.pose_model.predict(
-                source=frame,
-                device="intel:gpu",
-                verbose=False,
-            )
-            detections.extend(
-                self.parse_pose(pose_results[0])
-            )
+            frame = latest.tracking_bgr
 
-        self.detections = detections
+            detections = []
+
+            if self.vision_mode in ("dj", "both"):
+                dj_results = self.DJ_custom_model.predict(
+                    source=frame,
+                    device="intel:gpu",
+                    verbose=False,
+                )
+                detections.extend(
+                    self.parse_dj(dj_results[0])
+                )
+
+            if self.vision_mode in ("pose", "both"):
+                pose_results = self.pose_model.predict(
+                    source=frame,
+                    device="intel:gpu",
+                    verbose=False,
+                )
+                detections.extend(
+                    self.parse_pose(pose_results[0])
+                )
+
+            self.detections = detections
+
+            elapsed = time.perf_counter() - loop_start
+            remaining = 1/self.fps - elapsed
+
+            if remaining > 0:
+                time.sleep(remaining)
+
+    async def close(self):
+        self.running = False
+        await asyncio.to_thread(self.inference_thread.join, 2)
 
     def parse_dj(self, result):
         detections = []

@@ -33,6 +33,7 @@ from services.camera_stream import CameraStream, send_camera_image
 from services.csrt_tracker import CSRTTrackingManager
 from services.depthanything_service import DepthAnythingService
 from services.sam2_service import SAM2OpenVINOService # unused
+from services.yolo_service import YoloService
 
 
 context = zmq.asyncio.Context()
@@ -224,9 +225,6 @@ async def background_status_monitor(response_manager,object_tracking_manager,obj
             elif message.get("type") == "state":
                 update_camera_state(message,object_tracking_manager)
 
-            elif message.get("type") == "yolo":
-                robot_state["camera"]["yolo_detections"] = message["detections"]
-
         except Exception as e:
             print(f"[System Error in Monitor]: {e}")
             await asyncio.sleep(1) 
@@ -319,7 +317,7 @@ async def receive_events(ws,app,response_manager,camera,object_tracking_manager,
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
-async def display_camera_loop(camera, csrt_tracker):
+async def display_camera_loop(camera, csrt_tracker, yolo):
     print("[System: Starting live camera display...]")
 
     window_name = "Robot Vision"
@@ -337,8 +335,8 @@ async def display_camera_loop(camera, csrt_tracker):
 
             tracking_update = csrt_tracker.tracking_update
 
-            if robot_state["camera"].get("yolo_detections"):
-                display_frame = draw_yolo_overlay(display_frame)
+            if yolo.detections:
+                display_frame = draw_yolo_overlay(display_frame,yolo)
             if (tracking_update is not None and tracking_update.is_tracking and tracking_update.success):
                 display_frame = draw_csrt_overlay(display_frame,tracking_update.target,tracking_update.bbox_xywh)
 
@@ -398,6 +396,10 @@ async def main():
         depth_scale=0.508
     )
 
+    yolo = YoloService(
+        camera
+    )
+
     csrt_tracker = CSRTTrackingManager(
         camera=camera,
         max_initial_replay_frames=15
@@ -406,6 +408,7 @@ async def main():
     object_tracking_manager = ObjectTrackingManager(
         csrt_tracker=csrt_tracker,
         grounding_dino=grounding_dino,
+        yolo=yolo,
         zmq_req_lock=zmq_req_lock,
         zmq_req_socket=zmq_req_socket,
         zmq_pub_socket=zmq_pub_socket,
@@ -437,6 +440,7 @@ async def main():
 
     grounding_dino.start_background()
     depth_anything.start_background()
+    yolo.start_background()
 
     async def wait_for_dino():
         await grounding_dino.wait_until_ready()
@@ -444,6 +448,9 @@ async def main():
     async def wait_for_depth():
         await depth_anything.wait_until_ready()
         print("✅ DEPTH ANYTHING IS READY")
+    async def wait_for_yolo():
+        await yolo.wait_until_ready()
+        print("✅ YOLO IS READY")
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
@@ -505,9 +512,10 @@ async def main():
                 send_mic_audio(ws, app),
                 receive_events(ws,app,response_manager,camera,object_tracking_manager,object_searching_manager,object_approaching_manager),
                 background_status_monitor(response_manager,object_tracking_manager,object_approaching_manager),
-                display_camera_loop(camera,csrt_tracker),
+                display_camera_loop(camera,csrt_tracker,yolo),
                 wait_for_dino(),
                 wait_for_depth(),
+                wait_for_yolo()
             )
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed by server.")
@@ -521,6 +529,7 @@ async def main():
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await depth_anything.close()
+        await yolo.close()
 
 # HELPER FUNCTIONS
 

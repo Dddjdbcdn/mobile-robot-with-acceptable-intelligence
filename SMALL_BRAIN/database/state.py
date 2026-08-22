@@ -11,8 +11,6 @@ robot_state = {
         "timestamp": 0.0,
         "tracking": False,
         "is_stable": False,
-        "vision_mode": "dj",
-        "yolo_detections": {},
     }
 }
 

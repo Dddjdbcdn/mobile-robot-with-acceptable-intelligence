@@ -7,8 +7,6 @@ VERTICAL_FOV_DEG = 52
 
 import math
 
-from database.state import robot_state
-
 dj_yolo_classes = [
     "guitar",
     "chair",
@@ -234,9 +232,10 @@ def normalize_object_target(target):
 
 
 class ObjectTrackingManager():
-    def __init__(self, csrt_tracker,grounding_dino,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
+    def __init__(self, csrt_tracker,yolo,grounding_dino,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
+        self.yolo = yolo
         self.zmq_req_lock = zmq_req_lock
         self.zmq_req_socket = zmq_req_socket
         self.zmq_pub_socket = zmq_pub_socket
@@ -257,7 +256,7 @@ class ObjectTrackingManager():
         if self.tracking: await self.stop_tracking(reset=False)
 
         if target in human_trackable_parts:
-            robot_state["camera"]["vision_mode"] = "pose"
+            self.yolo.vision_mode = "pose"
             await asyncio.sleep(0.5)
 
             return await self._start_person_tracking(target)
@@ -272,7 +271,7 @@ class ObjectTrackingManager():
         if target in dj_yolo_classes:
             matching = [
                 detection
-                for detection in robot_state["camera"]["yolo_detections"]
+                for detection in self.yolo.detections
                 if detection["class"] == target
             ]
                 
@@ -294,7 +293,7 @@ class ObjectTrackingManager():
                 )
     
         if not yolo_detected:
-            robot_state["camera"]["vision_mode"] = "none"
+            self.yolo.vision_mode = "none"
             await asyncio.sleep(0.1)
             groundinngdino_result = await self.grounding_dino.detect(
                     image_source=jpeg_bytes,
@@ -304,7 +303,7 @@ class ObjectTrackingManager():
                     nms_threshold=0.80,
                     output_root=Path("results/grounding_results"),
                 )
-            robot_state["camera"]["vision_mode"] = "dj"
+            self.yolo.vision_mode = "dj"
 
             detection = groundinngdino_result.best
 
@@ -382,7 +381,7 @@ class ObjectTrackingManager():
     async def _start_person_tracking(self,target):
         detections = [
             detection
-            for detection in robot_state["camera"]["yolo_detections"]
+            for detection in self.yolo.detections
             if detection["class"] == "person"
             and "keypoints" in detection
         ]
@@ -486,7 +485,7 @@ class ObjectTrackingManager():
         while self.tracking:
             detections = [
                 detection
-                for detection in robot_state["camera"]["yolo_detections"]
+                for detection in self.yolo.detections
                 if detection["class"] == "person"
                 and "keypoints" in detection
             ]
@@ -603,7 +602,7 @@ class ObjectTrackingManager():
         
 
     async def stop_tracking(self,reset=True):
-        robot_state["camera"]["vision_mode"] = "dj"
+        self.yolo.vision_mode = "dj"
         self.stable = False
         self.stable_tick = 0
         self.tracking = False 

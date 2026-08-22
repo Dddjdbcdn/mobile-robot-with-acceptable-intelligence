@@ -178,8 +178,8 @@ def draw_csrt_overlay(frame,target,bbox):
     return frame
 
 
-def draw_yolo_overlay(frame):
-    detections = robot_state["camera"].get("yolo_detections", [])
+def draw_yolo_overlay(frame,yolo):
+    detections = yolo.detections
 
     if not detections:
         return frame
