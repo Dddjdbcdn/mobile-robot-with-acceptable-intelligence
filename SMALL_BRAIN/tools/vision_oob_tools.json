@@ -51,5 +51,28 @@
     ],
     "additionalProperties": false
     }
+  },
+  {
+  "type": "function",
+  "name": "assess_frame_search",
+  "description": "Verify whether the target is within the camera frame",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "result": {
+        "type": "string",
+        "description": "Use found when an object is visually clear or plausibly resembles the target. not_found means totally absent",
+        "enum": ["candidate","not_found"]
+      },
+      "confidence": {
+        "type": "number",
+        "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "required": ["result","confidence"],
+    "additionalProperties": false
+    }
   }
 ]

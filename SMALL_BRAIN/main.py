@@ -21,20 +21,22 @@ from database.state import robot_state,update_camera_state
 from utilities.database_functions import load_json, update_memory, build_system_prompt
 from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
 
-from actions.search_action import ObjectSearchingManager
-from actions.track_action import ObjectTrackingManager,human_trackable_parts
-from actions.approach_actions import ObjectApproachingManager
+from actions.approach_action import ApproachAction
+from actions.search_action import SearchAction
+from actions.see_action import SeeAction
+from actions.track_action import TrackAction
 
 from services.audio_stream import AudioApp, send_mic_audio
-from services.response_manager import ResponseManager
-from services.groundingdino_service import GroundingDINOService
 from services.camera_stream import CameraStream, send_camera_image
+from services.response_manager import ResponseManager
 
+from services.groundingdino_service import GroundingDINOService
 from services.csrt_tracker import CSRTTrackingManager
 from services.depthanything_service import DepthAnythingService
 from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
+from cognition.cognition_manager import CognitionManager
 
 context = zmq.asyncio.Context()
 
@@ -53,8 +55,8 @@ zmq_req_lock = asyncio.Lock()
 IDENTITY_PATH = "database/identity.json"
 MEMORY_PATH = "database/memory.json"
 TOOLS_PATHS = [
-    "tools/database_tools.json", 
-    "tools/navigate_tools.json", 
+    "tools/database_tools.json",
+    "tools/navigate_tools.json",
     "tools/vision_tools.json"
 ]
 
@@ -93,145 +95,28 @@ def create_tool_task(coroutine,name) :
     task.add_done_callback(handle_task_done)
     return task
 
-async def handle_tool_call(ws, function_name, arguments, call_id, response_metadata,response_manager,camera,object_searching_manager,object_tracking_manager,object_approaching_manager,session_state):
-    try:
-        args = json.loads(arguments) if arguments else {}
-
-        if function_name == "update_memory":
-            print("[System: Saving to disk -> "f"{args.get('category')}: {args.get('new_info')}]")
-            feedback = update_memory(MEMORY_PATH,args.get("category"),args.get("new_info"),)
-            await response_manager.send_function_output(call_id, feedback)
-            return
-
-        elif function_name == "get_vision":
-            jpeg_bytes = await asyncio.to_thread(camera.jpeg_bytes_snapshot, 70, False, "results/search_results/get_vision_snapshot.jpg")
-            snapshot = camera.snapshot()
-            feedback = {"status": "image_captured"}
-            target = ensure_string(args.get("target"))
-            action = args.get("action")
-
-            print(f"[GET VISION]: ACTION: {action}. TARGET: {target}")
-
-            await response_manager.send_function_output(call_id, feedback)
-
-            if action == "reasoning":
-                query = args.get("query", "").strip()
-                await send_camera_image(ws,jpeg_bytes,instruction=query)
-                await response_manager.create_voice_response()
-
-            elif action == "find_object":
-                await send_camera_image(ws,jpeg_bytes,instruction=f"Find {target} and explain the result")
-                session_state["jpeg_bytes"] = jpeg_bytes
-                session_state["target"] = target
-                session_state["snapshot"] = snapshot
-                await response_manager.create_tool_response(tool="INBAND_VISUAL_SEARCH")
-
-            elif action == "look_at_object":
-                tracking_result = await object_tracking_manager.start_tracking(jpeg_bytes,target,snapshot)
-                await response_manager.send_function_output(call_id, {"status": tracking_result})
-                if tracking_result != "tracking": await response_manager.create_voice_response()
-
-            return
-
-        elif function_name == "inband_visual_search":
-            await response_manager.send_function_output(call_id,{"status": "success"})
-
-            target = session_state["target"]
-            jpeg_bytes = session_state["jpeg_bytes"]
-            snapshot = session_state["snapshot"]
-            result = args.get("result")
-
-            print(f"TARGET: {target}")
-
-            if result == "found":
-                await response_manager.create_voice_response(system_msg=f"There is {target} in the current camera view")
-                
-            else:
-                print("[System: Initiating wide visual search...]")
-
-                if object_tracking_manager.tracking: 
-                    await object_tracking_manager.stop_tracking()
-
-                await object_searching_manager.start_visual_search(target,call_id)
-            return
-
-        elif function_name == "stop_visual_search":
-            print("[System: Stopping enviroment search...]")
-            await object_searching_manager.stop_visual_search()
-            await response_manager.send_function_output(call_id, {"status": "success"})
-            return
-        
-        elif function_name == "assess_batch_search":
-            await object_searching_manager.assess_batch_search_action(args,response_metadata)
-            return
-
-        elif function_name == "approach_object":
-            print("[System: Initiating object approaching...]")
-            await object_approaching_manager.start_approaching(call_id)
-            return
-
-        elif function_name in {"blind_move","navigate_to_pose","stop_motors","move_camera"}:
-            if object_tracking_manager.tracking: 
-                await object_tracking_manager.stop_tracking()
-
-            payload = {"command": function_name, **args}
-
-            print(f"[System: Dispatching {function_name} command to ROS 2...]")
-            print(f"Payload: {payload}")
-
-            async with zmq_req_lock:
-                await zmq_req_socket.send_json(payload)
-                feedback = await zmq_req_socket.recv_json()
-
-            print(f"[System: ROS 2 Acknowledged: {feedback.get('status', 'unknown')}]")
-
-            await response_manager.send_function_output(call_id, feedback)
-            return
-
-        elif function_name == 'stop_object_tracking':
-            print("[System: Stopping object tracking...]")
-            await object_tracking_manager.stop_tracking()
-            return
-
-        elif function_name == 'capture_depth':
-            jpeg_bytes = await asyncio.to_thread(camera.jpeg_bytes_snapshot, 70, False, "results/search_results/depth_input_snapshot.jpg")
-    
-            depth_result = await object_approaching_manager.depth_anything.detect(jpeg_bytes,output_root=Path("results/depth_results"))
-
-            print(f"DEPTH ANYTHING FINISHED. LATENCY: {depth_result.total_latency_ms}")
-
-        else:
-            await response_manager.send_function_output(call_id,{"status": "error","message": f"Unknown function: {function_name}"})
-            await response_manager.create_voice_response()
-
-    except Exception as error:
-        print(f"[Tool Error: {function_name}] {error}")
-
-        await response_manager.send_function_output(call_id,{"status": "error","message": str(error)})
-        await response_manager.create_voice_response()
-
-async def background_status_monitor(response_manager,object_tracking_manager,object_approaching_manager):
+async def background_status_monitor(cognitive_manager):
     print("[System: Background Monitor Listening for ROS 2 feedback...]")
     while True:
         try:
             message = await zmq_sub_socket.recv_json()
             if message.get("type") == "event":
-                alert = f"[SYSTEM NOTIFICATION]: {message.get('event')} - {message['status']}"
-                await response_manager.create_voice_response(system_msg=alert)
-
-                if object_approaching_manager.approaching and message.get('event') == "navigation":
-                    object_approaching_manager.approaching = False
+                await cognitive_manager.publish_ros_event(message)
 
             elif message.get("type") == "state":
-                update_camera_state(message,object_tracking_manager)
+                update_camera_state(message)
+                await cognitive_manager.publish_world_state({
+                    **message,
+                    "tracking": cognitive_manager.track_action.tracking,
+                    "tracking_stable": cognitive_manager.track_action.stable,
+                })
 
         except Exception as e:
             print(f"[System Error in Monitor]: {e}")
-            await asyncio.sleep(1) 
+            await asyncio.sleep(1)
 
-async def receive_events(ws,app,response_manager,camera,object_tracking_manager,object_searching_manager,object_approaching_manager):
+async def receive_events(ws,app,response_manager,camera,cognitive_manager):
     human_speaking = False
-    session_state = {}
 
     async for message in ws:
         event = json.loads(message)
@@ -252,8 +137,8 @@ async def receive_events(ws,app,response_manager,camera,object_tracking_manager,
         elif event_type == "response.created":
             response = event.get("response", {})
             response_manager.handle_response_created(response)
-            
-      
+
+
         elif event_type == "response.done":
             response = event.get("response", {})
             response_manager.handle_response_done(response)
@@ -275,18 +160,12 @@ async def receive_events(ws,app,response_manager,camera,object_tracking_manager,
                 response_metadata = response.get("metadata") or {}
 
                 create_tool_task(
-                    handle_tool_call(
+                    cognitive_manager.handle_tool_call(
                         ws,
                         function_name=output_item.get("name"),
                         arguments=output_item.get("arguments"),
                         call_id=output_item.get("call_id"),
                         response_metadata=response_metadata,
-                        response_manager=response_manager,
-                        camera=camera,
-                        object_searching_manager=object_searching_manager,
-                        object_tracking_manager=object_tracking_manager,
-                        object_approaching_manager=object_approaching_manager,
-                        session_state=session_state
                     ),
                     name=f"tool-{output_item.get('name', 'unknown')}",
                 )
@@ -366,7 +245,7 @@ async def main():
         "Authorization": "Bearer " + OPENAI_API_KEY,
         "OpenAI-Safety-Identifier": "hashed-user-id",
     }
-    
+
     app = AudioApp()
     print("✅ AUDIO IS READY")
 
@@ -405,35 +284,6 @@ async def main():
         max_initial_replay_frames=15
     )
 
-    object_tracking_manager = ObjectTrackingManager(
-        csrt_tracker=csrt_tracker,
-        grounding_dino=grounding_dino,
-        yolo=yolo,
-        zmq_req_lock=zmq_req_lock,
-        zmq_req_socket=zmq_req_socket,
-        zmq_pub_socket=zmq_pub_socket,
-    )
-
-    object_searching_manager = ObjectSearchingManager(
-            ws=None,
-            zmq_req_lock=zmq_req_lock,
-            zmq_req_socket=zmq_req_socket,
-            camera=camera,
-            response_manager = response_manager,
-            object_tracking_manager=object_tracking_manager
-        )
-    
-    object_approaching_manager = ObjectApproachingManager(
-        camera=camera, 
-        csrt_tracker=csrt_tracker,
-        grounding_dino=grounding_dino,
-        depth_anything=depth_anything,
-        object_tracking_manager=object_tracking_manager,
-        response_manager=response_manager,
-        zmq_req_lock=zmq_req_lock,
-        zmq_req_socket=zmq_req_socket,
-    )
-
     camera.start()
     csrt_tracker.start_worker()
     print("✅ CSRT TRACKER IS READY")
@@ -454,7 +304,7 @@ async def main():
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
-    
+
     tools_file = []
     for path in TOOLS_PATHS:
         tools_file.extend(load_json(path))
@@ -465,8 +315,45 @@ async def main():
             print("\n✅ CONNECTED TO GPT REALTIME AGENT.\n")
 
             response_manager.ws = ws
-            object_searching_manager.ws = ws
-            
+            track_action = TrackAction(
+                csrt_tracker=csrt_tracker,
+                grounding_dino=grounding_dino,
+                yolo=yolo,
+                zmq_req_lock=zmq_req_lock,
+                zmq_req_socket=zmq_req_socket,
+                zmq_pub_socket=zmq_pub_socket,
+            )
+            search_action = SearchAction(
+                ws=ws,
+                zmq_req_lock=zmq_req_lock,
+                zmq_req_socket=zmq_req_socket,
+                camera=camera,
+            )
+            see_action = SeeAction(ws=ws, camera=camera)
+            approach_action = ApproachAction(
+                zmq_req_lock=zmq_req_lock,
+                zmq_req_socket=zmq_req_socket,
+            )
+
+            async def send_robot_command(payload):
+                async with zmq_req_lock:
+                    await zmq_req_socket.send_json(payload)
+                    return await asyncio.wait_for(
+                        zmq_req_socket.recv_json(),
+                        timeout=5.0,
+                    )
+
+            cognitive_manager = CognitionManager(
+                approach_action=approach_action,
+                search_action=search_action,
+                see_action=see_action,
+                track_action=track_action,
+                send_tool_output=response_manager.send_function_output,
+                request_voice=response_manager.create_voice_response,
+                send_robot_command=send_robot_command,
+                inform_llm=response_manager.send_system_context,
+            )
+
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -501,7 +388,7 @@ async def main():
                             "voice": "shimmer",
                         }
                     },
-                    
+
                     "instructions": system_prompt,
                     "tools": tools_file
                 }
@@ -510,8 +397,9 @@ async def main():
 
             await asyncio.gather(
                 send_mic_audio(ws, app),
-                receive_events(ws,app,response_manager,camera,object_tracking_manager,object_searching_manager,object_approaching_manager),
-                background_status_monitor(response_manager,object_tracking_manager,object_approaching_manager),
+                receive_events(ws,app,response_manager,camera,cognitive_manager),
+                background_status_monitor(cognitive_manager),
+                cognitive_manager.cognition_loop(),
                 display_camera_loop(camera,csrt_tracker,yolo),
                 wait_for_dino(),
                 wait_for_depth(),
@@ -524,8 +412,8 @@ async def main():
     finally:
         print("Cleaning up audio hardware...")
         app.stop()
-        camera.stop()            
-        cv2.destroyAllWindows()   
+        camera.stop()
+        cv2.destroyAllWindows()
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await depth_anything.close()
@@ -536,19 +424,19 @@ async def main():
 def ensure_string(raw_target) -> str | None:
     if not raw_target or raw_target == "":
         return None
-        
+
     if isinstance(raw_target, str): return raw_target.strip()
-        
+
     if isinstance(raw_target, dict):
         for key in ['type', 'target', 'name', 'object', 'value']:
             if key in raw_target and isinstance(raw_target[key], str):
                 return raw_target[key].strip()
-        
+
         return json.dumps(raw_target)
-        
+
     if isinstance(raw_target, list):
         return ", ".join(str(item) for item in raw_target if item)
-    
+
     return str(raw_target)
 def has_meaningful_speech(text: str) -> bool:
     text = text.strip()

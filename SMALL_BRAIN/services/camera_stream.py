@@ -183,20 +183,3 @@ async def send_camera_image(ws, jpeg_bytes, instruction):
     print(f"\n[Camera] IMAGE ADDED")
 
     return {"jpeg_bytes": len(jpeg_bytes), "base64_characters": len(encoded_image)}
-
-def clear_images_folder(folder_path="results/search_results", extensions=(".jpg", ".jpeg", ".png", ".webp")):
-    target_dir = Path(folder_path)
-    if not target_dir.is_dir():
-        print(f"[Cleanup] Folder '{folder_path}' does not exist.")
-        return 0
-
-    deleted_count = 0
-    for item in target_dir.iterdir():
-        if item.is_file() and (extensions is None or item.suffix.lower() in extensions):
-            try:
-                item.unlink()
-                deleted_count += 1
-            except OSError as e:
-                print(f"[Cleanup] Failed to delete {item.name}: {e}")
-
-    return deleted_count

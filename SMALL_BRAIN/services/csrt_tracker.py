@@ -14,8 +14,7 @@ class StartTrackingCommand:
         self.target = target
 
 class TrackingUpdate:
-    def __init__(self, is_tracking, target, sequence, success, bbox_xywh=None, normalized_x=None, normalized_y=None):
-        self.is_tracking = is_tracking
+    def __init__(self, target, sequence, success, bbox_xywh=None, normalized_x=None, normalized_y=None):
         self.target = target
         self.sequence = sequence
         self.success = success
@@ -118,19 +117,15 @@ class CSRTTrackingManager:
         self._commands.put_nowait(command)
 
     def stop_tracking(self):
+        self.tracker = None
         self.active = False
         self.tracking_update = None
+        self.target = ""
 
         try: 
             self._commands.get_nowait()
         except queue.Empty: pass
         self._commands.put_nowait(None)
-
-    def _publish_lost(self, target, sequence):
-        self.tracking_update = TrackingUpdate(
-            is_tracking=False, target=target, sequence=sequence, success=False
-        )
-        self.stop_tracking()
 
     # ==========================================
     # CLEAN RUN LOOP
@@ -151,16 +146,12 @@ class CSRTTrackingManager:
     def _process_commands(self):
         try:
             # Block for 200ms if idle, or just peek (10ms) if busy tracking
-            command = self._commands.get(timeout=0.01 if self.active else 0.2)
+            command = self._commands.get(timeout=0.01 if self.tracking_update else 0.2)
         except queue.Empty:
             return # Mailbox is empty, do nothing
 
         # If the command is None, the LLM told us to stop tracking
         if command is None:
-            self.tracker = None
-            self.active = False
-            self.tracking_update = None
-            self.target = ""
             return
 
         # --- A new target has arrived! Initialize it. ---
@@ -181,8 +172,7 @@ class CSRTTrackingManager:
             ok, bbox = self.tracker.update(frame["bgr"]) 
             self.current_sequence = frame["sequence"]
             if not ok:
-                self.active = False
-                self._publish_lost(self.target, self.current_sequence)
+                self.tracking_update = TrackingUpdate(target=target, sequence=sequence, success=False)
                 break
 
     # ==========================================
@@ -202,8 +192,7 @@ class CSRTTrackingManager:
         self.current_sequence = newest.sequence
 
         if not ok:
-            self.active = False
-            self._publish_lost(self.target, self.current_sequence)
+            self.tracking_update = TrackingUpdate(target=target, sequence=sequence, success=False)
             return
 
         # Calculate math on success
@@ -218,7 +207,6 @@ class CSRTTrackingManager:
 
         # Expose the state to the main thread
         self.tracking_update = TrackingUpdate(
-            is_tracking=True,
             target=self.target,
             sequence=self.current_sequence,
             success=True,

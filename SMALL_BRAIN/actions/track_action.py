@@ -230,8 +230,15 @@ def normalize_object_target(target):
 
     return aliases.get(target, target)
 
+class ActionResult:
+    def __init__(self,action_type,event,timestamp,status,msg=None):
+        self.action_type = action_type
+        self.event = event
+        self.timestamp = timestamp
+        self.status = status
+        self.msg = msg
 
-class ObjectTrackingManager():
+class TrackAction():
     def __init__(self, csrt_tracker,yolo,grounding_dino,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
@@ -239,9 +246,10 @@ class ObjectTrackingManager():
         self.zmq_req_lock = zmq_req_lock
         self.zmq_req_socket = zmq_req_socket
         self.zmq_pub_socket = zmq_pub_socket
+
         self.tracking = False
         self.stable = False
-        self.stable_tick = 0.0
+        self.stable_tick = 0
         self.stable_threshold = STABLE_THRESHOLD
         self._tracking_task = None 
 
@@ -252,8 +260,6 @@ class ObjectTrackingManager():
         self.stable = False
         self.stable_tick = 0
         target = normalize_human_target(target) or normalize_object_target(target)
-        
-        if self.tracking: await self.stop_tracking(reset=False)
 
         if target in human_trackable_parts:
             self.yolo.vision_mode = "pose"
@@ -342,19 +348,18 @@ class ObjectTrackingManager():
                 self.tracking = True
                 self._tracking_task = asyncio.create_task(self._object_tracking_loop())
 
-                return "tracking"
+                return ActionResult("track_action","start",time.time(),"success","tracking_object")
             else:
-                return "failed to track"
+                return ActionResult("track_action","start",time.time(),"failure","tracking_denied")
         else:
-            self.csrt_tracker.stop_tracking()
-            return "failed to detect"
+            return ActionResult("track_action","start",time.time(),"failure","object_detection_failed")
 
     async def _object_tracking_loop(self):
         succeeded = False
 
         while self.tracking:
             tracking_update = self.csrt_tracker.tracking_update
-            if tracking_update is not None and tracking_update.is_tracking and tracking_update.success:
+            if tracking_update.success:
                 succeeded = True
                 target_x = tracking_update.normalized_x
                 target_y = tracking_update.normalized_y
@@ -374,8 +379,9 @@ class ObjectTrackingManager():
                     self.stable_tick = 0
                     self.stable = False
             else:
-                if succeeded: await self.stop_tracking()
-            
+                if succeeded: 
+                    stop_tracking(msg="object_lost")
+
             await asyncio.sleep(0.05)
     
     async def _start_person_tracking(self,target):
@@ -387,7 +393,7 @@ class ObjectTrackingManager():
         ]
 
         if not detections:
-            return "failed to detect"
+            return ActionResult("track_action","start",time.time(),"failure","person_detection_failed")
 
         person = max(
             detections,
@@ -395,9 +401,6 @@ class ObjectTrackingManager():
         )
 
         self.person_path = self.find_best_person_path(person,target)
-
-        if not self.person_path:
-            return "failed to detect"
 
         self.person_path_index = 0
         self.person_stable_count = 0
@@ -417,65 +420,41 @@ class ObjectTrackingManager():
                 self.zmq_req_socket.recv_json(),
                 timeout=1.0,
             )
+        if feedback.get("status") == "accepted":
+            self.tracking = True
+            self._tracking_task = asyncio.create_task(self._person_tracking_loop())
+            
+            return ActionResult("track_action","start",time.time(),"success",f"tracking_person_{target}")
+        else:
+            return ActionResult("track_action","start",time.time(),"failure",f"tracking_denied")
 
-        if feedback.get("status") != "accepted":
-            return "failed to track"
-
-        self.tracking = True
-
-        self._tracking_task = asyncio.create_task(
-            self._person_tracking_loop()
-        )
-
-        return "tracking"
 
     def find_best_person_path(self,person,target):
         target_keypoints = HUMAN_RETARGETS.get(target)
-
-        if target_keypoints is None:
-            return None
-
         visible_keypoints = [name for name,keypoint in person["keypoints"].items()]
-
         best_path = None
         shortest_path = float("inf")
-
         for visible_keypoint in visible_keypoints:
             for target_keypoint in target_keypoints:
                 path = self.find_skeleton_path(
                     visible_keypoint,
                     target_keypoint
                 )
-
                 if path and len(path) < shortest_path:
                     shortest_path = len(path)
                     best_path = path
-
         return best_path
 
     def find_skeleton_path(self,start,target):
         queue = [(start,[start])]
         visited = set()
-
         while queue:
             current,path = queue.pop(0)
-
-            if current == target:
-                return path
-
-            if current in visited:
-                continue
-
+            if current == target: return path
+            if current in visited: continue
             visited.add(current)
-
             for neighbor in SKELETON_GRAPH[current]:
-                queue.append(
-                    (
-                        neighbor,
-                        path + [neighbor]
-                    )
-                )
-
+                queue.append((neighbor,path + [neighbor]))
         return None
 
     async def _person_tracking_loop(self):
@@ -491,7 +470,7 @@ class ObjectTrackingManager():
             ]
 
             if not detections:
-                await asyncio.sleep(0.05)
+                stop_tracking(msg="person_lost")
                 continue
 
             person = max(
@@ -601,23 +580,21 @@ class ObjectTrackingManager():
         return False
         
 
-    async def stop_tracking(self,reset=True):
+    async def stop_tracking(self,msg=None):
         self.yolo.vision_mode = "dj"
         self.stable = False
         self.stable_tick = 0
         self.tracking = False 
-        self.stable = False
         self.csrt_tracker.stop_tracking()
 
-        if reset:
-            async with self.zmq_req_lock:
-                await self.zmq_req_socket.send_json({"command": "stop_tracking_object"})
-                feedback = await asyncio.wait_for(
-                    self.zmq_req_socket.recv_json(),
-                    timeout=1.0,
-                )
-        
-        return "Tracking stopped."
+        async with self.zmq_req_lock:
+            await self.zmq_req_socket.send_json({"command": "stop_tracking_object"})
+            feedback = await asyncio.wait_for(
+                self.zmq_req_socket.recv_json(),
+                timeout=1.0,
+            )
+    
+        return ActionResult("track_action","stop",time.time(),"success",msg)
 
     def target_to_angles(self, x, y):
         center_x_error = x - 0.5

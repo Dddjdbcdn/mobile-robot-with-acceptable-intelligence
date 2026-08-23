@@ -5,12 +5,14 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import time
 from typing import Any
 import uuid
 
 # Assuming these are available in your environment
 from utilities.database_functions import load_json
-from services.camera_stream import clear_images_folder
+
+from database.state import robot_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
@@ -18,6 +20,7 @@ VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
 tools = load_json(VISION_OOB_TOOLS_PATH)
 vision_oob_tools = {tool["name"]: tool for tool in tools}
 ASSESS_BATCH_SEARCH_TOOL = vision_oob_tools.get("assess_batch_search")
+ASSESS_FRAME_SEARCH_TOOL = vision_oob_tools.get("assess_frame_search")
 
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.5
 CAMERA_HORIZONTAL_FOV_DEG = 85
@@ -41,28 +44,35 @@ TILT_POSITION_ANGLE = {
 PAN_SWEEP_ORDER = ("leftmost", "center", "rightmost")
 SWEEP_TILT_ORDER = ("center", "upmost", "downmost")
 
+class ActionResult:
+    def __init__(self,action_type,event,timestamp,status,msg=None):
+        self.action_type = action_type
+        self.event = event
+        self.timestamp = timestamp
+        self.status = status
+        self.msg = msg
 
-class ObjectSearchingManager:
-    def __init__(self, ws, zmq_req_lock, zmq_req_socket, camera, response_manager,object_tracking_manager):
+class SearchAction:
+    def __init__(self, ws, zmq_req_lock, zmq_req_socket, camera):
         self.ws = ws
         self.zmq_req_lock = zmq_req_lock
         self.zmq_req_socket = zmq_req_socket
-        self.response_manager = response_manager
-        self.object_tracking_manager = object_tracking_manager
         self.camera = camera
+        self.search_task = None
+
+        self.completion_future = None
         self.reset_state()
 
     def reset_state(self) -> None:
         self.active = False
         self.search_id = None
-        self.main_call_id = None
         self.target = None
         self.sweep_index = 0
         self.pan_angle = PAN_POSITION_ANGLE["center"]
         self.tilt_angle = TILT_POSITION_ANGLE["center"]
         self.current_batch_frames = []
         self.current_candidate = None
-        self.verification_frame = None
+        self.first_frame_result = None
         self.batch_results = []
         self.pending_request_id = None
 
@@ -138,11 +148,60 @@ class ObjectSearchingManager:
         self.current_batch_frames = frames
         await self.request_batch_assessment(frames)
 
-    async def request_batch_assessment(self, frames: list[dict[str, Any]]) -> None:
+    async def request_frame_assessment(self):
+        request_id = uuid.uuid4().hex
+        self.pending_request_id = request_id
+
+        jpeg_bytes = await asyncio.to_thread(
+            self.camera.jpeg_bytes_snapshot,
+            tracking_bgr=True,
+            save_path=f"results/search_results/first_search_frame.jpg",
+        )
+
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": (
+                    f"Search for this object: {self.target}\n\n"
+                    "Use found when an object is visually clear or plausibly resembles the target.\n"
+                    "Use not_found when the target is not visible.\n"
+                    "Always call assess_frame_search exactly once."
+                ),
+            },
+            {
+                "type": "input_image",
+                "image_url": jpeg_to_data_url(jpeg_bytes),
+            }
+        ]
+
+        event = {
+            "event_id": f"visual_search_scan_{request_id}",
+            "type": "response.create",
+            "response": {
+                "conversation": "none",
+                "metadata": {
+                    "kind": "visual_search_assessment",
+                    "search_id": str(self.search_id),
+                    "request_id": request_id,
+                },
+                "output_modalities": ["text"],
+                "tools": [ASSESS_FRAME_SEARCH_TOOL],
+                "tool_choice": "required",
+                "input": [{"type": "message", "role": "user", "content": content}],
+            },
+        }
+        await self.ws.send(json.dumps(event))
+
+    async def request_batch_assessment(self, frames):
         request_id = uuid.uuid4().hex
         self.pending_request_id = request_id
 
         tilt_position = SWEEP_TILT_ORDER[int(self.sweep_index)]
+
+        images_order = "image_1: leftmost, image_2: center, image_3: rightmost"
+
+        if tilt_position == "upmost":
+            images_order = "image_1: rightmost, image_2: center, image_3: leftmost"
 
         content: list[dict[str, Any]] = [
             {
@@ -151,9 +210,7 @@ class ObjectSearchingManager:
                     f"Search for this object: {self.target}\n\n"
                     "These three images form one horizontal camera sweep.\n"
                     f"Current tilt: {tilt_position}\n"
-                    "image_1: leftmost\n"
-                    "image_2: center\n"
-                    "image_3: rightmost\n\n"
+                    f"{images_order}\n"
                     "Examine all three images.\n"
                     "Use candidate when an object is visually clear or plausibly resembles the target.\n"
                     "Use not_found when the target is not visible.\n"
@@ -196,7 +253,37 @@ class ObjectSearchingManager:
         }
         await self.ws.send(json.dumps(event))
 
-    async def assess_batch_search_action(self, args, response_metadata) -> None:
+    async def assess_frame_search(self, args, response_metadata) -> None:
+        if not self.active:
+            return
+
+        if response_metadata.get("kind") != "visual_search_assessment": return
+        if str(response_metadata.get("search_id")) != str(self.search_id): return
+        if response_metadata.get("request_id") != self.pending_request_id: return
+
+        self.pending_request_id = None
+
+        self.first_frame_result = {
+            "initial_pan_position": self.pan_angle,
+            "initial_tilt_position": self.tilt_angle,
+            "assessment": args,
+        }
+
+        result = args.get("result")
+        confidence = float(args.get("confidence", 0.0))
+
+        if result == "candidate" and confidence >= CANDIDATE_CONFIDENCE_THRESHOLD:
+            await self.complete_visual_search(
+                result="found",
+                message=f"I found {self.target}."
+            )
+            return
+
+        else:
+            await self.capture_sweep_batch()
+        return
+
+    async def assess_batch_search(self, args, response_metadata) -> None:
         if not self.active:
             return
 
@@ -239,7 +326,11 @@ class ObjectSearchingManager:
                     "sweep_index": int(self.sweep_index),
                 }
 
-                await self.capture_verification_image()
+                await self.move_to_candidate()
+                await self.complete_visual_search(
+                    result="found",
+                    message=f"I found {self.target}."
+                )
                 return
 
         self.sweep_index += 1
@@ -254,12 +345,11 @@ class ObjectSearchingManager:
             )
         return
 
-    async def capture_verification_image(self) -> None:
+    async def move_to_candidate(self) -> None:
         candidate = self.current_candidate
         if not isinstance(candidate, dict):
             raise RuntimeError("Verification requested without a candidate")
 
-        candidate_image = str(candidate["assessment"]["candidate_image"])
         candidate_x_position = candidate["assessment"].get("candidate_position").get("x")
         candidate_y_position = candidate["assessment"].get("candidate_position").get("y")
         candidate_frame = candidate.get("frame")
@@ -273,62 +363,40 @@ class ObjectSearchingManager:
 
         await self.move_camera_angles(target_pan, target_tilt)
 
-        jpeg_bytes = await asyncio.to_thread(self.camera.jpeg_bytes_snapshot, save_path=f"results/search_results/verification.jpg")
-        snapshot = self.camera.snapshot()
-
-        self.verification_frame = {
-            "source_candidate_image": candidate_image,
-            "pan_angle": float(self.pan_angle),
-            "tilt_angle": float(self.tilt_angle),
-            "jpeg_bytes": jpeg_bytes,
-            "snapshot": snapshot
-        }
-
-        await self.complete_visual_search(
-            result="found",
-            message=f"I found {self.target}."
-        )
-
-    async def start_visual_search(self, target, main_call_id) -> None:
+    async def start_visual_search(self, target):
         if self.active:
-            await self.response_manager.send_function_output(
-                main_call_id,
-                {
-                    "status": "error",
-                    "message": "Another visual search is already active.",
-                    "active_target": self.target,
-                },
+            return ActionResult(
+                "search_action", "start", time.time(), "failure",
+                {"result": "search_busy", "target": self.target},
             )
-            await self.response_manager.create_voice_response()
-            return
 
         self.reset_state()
 
-        async with self.zmq_req_lock:
-            await self.zmq_req_socket.send_json({"command": "get_state"})
-            feedback = await asyncio.wait_for(
-                self.zmq_req_socket.recv_json(),
-                timeout=5.0,
-            )
-    
         self.active = True
         self.search_id = uuid.uuid4().hex
-        self.main_call_id = main_call_id
         self.target = target
-        self.pan_angle = feedback.get("servo_pan_angle", 95)
-        self.tilt_angle = feedback.get("servo_tilt_angle", 85)
+        self.pan_angle = robot_state["camera"]["pan_angle"]
+        self.tilt_angle = robot_state["camera"]["tilt_angle"]
 
         print(f"[Visual search started] id={self.search_id}, target={target}")
 
         clear_images_folder()
-        await self.capture_sweep_batch()
+        self.completion_future = asyncio.get_running_loop().create_future()
+        await self.request_frame_assessment()
+
+        try:
+            return await self.completion_future
+        except asyncio.CancelledError:
+            if self.active:
+                await self.stop_visual_search()
+            raise
 
     async def stop_visual_search(self) -> None:
         if not self.active:
-            return
+            return ActionResult("seach_action","start",time.time(),"success")
 
         await self.move_camera_angles(PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"])
-        await self.complete_visual_search(
+        return await self.complete_visual_search(
             result="search_cancelled",
             message="The visual search was cancelled by the user. Report the current progress."
         )
@@ -352,28 +420,18 @@ class ObjectSearchingManager:
 
         print(f"[Visual search completed] {final_result}")
 
-        target = self.target
-        verification_frame = self.verification_frame
-        
-        if result == "found":
-            voice_text = f"Yes, I found {target}, and briefly explain the context."
-        elif result == "not_found":
-            voice_text = f"No, I couldn't find {target}, and briefly explain the context."
-        elif result == "search_cancelled":
-            voice_text = f"The search for {target} was cancelled."
-        else:
-            voice_text = message
-
-        await self.response_manager.create_voice_response(
-            system_msg=(
-                f"Result: {json.dumps(final_result)}\n"
-                f"Answer to say: {voice_text}"
-            )
+        action_result = ActionResult(
+            "search_action", "stop", time.time(), "success", msg=final_result
         )
-
+        completion_future = self.completion_future
         self.reset_state()
 
-# Helper Functions 
+        if completion_future is not None and not completion_future.done():
+            completion_future.set_result(action_result)
+
+        return action_result
+
+# Helper Functions
 
 def jpeg_to_data_url(jpeg_bytes: bytes) -> str:
     encoded = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -448,3 +506,20 @@ def save_candidate_debug_image(
         output_path = Path(save_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(output_path, format="JPEG", quality=95)
+
+def clear_images_folder(folder_path="results/search_results", extensions=(".jpg", ".jpeg", ".png", ".webp")):
+    target_dir = Path(folder_path)
+    if not target_dir.is_dir():
+        print(f"[Cleanup] Folder '{folder_path}' does not exist.")
+        return 0
+
+    deleted_count = 0
+    for item in target_dir.iterdir():
+        if item.is_file() and (extensions is None or item.suffix.lower() in extensions):
+            try:
+                item.unlink()
+                deleted_count += 1
+            except OSError as e:
+                print(f"[Cleanup] Failed to delete {item.name}: {e}")
+
+    return deleted_count

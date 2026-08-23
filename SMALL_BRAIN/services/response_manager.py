@@ -33,6 +33,17 @@ class ResponseManager:
             await self._cancel_active_response()
             await self._create_response_and_wait(system_msg)
 
+    async def send_system_context(self, message) -> None:
+        """Inform the model without creating or interrupting a response."""
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": message}],
+            },
+        }))
+
     async def create_tool_response(self,tool=None):
         request_id = uuid.uuid4().hex
 

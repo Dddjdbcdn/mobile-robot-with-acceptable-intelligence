@@ -77,14 +77,5 @@
             "type": "object",
             "properties": {}
         }
-    },
-    {
-        "type": "function",
-        "name": "center_robot",
-        "description": "Call this function when you want to rotate your robot body to align with the camera. Call this upon request or to get ready for approaching an object",
-        "parameters": {
-            "type": "object",
-            "properties": {}
-        }
     }
 ]

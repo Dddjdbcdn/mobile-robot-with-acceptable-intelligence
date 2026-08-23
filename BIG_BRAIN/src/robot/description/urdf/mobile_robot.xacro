@@ -243,7 +243,7 @@
 <joint name="ultrasonic_right_joint" type="fixed">
   <parent link="base_link"/>
   <child link="ultrasonic_right_link"/>
-  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${-side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 0.05"/>
+  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${-side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 ${-ultrasonic_z_angle}"/>
 </joint>
 
 <link name="ultrasonic_right_link">
