@@ -103,6 +103,8 @@ def project_tof_region(
 def draw_tof_overlay(
     frame: np.ndarray,
     stale_after_s: float = 0.5,
+    tracking: bool = False,
+    tracking_stable: bool = False,
 ) -> np.ndarray:
     d = robot_state["camera"]
     distance = d["camera_tof_range"]
@@ -151,11 +153,11 @@ def draw_tof_overlay(
     lines = [
         f"X {d['object_x']:+.2f}m  Y {d['object_y']:+.2f}m",
         f"Pan {d['pan_angle']:.1f}  Tilt {d['tilt_angle']:.1f}",
-        f"Tracking: {'YES' if d['tracking'] else 'NO'}",
+        f"Tracking: {'YES' if tracking else 'NO'}",
     ]
 
-    if d["tracking"]:
-        lines.append(f"Stable: {'YES' if d['is_stable'] else 'NO'}")
+    if tracking:
+        lines.append(f"Stable: {'YES' if tracking_stable else 'NO'}")
 
     for i, text in enumerate(lines):
         cv2.putText(

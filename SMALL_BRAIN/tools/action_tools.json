@@ -1,0 +1,100 @@
+[
+  {
+    "type": "function",
+    "name": "see_action",
+    "description": "Capture and inspect the current camera frame. Use this when the user asks what is visible, whether something is visible, to look at object, describe the scene, or when visual context is needed before deciding what to do.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": ["string", "null"],
+          "description": "A self-contained visual inspection instruction that matches the user's requested output exactly. Keep the requested answer minimal unless the user asks for detail. Do not add unrelated environment description. The query must preserve the user's requested level of detail. By default, request the shortest direct answer that fully satisfies the user. Do not request a general scene description unless the user explicitly asks for one. Elaborate only when the user explicitly asks for details, explanation, description, reasoning, or a full scene analysis."
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "search_action",
+    "description": "Start an interruptible visual search for an object or person. A running result only confirms the search started. Wait for the matching terminal ROBOT ACTION EVENT before deciding whether the target was found. After not_found, change viewpoint before retrying.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The object or person to search."
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+    {
+    "type": "function",
+    "name": "track_action",
+    "description": "Start continuously tracking an object or person. Tracking remains active after the tool returns running. Use robot state and later action events to detect stability or target loss.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The object or person to track."
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "approach_action",
+    "description": "Start approaching an object or person. Call only when that exact target is actively tracked and tracking is stable. Wait for the matching terminal ROBOT ACTION EVENT to know whether the target was reached.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The object or person to approach."
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+
+  {
+  "type": "function",
+  "name": "move_action",
+  "description": "Start one interruptible relative robot movement. A running result means motion began, not that it completed. Wait for the matching terminal ROBOT ACTION EVENT before relying on the new viewpoint.",
+  "parameters": {
+      "type": "object",
+      "properties": {
+          "linear_velocity": {
+              "type": "number",
+              "description": "Forward/backward speed in meters per second (m/s). Range: [-0.5, 0.5]. Positive values move the robot forward, negative values move it backward. Try to keep the linear velocity absolute value above 0.05 m/s to overcome friction"
+          },
+          "distance": {
+              "type": "number",
+              "description": "Distance to travel linearly in meters (m). Range: [0.0,0.5]. The direction (forward or backward) is determined inside the linear velocity property."
+          },
+          "angular_velocity": {
+              "type": "number",
+              "description": "Rotational speed in radians per second (rad/s). Range: [-3.0, 3.0]. Positive values rotate counter-clockwise (left), negative values rotate clockwise (right). Try to keep the angular velocity absolute above value 0.5 rad/s to overcome friction"
+          },
+          "angle": {
+              "type": "number",
+              "description": "Angle to rotate in radians (rad). Range: [0.0, 6.283]. The direction (clockwise or counterclockwise) is determined inside the angular velocity property."
+          }
+      },
+      "required": [
+          "linear_velocity",
+          "distance",
+          "angular_velocity",
+          "angle"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

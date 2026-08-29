@@ -150,7 +150,6 @@ class CSRTTrackingManager:
         except queue.Empty:
             return # Mailbox is empty, do nothing
 
-        # If the command is None, the LLM told us to stop tracking
         if command is None:
             return
 
@@ -172,7 +171,11 @@ class CSRTTrackingManager:
             ok, bbox = self.tracker.update(frame["bgr"]) 
             self.current_sequence = frame["sequence"]
             if not ok:
-                self.tracking_update = TrackingUpdate(target=target, sequence=sequence, success=False)
+                self.tracking_update = TrackingUpdate(
+                    target=self.target,
+                    sequence=self.current_sequence,
+                    success=False,
+                )
                 break
 
     # ==========================================
@@ -192,7 +195,11 @@ class CSRTTrackingManager:
         self.current_sequence = newest.sequence
 
         if not ok:
-            self.tracking_update = TrackingUpdate(target=target, sequence=sequence, success=False)
+            self.tracking_update = TrackingUpdate(
+                target=self.target,
+                sequence=self.current_sequence,
+                success=False,
+            )
             return
 
         # Calculate math on success

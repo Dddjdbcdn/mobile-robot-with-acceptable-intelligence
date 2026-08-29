@@ -1,6 +1,5 @@
 import asyncio
 from pathlib import Path
-import time
 
 HORIZONTAL_FOV_DEG = 85
 VERTICAL_FOV_DEG = 52
@@ -230,49 +229,69 @@ def normalize_object_target(target):
 
     return aliases.get(target, target)
 
-class ActionResult:
-    def __init__(self,action_type,event,timestamp,status,msg=None):
-        self.action_type = action_type
-        self.event = event
-        self.timestamp = timestamp
-        self.status = status
-        self.msg = msg
+from actions.action_result import ActionResult
 
 class TrackAction():
-    def __init__(self, csrt_tracker,yolo,grounding_dino,zmq_req_lock, zmq_req_socket,zmq_pub_socket, STABLE_THRESHOLD = 0.05):
+    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, STABLE_THRESHOLD=0.05):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
         self.yolo = yolo
-        self.zmq_req_lock = zmq_req_lock
-        self.zmq_req_socket = zmq_req_socket
         self.zmq_pub_socket = zmq_pub_socket
+        self.send_robot_command = send_robot_command
+        self.camera = camera
 
-        self.tracking = False
+        self.active = False
+        self.target = None
         self.stable = False
         self.stable_tick = 0
         self.stable_threshold = STABLE_THRESHOLD
         self._tracking_task = None 
+        self.completion_future = None
+        self.action_id = None
 
         self.person_path = []
         self.person_path_index = 0
 
-    async def start_tracking(self,jpeg_bytes,target,snapshot):
+    async def start_tracking(self, target, action_id):
+        if self.active:
+            await self.stop_tracking(
+                reason_code="REPLACED",
+                status="cancelled",
+                outcome="replaced_by_new_goal",
+            )
+
+        normalized_target = (
+            normalize_human_target(target) or normalize_object_target(target)
+        )
+
+        self.action_id = action_id
+        self.target = normalized_target
         self.stable = False
         self.stable_tick = 0
-        target = normalize_human_target(target) or normalize_object_target(target)
 
-        if target in human_trackable_parts:
+        jpeg_bytes = await asyncio.to_thread(
+            self.camera.jpeg_bytes_snapshot,
+            70,
+            False,
+            "results/action_results/track_snapshot.jpg",
+        )
+        snapshot = self.camera.snapshot()
+
+        if normalized_target in human_trackable_parts:
             self.yolo.vision_mode = "pose"
             await asyncio.sleep(0.5)
+            return await self._start_person_tracking(normalized_target)
 
-            return await self._start_person_tracking(target)
+        return await self._start_object_tracking(
+            jpeg_bytes,
+            normalized_target,
+            snapshot,
+        )
 
-        return await self._start_object_tracking(jpeg_bytes,target,snapshot)
-
-    async def _start_object_tracking(self,jpeg_bytes,target,snapshot):
-        yolo_detected = False
-        groundingdino_detected = False
+    async def _start_object_tracking(self, jpeg_bytes, target, snapshot):
         tracking_bbox = None
+        detection_source = None
+        detection_confidence = None
 
         if target in dj_yolo_classes:
             matching = [
@@ -280,85 +299,97 @@ class TrackAction():
                 for detection in self.yolo.detections
                 if detection["class"] == target
             ]
-                
             if matching:
-                detection = max(matching,key=lambda d: d["confidence"])
-                print(
-                    f"YOLO TARGET FOUND: {detection['class']}. "
-                    f"SCORE: {detection['confidence']}."
-                )
-                yolo_detected = True
-
+                detection = max(matching, key=lambda item: item["confidence"])
                 bbox = detection["bbox"]
-
                 tracking_bbox = (
                     int(bbox["x1"]),
                     int(bbox["y1"]),
                     int(bbox["x2"] - bbox["x1"]),
                     int(bbox["y2"] - bbox["y1"]),
                 )
-    
-        if not yolo_detected:
+                detection_source = "yolo"
+                detection_confidence = detection["confidence"]
+
+        if tracking_bbox is None:
             self.yolo.vision_mode = "none"
             await asyncio.sleep(0.1)
-            groundinngdino_result = await self.grounding_dino.detect(
+            try:
+                grounding_result = await self.grounding_dino.detect(
                     image_source=jpeg_bytes,
-                    target=f"{target}",
+                    target=target,
                     box_threshold=0.25,
                     text_threshold=0.25,
                     nms_threshold=0.80,
                     output_root=Path("results/grounding_results"),
                 )
-            self.yolo.vision_mode = "dj"
+            finally:
+                self.yolo.vision_mode = "dj"
 
-            detection = groundinngdino_result.best
-
-            print(f"GROUNDING DINO FINISHED. LATENCY: {groundinngdino_result.inference_latency_ms}")
-
+            detection = grounding_result.best
             if detection is not None:
-                print(f"GROUNDING DINO TARGET FOUND: {detection.label}. SCORE: {detection.score}.")
-                groundingdino_detected = True
                 orig_x, orig_y, orig_w, orig_h = detection.tracker_box_xywh
-
                 tracking_bbox = (
                     int(orig_x / 2.0),
                     int(orig_y / 2.0),
                     int(orig_w / 2.0),
-                    int(orig_h / 2.0)
+                    int(orig_h / 2.0),
                 )
+                detection_source = "grounding_dino"
+                detection_confidence = detection.score
 
-        if yolo_detected or groundingdino_detected:
-            self.csrt_tracker.begin_tracking(
-                detection_sequence=snapshot.sequence, 
-                initialization_frame=snapshot.tracking_bgr, 
-                bbox_xywh=tracking_bbox, 
-                target=target
+        if tracking_bbox is None:
+            action_id = self.action_id
+            self.action_id = None
+            self.target = None
+            return ActionResult(
+                action_id=action_id,
+                action_type="track_action",
+                status="failed",
+                target=target,
+                outcome="target_not_detected",
+                reason_code="OBJECT_DETECTION_FAILED",
+                retryable=True,
             )
 
-            print(f"CSRT STARTS TRACKING OBJECT: {target}")
+        self.csrt_tracker.begin_tracking(
+            detection_sequence=snapshot.sequence,
+            initialization_frame=snapshot.tracking_bgr,
+            bbox_xywh=tracking_bbox,
+            target=target,
+        )
 
-            async with self.zmq_req_lock:
-                await self.zmq_req_socket.send_json({"command": "track_object"})
-                feedback = await asyncio.wait_for(
-                    self.zmq_req_socket.recv_json(),
-                    timeout=1.0,
-                )
+        feedback = await self.send_robot_command({
+            "command": "track_object",
+            "action_id": self.action_id,
+        })
 
-            if feedback.get("status") == "accepted":
-                self.tracking = True
-                self._tracking_task = asyncio.create_task(self._object_tracking_loop())
+        self.active = True
+        self.completion_future = asyncio.get_running_loop().create_future()
+        self._tracking_task = asyncio.create_task(self._object_tracking_loop())
 
-                return ActionResult("track_action","start",time.time(),"success","tracking_object")
-            else:
-                return ActionResult("track_action","start",time.time(),"failure","tracking_denied")
-        else:
-            return ActionResult("track_action","start",time.time(),"failure","object_detection_failed")
+        return ActionResult(
+            action_id=self.action_id,
+            action_type="track_action",
+            status="running",
+            target=target,
+            outcome="tracking",
+            data={
+                "tracking_stable": False,
+                "detection_source": detection_source,
+                "detection_confidence": detection_confidence,
+            },
+        )
 
     async def _object_tracking_loop(self):
         succeeded = False
 
-        while self.tracking:
+        while self.active:
             tracking_update = self.csrt_tracker.tracking_update
+            if tracking_update is None:
+                await asyncio.sleep(0.05)
+                continue
+
             if tracking_update.success:
                 succeeded = True
                 target_x = tracking_update.normalized_x
@@ -380,11 +411,15 @@ class TrackAction():
                     self.stable = False
             else:
                 if succeeded: 
-                    stop_tracking(msg="object_lost")
+                    await self.stop_tracking(
+                        reason_code="OBJECT_LOST",
+                        status="failed",
+                        outcome="target_lost",
+                    )
 
             await asyncio.sleep(0.05)
     
-    async def _start_person_tracking(self,target):
+    async def _start_person_tracking(self, target):
         detections = [
             detection
             for detection in self.yolo.detections
@@ -393,41 +428,47 @@ class TrackAction():
         ]
 
         if not detections:
-            return ActionResult("track_action","start",time.time(),"failure","person_detection_failed")
+            action_id = self.action_id or "unassigned"
+            self.action_id = None
+            self.target = None
+            return ActionResult(
+                action_id=action_id,
+                action_type="track_action",
+                status="failed",
+                target=target,
+                outcome="target_not_detected",
+                reason_code="PERSON_DETECTION_FAILED",
+                retryable=True,
+            )
 
-        person = max(
-            detections,
-            key=lambda detection: detection["confidence"]
-        )
-
-        self.person_path = self.find_best_person_path(person,target)
+        person = max(detections, key=lambda detection: detection["confidence"])
+        self.person_path = self.find_best_person_path(person, target)
 
         self.person_path_index = 0
         self.person_stable_count = 0
 
-        print(
-            f"TARGET: {target}"
-            f"\nSTARTING FROM: {self.person_path[0]}"
-            f"\nPATH: {' -> '.join(self.person_path)}"
+        feedback = await self.send_robot_command({
+            "command": "track_object",
+            "action_id": self.action_id,
+        })
+
+        self.active = True
+        self.completion_future = asyncio.get_running_loop().create_future()
+        self._tracking_task = asyncio.create_task(self._person_tracking_loop())
+
+        return ActionResult(
+            action_id=self.action_id,
+            action_type="track_action",
+            status="running",
+            target=target,
+            outcome="tracking",
+            data={
+                "tracking_stable": False,
+                "detection_source": "yolo_pose",
+                "detection_confidence": person.get("confidence"),
+                "keypoint_path": list(self.person_path),
+            },
         )
-
-        async with self.zmq_req_lock:
-            await self.zmq_req_socket.send_json({
-                "command": "track_object"
-            })
-
-            feedback = await asyncio.wait_for(
-                self.zmq_req_socket.recv_json(),
-                timeout=1.0,
-            )
-        if feedback.get("status") == "accepted":
-            self.tracking = True
-            self._tracking_task = asyncio.create_task(self._person_tracking_loop())
-            
-            return ActionResult("track_action","start",time.time(),"success",f"tracking_person_{target}")
-        else:
-            return ActionResult("track_action","start",time.time(),"failure",f"tracking_denied")
-
 
     def find_best_person_path(self,person,target):
         target_keypoints = HUMAN_RETARGETS.get(target)
@@ -461,7 +502,7 @@ class TrackAction():
         current_reached = False
         predicted_target = None
 
-        while self.tracking:
+        while self.active:
             detections = [
                 detection
                 for detection in self.yolo.detections
@@ -470,7 +511,11 @@ class TrackAction():
             ]
 
             if not detections:
-                stop_tracking(msg="person_lost")
+                await self.stop_tracking(
+                    reason_code="PERSON_LOST",
+                    status="failed",
+                    outcome="target_lost",
+                )
                 continue
 
             person = max(
@@ -565,7 +610,7 @@ class TrackAction():
         loop = asyncio.get_running_loop()
         start_time = loop.time()
 
-        while self.tracking:
+        while self.active:
             if self.stable:
                 return True
 
@@ -580,21 +625,68 @@ class TrackAction():
         return False
         
 
-    async def stop_tracking(self,msg=None):
+    async def wait_until_finished(self):
+        return await self.completion_future
+
+    async def stop_tracking(
+        self,
+        reason_code="USER_REQUESTED",
+        status="cancelled",
+        outcome="tracking_stopped",
+    ):
+        if not self.active:
+            return
+
+        await self.send_robot_command({
+            "command": "stop_tracking_object",
+            "action_id": self.action_id,
+        })
+
+        return self.complete_tracking(
+            status=status,
+            outcome=outcome,
+            reason_code=reason_code,
+        )
+
+    def complete_tracking(
+        self,
+        status,
+        outcome="tracking_stopped",
+        reason_code=None,
+        data=None,
+    ):
+        action_id = self.action_id or "unassigned"
+        target = self.target
+        was_stable = self.stable
+
+        result = ActionResult(
+            action_id=action_id,
+            action_type="track_action",
+            status=status,
+            target=target,
+            outcome=outcome,
+            reason_code=reason_code,
+            retryable=status == "failed",
+            data={
+                "tracking_was_stable": was_stable,
+                **(data or {}),
+            },
+        )
+
+        completion_future = self.completion_future
+
         self.yolo.vision_mode = "dj"
         self.stable = False
         self.stable_tick = 0
-        self.tracking = False 
+        self.active = False
         self.csrt_tracker.stop_tracking()
+        self.action_id = None
+        self.target = None
 
-        async with self.zmq_req_lock:
-            await self.zmq_req_socket.send_json({"command": "stop_tracking_object"})
-            feedback = await asyncio.wait_for(
-                self.zmq_req_socket.recv_json(),
-                timeout=1.0,
-            )
-    
-        return ActionResult("track_action","stop",time.time(),"success",msg)
+        if completion_future is not None and not completion_future.done():
+            completion_future.set_result(result)
+
+        return result
 
     def target_to_angles(self, x, y):
         center_x_error = x - 0.5

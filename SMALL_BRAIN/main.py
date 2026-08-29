@@ -25,6 +25,7 @@ from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
+from actions.move_action import MoveAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream, send_camera_image
@@ -56,8 +57,8 @@ IDENTITY_PATH = "database/identity.json"
 MEMORY_PATH = "database/memory.json"
 TOOLS_PATHS = [
     "tools/database_tools.json",
-    "tools/navigate_tools.json",
-    "tools/vision_tools.json"
+    "tools/action_tools.json",
+    "tools/stop_tools.json",
 ]
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -101,14 +102,15 @@ async def background_status_monitor(cognitive_manager):
         try:
             message = await zmq_sub_socket.recv_json()
             if message.get("type") == "event":
-                await cognitive_manager.publish_ros_event(message)
+                await cognitive_manager.handle_tool_msg(message)
 
             elif message.get("type") == "state":
                 update_camera_state(message)
                 await cognitive_manager.publish_world_state({
                     **message,
-                    "tracking": cognitive_manager.track_action.tracking,
+                    "track_action_active": cognitive_manager.track_action.active,
                     "tracking_stable": cognitive_manager.track_action.stable,
+                    "tracked_target": cognitive_manager.track_action.target,
                 })
 
         except Exception as e:
@@ -161,7 +163,6 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
 
                 create_tool_task(
                     cognitive_manager.handle_tool_call(
-                        ws,
                         function_name=output_item.get("name"),
                         arguments=output_item.get("arguments"),
                         call_id=output_item.get("call_id"),
@@ -196,7 +197,7 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
-async def display_camera_loop(camera, csrt_tracker, yolo):
+async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
     print("[System: Starting live camera display...]")
 
     window_name = "Robot Vision"
@@ -210,7 +211,11 @@ async def display_camera_loop(camera, csrt_tracker, yolo):
             snapshot = camera.snapshot()
             display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
 
-            display_frame = draw_tof_overlay(display_frame)
+            display_frame = draw_tof_overlay(
+                display_frame,
+                tracking=track_action.active,
+                tracking_stable=track_action.stable,
+            )
 
             tracking_update = csrt_tracker.tracking_update
 
@@ -241,15 +246,20 @@ async def display_camera_loop(camera, csrt_tracker, yolo):
 
 async def main():
     print("🤖 DJ STARTING TO CONNECT")
-    headers = {
-        "Authorization": "Bearer " + OPENAI_API_KEY,
-        "OpenAI-Safety-Identifier": "hashed-user-id",
-    }
+    cognitive_manager = None
+
+    identity_file = load_json(IDENTITY_PATH)
+    memory_file = load_json(MEMORY_PATH)
+
+    tools_file = []
+    for path in TOOLS_PATHS:
+        tools_file.extend(load_json(path))
+
+    system_prompt = build_system_prompt(identity_file, memory_file)
 
     app = AudioApp()
     print("✅ AUDIO IS READY")
 
-    response_manager = ResponseManager(ws=None,app=app)
     camera = CameraStream(
             camera_index=0,
             capture_width=1280,
@@ -259,6 +269,16 @@ async def main():
             history_frames=60,
             fps=30,
         )
+    camera.start()
+    print("✅ CAMERA IS READY")
+
+    csrt_tracker = CSRTTrackingManager(
+        camera=camera,
+        max_initial_replay_frames=15
+    )
+
+    csrt_tracker.start_worker()
+    print("✅ CSRT TRACKER IS READY")
 
     grounding_dino = GroundingDINOService(
         repo=GROUNDING_DINO_REPO,
@@ -276,17 +296,8 @@ async def main():
     )
 
     yolo = YoloService(
-        camera
+        camera=camera
     )
-
-    csrt_tracker = CSRTTrackingManager(
-        camera=camera,
-        max_initial_replay_frames=15
-    )
-
-    camera.start()
-    csrt_tracker.start_worker()
-    print("✅ CSRT TRACKER IS READY")
 
     grounding_dino.start_background()
     depth_anything.start_background()
@@ -301,57 +312,51 @@ async def main():
     async def wait_for_yolo():
         await yolo.wait_until_ready()
         print("✅ YOLO IS READY")
+    async def send_robot_command(payload):
+        async with zmq_req_lock:
+            await zmq_req_socket.send_json(payload)
+            return await asyncio.wait_for(
+                zmq_req_socket.recv_json(),
+                timeout=5.0,
+            )
 
-    identity_file = load_json(IDENTITY_PATH)
-    memory_file = load_json(MEMORY_PATH)
-
-    tools_file = []
-    for path in TOOLS_PATHS:
-        tools_file.extend(load_json(path))
-
-    system_prompt = build_system_prompt(identity_file, memory_file)
+    headers = {
+        "Authorization": "Bearer " + OPENAI_API_KEY,
+        "OpenAI-Safety-Identifier": "hashed-user-id",
+    }
     try:
         async with websockets.connect(URL, additional_headers=headers) as ws:
             print("\n✅ CONNECTED TO GPT REALTIME AGENT.\n")
 
-            response_manager.ws = ws
+            response_manager = ResponseManager(ws=ws,app=app)
+
             track_action = TrackAction(
                 csrt_tracker=csrt_tracker,
                 grounding_dino=grounding_dino,
                 yolo=yolo,
-                zmq_req_lock=zmq_req_lock,
-                zmq_req_socket=zmq_req_socket,
+                camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
+                send_robot_command=send_robot_command,
+            )
+            approach_action = ApproachAction(
+                send_robot_command=send_robot_command,
+                track_action=track_action,
             )
             search_action = SearchAction(
                 ws=ws,
-                zmq_req_lock=zmq_req_lock,
-                zmq_req_socket=zmq_req_socket,
+                send_robot_command=send_robot_command,
                 camera=camera,
             )
             see_action = SeeAction(ws=ws, camera=camera)
-            approach_action = ApproachAction(
-                zmq_req_lock=zmq_req_lock,
-                zmq_req_socket=zmq_req_socket,
-            )
-
-            async def send_robot_command(payload):
-                async with zmq_req_lock:
-                    await zmq_req_socket.send_json(payload)
-                    return await asyncio.wait_for(
-                        zmq_req_socket.recv_json(),
-                        timeout=5.0,
-                    )
+            move_action = MoveAction(send_robot_command=send_robot_command)
 
             cognitive_manager = CognitionManager(
                 approach_action=approach_action,
                 search_action=search_action,
                 see_action=see_action,
                 track_action=track_action,
-                send_tool_output=response_manager.send_function_output,
-                request_voice=response_manager.create_voice_response,
-                send_robot_command=send_robot_command,
-                inform_llm=response_manager.send_system_context,
+                move_action=move_action,
+                response_manager=response_manager,
             )
 
             session_update = {
@@ -400,7 +405,7 @@ async def main():
                 receive_events(ws,app,response_manager,camera,cognitive_manager),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
-                display_camera_loop(camera,csrt_tracker,yolo),
+                display_camera_loop(camera,csrt_tracker,yolo,track_action),
                 wait_for_dino(),
                 wait_for_depth(),
                 wait_for_yolo()
@@ -418,26 +423,9 @@ async def main():
         await grounding_dino.close()
         await depth_anything.close()
         await yolo.close()
+        if cognitive_manager is not None:
+            await cognitive_manager.shutdown()
 
-# HELPER FUNCTIONS
-
-def ensure_string(raw_target) -> str | None:
-    if not raw_target or raw_target == "":
-        return None
-
-    if isinstance(raw_target, str): return raw_target.strip()
-
-    if isinstance(raw_target, dict):
-        for key in ['type', 'target', 'name', 'object', 'value']:
-            if key in raw_target and isinstance(raw_target[key], str):
-                return raw_target[key].strip()
-
-        return json.dumps(raw_target)
-
-    if isinstance(raw_target, list):
-        return ", ".join(str(item) for item in raw_target if item)
-
-    return str(raw_target)
 def has_meaningful_speech(text: str) -> bool:
     text = text.strip()
     if not text: return False

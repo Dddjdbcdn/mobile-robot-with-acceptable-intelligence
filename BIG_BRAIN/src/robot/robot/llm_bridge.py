@@ -131,7 +131,8 @@ class LLMRosBridge(Node):
         self.state_timer = self.create_timer(0.05, self.state_pub_loop)
 
         self.current_nav_goal_handle = None
-        self.blind_move_timer = None
+        self.current_nav_action_id = None
+        self.move_action_timer = None
         self.track_object_timer = None
         self.navigation_active = False
         self.max_tracking_time = 10.0
@@ -184,23 +185,36 @@ class LLMRosBridge(Node):
                 f"Failed to forward YOLO detections: {e}"
             )
 
-    def send_telemetry(self, event_name, status_msg):
+    def send_event(self, event_name, status_msg, action_id=None):
         with self.pub_lock:
             payload = {
                 "type": "event",
-                "event": event_name, 
-                "status": status_msg}
+                "event": event_name,
+                "status": status_msg,
+            }
+            if action_id is not None:
+                payload["action_id"] = action_id
             self.pub_socket.send_json(payload)
             self.get_logger().info(f"Broadcasted to LLM: {payload}")
 
-    def blind_move_loop(self,lin_vel,ang_vel,fwd_dur,rot_dur,start_time,send_telemetry=False):
+    def move_action_loop(
+        self,
+        lin_vel,
+        ang_vel,
+        fwd_dur,
+        rot_dur,
+        start_time,
+        action_id,
+        send_event=False,
+    ):
         elapsed = (self.get_clock().now() - start_time).nanoseconds / 1e9
         
         if elapsed >= max(fwd_dur,rot_dur):
             self.publish_cmd(0.0, 0.0)
-            self.blind_move_timer.cancel()
-            self.blind_move_timer = None
-            if send_telemetry: self.send_telemetry("blind_move", "completed")
+            self.move_action_timer.cancel()
+            self.move_action_timer = None
+            if send_event:
+                self.send_event("move_action", "completed", action_id)
             return
 
         lin = lin_vel if elapsed < fwd_dur else 0.0
@@ -211,7 +225,13 @@ class LLMRosBridge(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.navigation_active = False
-            self.send_telemetry("navigation", "Goal Rejected by Nav2")
+            action_id = self.current_nav_action_id
+            self.current_nav_action_id = None
+            self.send_event(
+                "navigation",
+                "Goal Rejected by Nav2",
+                action_id,
+            )
             return
         
         self.current_nav_goal_handle = goal_handle
@@ -222,15 +242,21 @@ class LLMRosBridge(Node):
         status = future.result().status
         self.navigation_active = False
         self.current_nav_goal_handle = None
+        action_id = self.current_nav_action_id
+        self.current_nav_action_id = None
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.send_telemetry("navigation", "Goal Reached")
+            self.send_event("navigation", "Goal Reached", action_id)
         else:
-            self.send_telemetry("navigation", f"Failed or Canceled (Status {status})")
+            self.send_event(
+                "navigation",
+                f"Failed or Canceled (Status {status})",
+                action_id,
+            )
 
     def stop_all_motion(self):
-        if self.blind_move_timer:
-            self.blind_move_timer.cancel()
-            self.blind_move_timer = None
+        if self.move_action_timer:
+            self.move_action_timer.cancel()
+            self.move_action_timer = None
         if self.current_nav_goal_handle:
             self.current_nav_goal_handle.cancel_goal_async()
             self.current_nav_goal_handle = None
@@ -266,8 +292,8 @@ class LLMRosBridge(Node):
     def shutdown(self):
         self.get_logger().info("Shutting down LLM ROS Bridge...")
 
-        if self.blind_move_timer is not None:
-            self.blind_move_timer.cancel()
+        if self.move_action_timer is not None:
+            self.move_action_timer.cancel()
 
         if self.track_object_timer is not None:
             self.track_object_timer.cancel()
@@ -299,8 +325,9 @@ class LLMRosBridge(Node):
                         }
                     )
                 
-                elif cmd == "blind_move":
+                elif cmd == "move_action":
                     self.stop_all_motion()
+                    action_id = request.get("action_id")
                     
                     lin_vel = float(request.get("linear_velocity", 0.0))
                     dist = float(request.get("distance", 0.0))
@@ -310,7 +337,18 @@ class LLMRosBridge(Node):
                     rot_dur = abs(angle / ang_vel) if ang_vel != 0 else 0.0
                     start_time = self.get_clock().now()
         
-                    self.blind_move_timer = self.create_timer(0.05, lambda: self.blind_move_loop(lin_vel, ang_vel, fwd_dur, rot_dur, start_time, True))
+                    self.move_action_timer = self.create_timer(
+                        0.05,
+                        lambda: self.move_action_loop(
+                            lin_vel,
+                            ang_vel,
+                            fwd_dur,
+                            rot_dur,
+                            start_time,
+                            action_id,
+                            True,
+                        ),
+                    )
                     self.rep_socket.send_json({"status": "accepted", "message": "Blind move started"})
 
                 elif cmd == "track_object":
@@ -336,6 +374,7 @@ class LLMRosBridge(Node):
                     self.stop_all_motion()
 
                     self.navigation_active = True
+                    self.current_nav_action_id = request.get("action_id")
 
                     x = float(request.get("x", 0.0))
                     y = float(request.get("y", 0.0))
@@ -357,6 +396,8 @@ class LLMRosBridge(Node):
                         timeout = rclpy.duration.Duration(seconds=0.1)
                         pose_map = self.tf_buffer.transform(pose_in, 'map', timeout=timeout)
                     except Exception as e:
+                        self.navigation_active = False
+                        self.current_nav_action_id = None
                         self.rep_socket.send_json({"status": "error", "message": f"TF Transform failed: {e}"})
                         continue
 
@@ -364,6 +405,8 @@ class LLMRosBridge(Node):
                     goal.pose = pose_map
                     
                     if not self.nav_client.wait_for_server(timeout_sec=1.0):
+                        self.navigation_active = False
+                        self.current_nav_action_id = None
                         self.rep_socket.send_json({"status": "error", "message": "Nav2 not available"})
                         continue
 
@@ -372,7 +415,7 @@ class LLMRosBridge(Node):
 
                     self.rep_socket.send_json({"status": "accepted", "message": "Nav2 Goal Dispatched"})
                 
-                elif cmd == "stop_motors":
+                elif cmd == "stop_moving":
                     self.stop_all_motion()
                     self.rep_socket.send_json({"status": "accepted", "message": "All motion stopped"})
 

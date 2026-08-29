@@ -1,0 +1,42 @@
+[
+    {
+        "type": "function",
+        "name": "stop_approaching",
+        "description": "Stop motors and abort any navigation goal",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+    }
+    },
+    {
+        "type": "function",
+        "name": "stop_searching",
+        "description": "Stop the running visual search",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+    }
+    },
+    {
+        "type": "function",
+        "name": "stop_tracking",
+        "description": "Stop tracking an object or person",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }
+    },
+    {
+        "type": "function",
+        "name": "stop_moving",
+        "description": "Stop the current relative movement",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }
+    }
+]

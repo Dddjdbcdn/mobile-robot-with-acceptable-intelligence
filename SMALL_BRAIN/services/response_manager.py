@@ -1,16 +1,6 @@
 import asyncio
 import json
 import uuid
-from pathlib import Path
-
-from utilities.database_functions import load_json
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-VISION_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_tools.json")
-
-tools = load_json(VISION_TOOLS_PATH)
-vision_tools = {tool["name"]: tool for tool in tools}
-INBAND_VISUAL_SEARCH = vision_tools.get("inband_visual_search")
 RESPONSE_TIMEOUT = 10.0
 
 class ResponseManager:
@@ -43,26 +33,6 @@ class ResponseManager:
                 "content": [{"type": "input_text", "text": message}],
             },
         }))
-
-    async def create_tool_response(self,tool=None):
-        request_id = uuid.uuid4().hex
-
-        if tool == "INBAND_VISUAL_SEARCH":
-            response_content = {
-                "event_id": f"create_tool_{request_id}",
-                "type": "response.create",
-                "response": {
-                    "tools": [INBAND_VISUAL_SEARCH],
-                    "tool_choice": "required",
-                    "metadata": {
-                        "kind": "tool",
-                        "request_id": request_id,
-                    },
-                    "output_modalities": ["text"],
-                },
-            }
-
-        await self.ws.send(json.dumps(response_content))
 
     async def _cancel_active_response(self) -> None:
         active_response_id = self.active_response_id

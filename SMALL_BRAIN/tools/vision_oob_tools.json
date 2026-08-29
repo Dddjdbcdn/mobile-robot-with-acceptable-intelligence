@@ -61,7 +61,7 @@
     "properties": {
       "result": {
         "type": "string",
-        "description": "Use found when an object is visually clear or plausibly resembles the target. not_found means totally absent",
+                    "description": "Use candidate when an object is visually clear or plausibly resembles the target. not_found means totally absent",
         "enum": ["candidate","not_found"]
       },
       "confidence": {

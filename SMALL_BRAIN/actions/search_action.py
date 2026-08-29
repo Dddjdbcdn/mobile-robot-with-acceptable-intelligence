@@ -44,27 +44,23 @@ TILT_POSITION_ANGLE = {
 PAN_SWEEP_ORDER = ("leftmost", "center", "rightmost")
 SWEEP_TILT_ORDER = ("center", "upmost", "downmost")
 
-class ActionResult:
-    def __init__(self,action_type,event,timestamp,status,msg=None):
-        self.action_type = action_type
-        self.event = event
-        self.timestamp = timestamp
-        self.status = status
-        self.msg = msg
+from actions.action_result import ActionResult
 
 class SearchAction:
-    def __init__(self, ws, zmq_req_lock, zmq_req_socket, camera):
+    def __init__(self, ws, send_robot_command, camera):
         self.ws = ws
-        self.zmq_req_lock = zmq_req_lock
-        self.zmq_req_socket = zmq_req_socket
+        self.send_robot_command = send_robot_command
         self.camera = camera
         self.search_task = None
+        self.action_id = None
 
         self.completion_future = None
         self.reset_state()
 
     def reset_state(self) -> None:
         self.active = False
+        self.search_task = None
+        self.action_id = None
         self.search_id = None
         self.target = None
         self.sweep_index = 0
@@ -98,18 +94,10 @@ class SearchAction:
             "delta_tilt_angle": delta_tilt,
         }
 
-        async with self.zmq_req_lock:
-            await self.zmq_req_socket.send_json(payload)
-            feedback = await asyncio.wait_for(
-                self.zmq_req_socket.recv_json(),
-                timeout=CAMERA_MOVE_TIMEOUT_SECONDS,
-            )
+        await self.send_robot_command(payload)
 
-        if feedback.get("status") != "accepted":
-            raise RuntimeError(f"Camera movement rejected: {feedback}")
-
-        self.pan_angle = float(feedback.get("pan_angle", target_pan))
-        self.tilt_angle = float(feedback.get("tilt_angle", target_tilt))
+        self.pan_angle += delta_pan
+        self.tilt_angle += delta_tilt
 
         await asyncio.sleep(CAMERA_SETTLE_SECONDS)
 
@@ -163,7 +151,7 @@ class SearchAction:
                 "type": "input_text",
                 "text": (
                     f"Search for this object: {self.target}\n\n"
-                    "Use found when an object is visually clear or plausibly resembles the target.\n"
+                    "Use candidate when an object is visually clear or plausibly resembles the target.\n"
                     "Use not_found when the target is not visible.\n"
                     "Always call assess_frame_search exactly once."
                 ),
@@ -273,9 +261,9 @@ class SearchAction:
         confidence = float(args.get("confidence", 0.0))
 
         if result == "candidate" and confidence >= CANDIDATE_CONFIDENCE_THRESHOLD:
-            await self.complete_visual_search(
-                result="found",
-                message=f"I found {self.target}."
+            await self.complete_searching(
+                status="succeeded",
+                outcome="found"
             )
             return
 
@@ -327,9 +315,9 @@ class SearchAction:
                 }
 
                 await self.move_to_candidate()
-                await self.complete_visual_search(
-                    result="found",
-                    message=f"I found {self.target}."
+                await self.complete_searching(
+                    status="succeeded",
+                    outcome="found"
                 )
                 return
 
@@ -339,9 +327,9 @@ class SearchAction:
             return
         else:
             await self.move_camera_angles(PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"])
-            await self.complete_visual_search(
-                result="not_found",
-                message=f"I could not find {self.target} after scanning all rows."
+            await self.complete_searching(
+                status="failed",
+                outcome="not_found"
             )
         return
 
@@ -363,66 +351,122 @@ class SearchAction:
 
         await self.move_camera_angles(target_pan, target_tilt)
 
-    async def start_visual_search(self, target):
+    async def start_searching(self, target, action_id):
         if self.active:
             return ActionResult(
-                "search_action", "start", time.time(), "failure",
-                {"result": "search_busy", "target": self.target},
+                action_id=action_id,
+                action_type="search_action",
+                status="failed",
+                target=target,
+                outcome="rejected",
+                reason_code="SEARCH_BUSY",
+                retryable=True,
+                data={
+                    "active_action_id": self.action_id,
+                    "active_target": self.target,
+                },
+            )
+
+        normalized_target = (target or "").strip()
+        if not normalized_target:
+            return ActionResult(
+                action_id=action_id,
+                action_type="search_action",
+                status="failed",
+                outcome="invalid_request",
+                reason_code="SEARCH_TARGET_REQUIRED",
             )
 
         self.reset_state()
-
         self.active = True
-        self.search_id = uuid.uuid4().hex
-        self.target = target
+        self.action_id = action_id
+        self.search_id = action_id
+        self.target = normalized_target
         self.pan_angle = robot_state["camera"]["pan_angle"]
         self.tilt_angle = robot_state["camera"]["tilt_angle"]
 
-        print(f"[Visual search started] id={self.search_id}, target={target}")
-
         clear_images_folder()
         self.completion_future = asyncio.get_running_loop().create_future()
-        await self.request_frame_assessment()
+        self.search_task = asyncio.create_task(self.request_frame_assessment())
 
-        try:
-            return await self.completion_future
-        except asyncio.CancelledError:
-            if self.active:
-                await self.stop_visual_search()
-            raise
-
-    async def stop_visual_search(self) -> None:
-        if not self.active:
-            return ActionResult("seach_action","start",time.time(),"success")
-
-        await self.move_camera_angles(PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"])
-        return await self.complete_visual_search(
-            result="search_cancelled",
-            message="The visual search was cancelled by the user. Report the current progress."
+        return ActionResult(
+            action_id=action_id,
+            action_type="search_action",
+            status="running",
+            target=normalized_target,
+            outcome="searching",
+            data={
+                "strategy": "camera_sweep",
+                "configured_sweep_rows": len(SWEEP_TILT_ORDER),
+            },
         )
 
-    async def complete_visual_search(self, result: str, message: str) -> None:
+    async def wait_until_finished(self):
+        return await self.completion_future
+
+    async def stop_searching(self,reason="USER_REQUESTED"):
         if not self.active:
             return
 
-        final_result = {
-            "kind": "object searching result",
-            "status": "completed",
-            "target": str(self.target),
-            "result": result,
-            "message": message,
-            "scan_results": self.batch_results,
-            "final_camera_pose": {
-                "pan_angle": self.pan_angle,
-                "tilt_angle": self.tilt_angle,
-            },
+        self.pending_request_id = None
+        if self.search_task is not None and not self.search_task.done():
+            self.search_task.cancel()
+        self.search_task = None
+
+        await self.move_camera_angles(
+            PAN_POSITION_ANGLE["center"],
+            TILT_POSITION_ANGLE["center"],
+        )
+        await self.complete_searching(
+            status="cancelled",
+            outcome="search_cancelled",
+            reason_code=reason,
+        )
+
+    async def complete_searching(self,status,outcome,reason_code=None):
+        if not self.active:
+            return None
+
+        action_id = self.action_id
+        target = str(self.target)
+        scan_results = list(self.batch_results)
+        first_frame_result = self.first_frame_result
+        final_camera_pose = {
+            "pan_angle": self.pan_angle,
+            "tilt_angle": self.tilt_angle,
+        }
+        searched_rows = len(scan_results)
+        coverage = min(1.0, searched_rows / max(1, len(SWEEP_TILT_ORDER)))
+
+        data = {
+            "initial_frame_assessment": first_frame_result,
+            "scan_results": scan_results,
+            "searched_rows": searched_rows,
+            "configured_sweep_rows": len(SWEEP_TILT_ORDER),
+            "search_coverage": coverage,
+            "final_camera_pose": final_camera_pose,
         }
 
-        print(f"[Visual search completed] {final_result}")
+        print(
+            "[Visual search completed] "
+            f"action_id={action_id}, target={target}, status={status}"
+        )
 
         action_result = ActionResult(
-            "search_action", "stop", time.time(), "success", msg=final_result
+            action_id=action_id,
+            action_type="search_action",
+            status=status,
+            target=target,
+            outcome=outcome,
+            reason_code=(
+                reason_code
+                if reason_code is not None
+                else "TARGET_NOT_VISIBLE" if status == "failed" else None
+            ),
+            retryable=status == "failed",
+            data=data,
         )
+
         completion_future = self.completion_future
         self.reset_state()
 

@@ -1,63 +1,63 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
 import json
 import time
+import uuid
+
+from actions.action_result import ActionResult
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ToolRequest:
     function_name: str
     arguments: dict
     call_id: str
+    action_id: str
     response_metadata: dict
-    accepted: asyncio.Future
 
 
-@dataclass(slots=True)
-class ActionFinished:
+@dataclass(frozen=True, slots=True)
+class ActionExecuted:
     request: ToolRequest
     result: object = None
     error: BaseException | None = None
 
 
-@dataclass(slots=True)
-class RosEvent:
-    payload: dict
+@dataclass(frozen=True, slots=True)
+class ActionLifecycleFinished:
+    request: ToolRequest
+    result: object = None
+    error: BaseException | None = None
 
-
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class WorldState:
     payload: dict
 
 
-async def _ignore_context(_message):
-    return None
-
-
+@dataclass(frozen=True, slots=True)
 class Shutdown:
     pass
 
 
 class CognitionManager:
-    """Continuous, event-driven owner of high-level robot actions."""
-
     OOB_TOOLS = {"assess_frame_search", "assess_batch_search"}
-    STOP_TOOLS = {"stop_visual_search", "stop_object_tracking", "stop_motors"}
+    STOP_TOOLS = {
+        "stop_searching",
+        "stop_tracking",
+        "stop_approaching",
+        "stop_moving",
+    }
 
     def __init__(
         self,
-        *,
         approach_action,
         search_action,
         see_action,
         track_action,
-        send_tool_output,
-        request_voice,
-        send_robot_command,
-        inform_llm=None,
+        move_action,
+        response_manager,
         idle_salience_threshold=0.75,
         idle_wakeup_cooldown=15.0,
         active_context_interval=3.0,
@@ -66,217 +66,341 @@ class CognitionManager:
         self.search_action = search_action
         self.see_action = see_action
         self.track_action = track_action
-        self.send_tool_output = send_tool_output
-        self.request_voice = request_voice
-        self.send_robot_command = send_robot_command
-        self.inform_llm = inform_llm or _ignore_context
+        self.move_action = move_action
+        self.response_manager = response_manager
+
+        self.events = asyncio.Queue()
+        self.action_results = []
+        self.current_action: ToolRequest | None = None
+        self.current_action_task: asyncio.Task | None = None
+        self._running = False
+
+        self.world_state = {}
+        self._last_idle_wakeup = 0.0
+        self._last_active_context = 0.0
         self.idle_salience_threshold = idle_salience_threshold
         self.idle_wakeup_cooldown = idle_wakeup_cooldown
         self.active_context_interval = active_context_interval
 
-        self.events = asyncio.Queue()
-        self.pending_requests = deque()
-        self.action_results = []
-        self.current_action = None
-        self.current_request = None
-        self.world_state = {}
-        self._last_idle_wakeup = 0.0
-        self._last_active_context = 0.0
-        self._action_task = None
-        self._running = False
-
     async def handle_tool_call(
         self,
-        ws=None,
-        *,
         function_name,
         arguments,
         call_id,
         response_metadata=None,
     ):
-        """Validate a Realtime call and enqueue it as cognition input."""
-        try:
-            args = json.loads(arguments) if isinstance(arguments, str) else arguments
-            args = {} if args is None else args
-            if not isinstance(args, dict):
-                raise ValueError("tool arguments must be an object")
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            await self.send_tool_output(
-                call_id,
-                {"status": "error", "message": f"invalid arguments: {error}"},
-            )
-            return
+        args = json.loads(arguments) if arguments else {}
 
-        accepted = asyncio.get_running_loop().create_future()
-        await self.events.put(
-            ToolRequest(
-                function_name,
-                args,
-                call_id,
-                response_metadata or {},
-                accepted,
-            )
+        request = ToolRequest(
+            function_name=function_name,
+            arguments=args,
+            call_id=call_id,
+            action_id=uuid.uuid4().hex,
+            response_metadata=response_metadata or {},
         )
-        await accepted
 
-    async def publish_ros_event(self, payload):
-        await self.events.put(RosEvent(payload))
+        print(f"[{function_name} function is called]. Args: {args}")
+        await self.events.put(request)
+
+    async def handle_tool_msg(self, message):
+        self.approach_action.handle_navigation_event(message)
+        self.move_action.handle_moving_event(message)
 
     async def publish_world_state(self, payload):
         await self.events.put(WorldState(payload))
 
-    async def cognition_loop(self):
-        """Sleep on the event queue and react without polling."""
-        self._running = True
-        try:
-            while self._running:
-                event = await self.events.get()
-                try:
-                    if isinstance(event, ToolRequest):
-                        await self._handle_tool_request(event)
-                    elif isinstance(event, ActionFinished):
-                        await self._handle_action_finished(event)
-                    elif isinstance(event, RosEvent):
-                        await self._handle_ros_event(event.payload)
-                    elif isinstance(event, WorldState):
-                        await self._handle_world_state(event.payload)
-                    elif isinstance(event, Shutdown):
-                        self._running = False
-                finally:
-                    self.events.task_done()
-        finally:
-            await self._cancel_current_action()
-
     async def shutdown(self):
         await self.events.put(Shutdown())
 
-    async def _handle_tool_request(self, request):
-        try:
-            if request.function_name in self.OOB_TOOLS:
-                await self._route_assessment(request)
-            elif request.function_name in self.STOP_TOOLS:
-                await self._execute_stop(request)
-            elif self._action_task is not None:
-                self.pending_requests.append(request)
-                await self.send_tool_output(
-                    request.call_id,
-                    {
-                        "status": "queued",
-                        "position": len(self.pending_requests),
-                        "active_action": self.current_action,
-                    },
-                )
-            else:
-                await self.send_tool_output(
-                    request.call_id,
-                    {"status": "accepted", "action": request.function_name},
-                )
-                self._start_request(request)
-        except Exception as error:
-            await self.send_tool_output(
-                request.call_id,
-                {"status": "error", "message": f"{type(error).__name__}: {error}"},
+    async def cognition_loop(self):
+        self._running = True
+
+        while self._running:
+            event = await self.events.get()
+
+            if isinstance(event, ToolRequest):
+                await self.handle_tool_request(event)
+            elif isinstance(event, ActionExecuted):
+                await self.handle_action_executed(event)
+            elif isinstance(event, ActionLifecycleFinished):
+                await self.handle_lifecycle_finished(event)
+            elif isinstance(event, WorldState):
+                await self._handle_world_state(event.payload)
+            elif isinstance(event, Shutdown):
+                self._running = False
+
+    async def handle_tool_request(self, request):
+        if request.function_name in self.OOB_TOOLS:
+            await self.oob_assessment(request)
+            return
+
+        if request.function_name in self.STOP_TOOLS:
+            await self.execute_stop(request)
+            return
+
+        if self.current_action_task is not None:
+            result = ActionResult(
+                action_id=request.action_id,
+                action_type=request.function_name,
+                status="failed",
+                target=request.arguments.get("target"),
+                outcome="rejected",
+                reason_code="ACTION_START_BUSY",
+                retryable=True,
+                data={
+                    "active_action": self.current_action.function_name,
+                    "active_action_id": self.current_action.action_id,
+                },
             )
-        finally:
-            if not request.accepted.done():
-                request.accepted.set_result(None)
+            await self.response_manager.send_function_output(
+                request.call_id,
+                self._action_envelope("command_result", result),
+            )
+            await self.response_manager.create_voice_response()
+            return
 
-    def _start_request(self, request):
-        self.current_request = request
-        self.current_action = request.function_name
-        self._action_task = asyncio.create_task(
-            self._execute_request(request),
-            name=f"cognition-{request.function_name}",
-        )
-        self._action_task.add_done_callback(
-            lambda task, request=request: self._action_done(request, task)
+        self.current_action = request
+        self.current_action_task = asyncio.create_task(
+            self.execute_request(request),
+            name=f"cognition-start-{request.function_name}",
         )
 
-    async def _execute_request(self, request):
+        def action_executed(task):
+            try:
+                event = ActionExecuted(request, result=task.result())
+            except BaseException as error:
+                event = ActionExecuted(request, error=error)
+            self.events.put_nowait(event)
+
+        self.current_action_task.add_done_callback(action_executed)
+
+    async def execute_request(self, request):
         name = request.function_name
         args = request.arguments
 
-        if name in {"get_vision", "vision_reasoning"}:
-            mode = "reasoning" if name == "vision_reasoning" else args.get("action")
-            if mode == "reasoning":
-                return await self.see_action.start_seeing(args.get("query"))
-            if mode == "find_object":
-                return await self.search_action.start_visual_search(args.get("target"))
-            if mode == "look_at_object":
-                return await self._start_tracking(args.get("target"))
-            raise ValueError(f"unsupported vision action: {mode}")
+        if name == "see_action":
+            return await self.see_action.see(
+                query=args.get("query"),
+                action_id=request.action_id,
+            )
 
-        if name == "find_and_approach":
-            return await self._find_and_approach(args.get("target"))
-        if name == "look_at":
-            return await self._start_tracking(args.get("target"))
-        if name == "approach_object":
-            return await self.approach_action.start_approaching()
-        if name in {"blind_move", "navigate_to_pose"}:
-            if self.track_action.tracking:
-                await self.track_action.stop_tracking("motion_command_started")
-            return await self.send_robot_command({"command": name, **args})
-        if name == "capture_depth":
-            raise NotImplementedError("capture_depth has no action adapter")
-        raise ValueError(f"unknown function: {name}")
+        if name == "search_action":
+            return await self.search_action.start_searching(
+                target=args.get("target"),
+                action_id=request.action_id,
+            )
 
-    async def _start_tracking(self, target):
-        if not target:
-            raise ValueError("tracking target is required")
-        camera = self.see_action.camera
-        jpeg_bytes = await asyncio.to_thread(
-            camera.jpeg_bytes_snapshot,
-            70,
-            False,
-            "results/search_results/tracking_input.jpg",
-        )
-        return await self.track_action.start_tracking(
-            jpeg_bytes,
-            target,
-            camera.snapshot(),
+        if name == "track_action":
+            return await self.track_action.start_tracking(
+                target=args.get("target"),
+                action_id=request.action_id,
+            )
+
+        if name == "approach_action":
+            return await self.approach_action.start_approaching(
+                target=args.get("target"),
+                action_id=request.action_id,
+            )
+
+        if name == "move_action":
+            return await self.move_action.start_moving(
+                action_id=request.action_id,
+                **args,
+            )
+
+        return ActionResult(
+            action_id=request.action_id,
+            action_type=name,
+            status="failed",
+            outcome="unsupported_action",
+            reason_code="UNKNOWN_ACTION",
         )
 
-    async def _find_and_approach(self, target):
-        if not target:
-            raise ValueError("search target is required")
-        result = await self.search_action.start_visual_search(target)
-        if not self._succeeded(result) or (
-            isinstance(result.msg, dict) and result.msg.get("result") != "found"
-        ):
-            return result
-        result = await self._start_tracking(target)
-        if not self._succeeded(result):
-            return result
-        if not await self.track_action.wait_until_stable():
-            await self.track_action.stop_tracking("stability_timeout")
-            raise TimeoutError("tracker did not become stable")
-        return await self.approach_action.start_approaching()
+    async def execute_stop(self, request):
+        action, stop_method_name = {
+            "stop_searching": (
+                self.search_action,
+                "stop_searching",
+            ),
+            "stop_tracking": (
+                self.track_action,
+                "stop_tracking",
+            ),
+            "stop_approaching": (
+                self.approach_action,
+                "stop_approaching",
+            ),
+            "stop_moving": (
+                self.move_action,
+                "stop_moving",
+            ),
+        }[request.function_name]
+        was_active = bool(getattr(action, "active", False))
+        if was_active:
+            await getattr(action, stop_method_name)()
 
-    async def _route_assessment(self, request):
+        await self.response_manager.send_function_output(
+            request.call_id,
+            self._action_envelope(
+                "command_result",
+                {
+                    "command": request.function_name,
+                    "status": "completed" if was_active else "skipped",
+                    "outcome": "stopped" if was_active else "not_active",
+                },
+            ),
+        )
+        if not was_active:
+            await self.response_manager.create_voice_response()
+
+    async def oob_assessment(self, request):
         if request.function_name == "assess_frame_search":
             assessment = self.search_action.assess_frame_search(
                 request.arguments,
                 request.response_metadata,
             )
-        else:
+        elif request.function_name == "assess_batch_search":
             assessment = self.search_action.assess_batch_search(
                 request.arguments,
                 request.response_metadata,
             )
-        task = asyncio.create_task(assessment, name=request.function_name)
-        task.add_done_callback(self._auxiliary_done)
-        await self.send_tool_output(request.call_id, {"status": "received"})
 
-    def _auxiliary_done(self, task):
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as error:
-            self.action_results.append({
-                "status": "failure",
-                "message": f"{type(error).__name__}: {error}",
-            })
+        asyncio.create_task(assessment, name=request.function_name)
+        # These calls come from responses created with conversation="none".
+        # Their arguments are the complete one-shot assessment, and their
+        # call IDs cannot be answered in the default Realtime conversation.
+
+    async def handle_action_executed(self, event):
+        if event.request is not self.current_action:
+            return
+
+        self.current_action_task = None
+        self.current_action = None
+        result = event.result
+        if event.error is not None:
+            result = ActionResult(
+                action_id=event.request.action_id,
+                action_type=event.request.function_name,
+                status="failed",
+                target=event.request.arguments.get("target"),
+                outcome="execution_error",
+                reason_code="ACTION_EXECUTION_ERROR",
+                retryable=True,
+                data={
+                    "error": (
+                        f"{type(event.error).__name__}: {event.error}"
+                    )
+                },
+            )
+        self.action_results.append(result)
+
+        await self.response_manager.send_function_output(
+            event.request.call_id,
+            self._action_envelope("command_result", result),
+        )
+
+        if isinstance(result, ActionResult) and result.status == "running":
+            action = {
+                "search_action": self.search_action,
+                "track_action": self.track_action,
+                "approach_action": self.approach_action,
+                "move_action": self.move_action,
+            }.get(event.request.function_name)
+
+            async def wait_for_completion(action):
+                try:
+                    lifecycle_event = ActionLifecycleFinished(
+                        event.request,
+                        result=await action.wait_until_finished(),
+                    )
+                except BaseException as error:
+                    lifecycle_event = ActionLifecycleFinished(
+                        event.request,
+                        error=error,
+                    )
+                await self.events.put(lifecycle_event)
+
+            if action is not None:
+                asyncio.create_task(
+                    wait_for_completion(action),
+                    name=f"cognition-finish-{event.request.action_id}",
+                )
+
+        await self.response_manager.create_voice_response()
+
+    async def handle_lifecycle_finished(self, event):
+        result = event.result
+        if event.error is not None:
+            result = ActionResult(
+                action_id=event.request.action_id,
+                action_type=event.request.function_name,
+                status="failed",
+                target=event.request.arguments.get("target"),
+                outcome="lifecycle_error",
+                reason_code="ACTION_LIFECYCLE_ERROR",
+                retryable=True,
+                data={
+                    "error": (
+                        f"{type(event.error).__name__}: {event.error}"
+                    )
+                },
+            )
+        self.action_results.append(result)
+
+        summary = (
+            "[ROBOT ACTION EVENT]\n"
+            + json.dumps(
+                self._action_envelope("action_finished", result),
+                separators=(",", ":"),
+            )
+        )
+        await self.response_manager.send_system_context(summary)
+        await self.response_manager.create_voice_response()
+
+    def _action_envelope(self, event_type, result):
+        return {
+            "schema": "robot.action_event.v1",
+            "event_type": event_type,
+            "result": self._serialize(result),
+            "robot_state": self._decision_state(),
+            "decision_instruction": (
+                "Re-evaluate the current user goal using this result. "
+                "Choose the next action only if useful; do not assume success "
+                "from a running action."
+            ),
+        }
+
+    def _decision_state(self):
+        active_actions = []
+        for action_type, action, active_attribute in (
+            ("search_action", self.search_action, "active"),
+            ("track_action", self.track_action, "active"),
+            ("approach_action", self.approach_action, "active"),
+            ("move_action", self.move_action, "active"),
+        ):
+            if getattr(action, active_attribute, False):
+                active_actions.append({
+                    "action_id": getattr(action, "action_id", None),
+                    "action_type": action_type,
+                    "target": getattr(action, "target", None),
+                })
+
+        track_active = bool(getattr(self.track_action, "active", False))
+        tracking_stable = bool(getattr(self.track_action, "stable", False))
+        tracked_target = getattr(self.track_action, "target", None)
+        return {
+            "active_actions": active_actions,
+            "track_action_active": track_active,
+            "tracking_stable": tracking_stable,
+            "tracked_target": tracked_target,
+            "camera_tof_range": self.world_state.get("camera_tof_range"),
+            "servo_pan_angle": self.world_state.get("servo_pan_angle"),
+            "servo_tilt_angle": self.world_state.get("servo_tilt_angle"),
+            "constraints": {
+                "can_approach": track_active and tracking_stable,
+                "approach_requires_target": tracked_target,
+            },
+        }
 
     async def _handle_world_state(self, payload):
         previous = self.world_state
@@ -284,11 +408,19 @@ class CognitionManager:
         salience, reasons = self._score_salience(previous, self.world_state)
         now = time.monotonic()
 
-        if self._action_task is not None:
+        if self._decision_state()["active_actions"]:
             interval_elapsed = now - self._last_active_context
             if salience >= 0.5 or interval_elapsed >= self.active_context_interval:
                 self._last_active_context = now
-                await self.inform_llm(self._state_summary(salience, reasons))
+                await self.response_manager.send_system_context(
+                    self._state_summary(salience, reasons)
+                )
+
+            if salience >= self.idle_salience_threshold:
+                asyncio.create_task(
+                    self.response_manager.create_voice_response(),
+                    name="active-state-wakeup",
+                )
             return
 
         if (
@@ -297,29 +429,16 @@ class CognitionManager:
         ):
             self._last_idle_wakeup = now
             summary = self._state_summary(salience, reasons)
-            await self.inform_llm(summary)
-            task = asyncio.create_task(
-                self.request_voice(
+            await self.response_manager.send_system_context(summary)
+            asyncio.create_task(
+                self.response_manager.create_voice_response(
                     system_msg=(
-                        f"[SALIENT WORLD EVENT]: {summary}. "
-                        "Decide whether to speak or take an appropriate action. "
-                        "Do nothing if intervention is unnecessary."
+                        "[SALIENT WORLD EVENT] Re-evaluate the current goal. "
+                        "Speak or act only when this event requires intervention."
                     )
                 ),
                 name="salience-wakeup",
             )
-            task.add_done_callback(self._auxiliary_done)
-
-    async def _handle_ros_event(self, payload):
-        self.action_results.append(payload)
-        summary = f"[ROS EVENT]: {json.dumps(payload)}"
-        await self.inform_llm(summary)
-        if self._action_task is None:
-            task = asyncio.create_task(
-                self.request_voice(system_msg=summary),
-                name="ros-event-wakeup",
-            )
-            task.add_done_callback(self._auxiliary_done)
 
     @staticmethod
     def _score_salience(previous, current):
@@ -347,13 +466,20 @@ class CognitionManager:
                     score = max(score, 0.55)
                     reasons.append("large distance change")
 
-        if previous and current.get("tracking") != previous.get("tracking"):
+        if (
+            previous
+            and current.get("track_action_active")
+            != previous.get("track_action_active")
+        ):
             score = max(score, 0.8)
-            reasons.append(f"tracking changed to {current.get('tracking')}")
+            reasons.append(
+                "track action active changed to "
+                f"{current.get('track_action_active')}"
+            )
         if previous and (
             current.get("tracking_stable") != previous.get("tracking_stable")
         ):
-            score = max(score, 0.65)
+            score = max(score, 0.8)
             reasons.append(
                 f"tracking stability changed to {current.get('tracking_stable')}"
             )
@@ -361,76 +487,11 @@ class CognitionManager:
 
     def _state_summary(self, salience, reasons):
         state = {
-            "active_action": self.current_action,
+            **self._decision_state(),
             "salience": round(salience, 2),
             "reasons": reasons,
-            "camera_tof_range": self.world_state.get("camera_tof_range"),
-            "tracking": self.world_state.get("tracking"),
-            "tracking_stable": self.world_state.get("tracking_stable"),
-            "servo_pan_angle": self.world_state.get("servo_pan_angle"),
-            "servo_tilt_angle": self.world_state.get("servo_tilt_angle"),
         }
-        return f"[WORLD STATE]: {json.dumps(state)}"
-
-    async def _execute_stop(self, request):
-        if request.function_name == "stop_visual_search":
-            result = await self.search_action.stop_visual_search()
-        elif request.function_name == "stop_object_tracking":
-            result = await self.track_action.stop_tracking("user_requested")
-        else:
-            await self._cancel_current_action()
-            if self.track_action.tracking:
-                await self.track_action.stop_tracking("emergency_stop")
-            result = await self.send_robot_command({"command": "stop_motors"})
-        await self.send_tool_output(request.call_id, self._serialize(result))
-
-    async def _handle_action_finished(self, event):
-        if event.request is not self.current_request:
-            return
-        self._action_task = None
-        self.current_request = None
-        self.current_action = None
-
-        if event.error is None:
-            result = event.result
-        elif isinstance(event.error, asyncio.CancelledError):
-            result = {"status": "cancelled"}
-        else:
-            result = {
-                "status": "failure",
-                "message": f"{type(event.error).__name__}: {event.error}",
-            }
-        self.action_results.append(result)
-        await self.request_voice(
-            system_msg=f"[ACTION RESULT]: {json.dumps(self._serialize(result))}"
-        )
-        if self.pending_requests:
-            self._start_request(self.pending_requests.popleft())
-
-    async def _cancel_current_action(self):
-        if self._action_task is None:
-            return
-        self._action_task.cancel()
-        try:
-            await self._action_task
-        except asyncio.CancelledError:
-            pass
-        self._action_task = None
-        self.current_request = None
-        self.current_action = None
-
-    def _action_done(self, request, task):
-        try:
-            event = ActionFinished(request, result=task.result())
-        except BaseException as error:
-            event = ActionFinished(request, error=error)
-        self.events.put_nowait(event)
-
-    @staticmethod
-    def _succeeded(result):
-        if isinstance(result, dict):
-            return result.get("status") in {"success", "accepted", "succeeded"}
-        return getattr(result, "status", None) == "success"
+        return "[WORLD STATE] " + json.dumps(state, separators=(",", ":"))
 
     @classmethod
     def _serialize(cls, value):
