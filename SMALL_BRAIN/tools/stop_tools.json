@@ -1,42 +1,32 @@
 [
-    {
-        "type": "function",
-        "name": "stop_approaching",
-        "description": "Stop motors and abort any navigation goal",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
+  {
+    "type": "function",
+    "name": "stop_goal",
+    "description": "Cancel an in-progress find_target or approach_target goal and stop the prerequisite currently executing.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
     }
-    },
-    {
-        "type": "function",
-        "name": "stop_searching",
-        "description": "Stop the running visual search",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
+  },
+  {
+    "type": "function",
+    "name": "stop_tracking",
+    "description": "Stop continuous tracking previously started by watch_target.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
     }
-    },
-    {
-        "type": "function",
-        "name": "stop_tracking",
-        "description": "Stop tracking an object or person",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }
-    },
-    {
-        "type": "function",
-        "name": "stop_moving",
-        "description": "Stop the current relative movement",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }
+  },
+  {
+    "type": "function",
+    "name": "stop_moving",
+    "description": "Stop an explicit blind movement started by move_action.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
     }
+  }
 ]

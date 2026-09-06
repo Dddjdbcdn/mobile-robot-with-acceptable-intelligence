@@ -76,8 +76,15 @@ HUMAN_RETARGETS = {
 
 human_trackable_parts = list(HUMAN_RETARGETS.keys())
 
+def is_yolo_trackable_target(target):
+    normalized_target = normalize_human_target(target) or normalize_object_target(target)
+    return (
+        normalized_target in human_trackable_parts
+        or normalized_target in dj_yolo_classes
+    )
+
 def normalize_human_target(target):
-    target = target.lower().strip()
+    target = str(target or "").lower().strip()
 
     target = target.replace("'s","")
     target = target.replace("-"," ")
@@ -96,7 +103,7 @@ def normalize_human_target(target):
     elif "eye" in words or "eyes" in words: part = "eye"
     elif "face" in words: part = "face"
     elif "head" in words: part = "head"
-    elif "person" in words or "human" in words or "user" in words or "me" in words or "you" in words: part = "person"
+    elif "person" in words or "human" in words or "user" in words or "me" in words or "you" in words or "dang" in words or "owner" in words: part = "person"
 
     else:
         return None
@@ -107,7 +114,7 @@ def normalize_human_target(target):
     return part
 
 def normalize_object_target(target):
-    target = target.lower().strip()
+    target = str(target or "").lower().strip()
     target = target.replace("'s", "")
     target = target.replace("-", " ")
     target = target.replace("_", " ")
@@ -230,9 +237,8 @@ def normalize_object_target(target):
     return aliases.get(target, target)
 
 from actions.action_result import ActionResult
-
 class TrackAction():
-    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, STABLE_THRESHOLD=0.05):
+    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, search_action,STABLE_THRESHOLD=0.05):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
         self.yolo = yolo
@@ -245,14 +251,21 @@ class TrackAction():
         self.stable = False
         self.stable_tick = 0
         self.stable_threshold = STABLE_THRESHOLD
-        self._tracking_task = None 
+        self._tracking_task = None
         self.completion_future = None
         self.action_id = None
+        self.search_action = search_action
 
         self.person_path = []
         self.person_path_index = 0
 
-    async def start_tracking(self, target, action_id):
+    async def start_tracking(
+        self,
+        target,
+        action_id,
+        require_search=True,
+        allow_grounding_dino=True,
+    ):
         if self.active:
             await self.stop_tracking(
                 reason_code="REPLACED",
@@ -263,6 +276,24 @@ class TrackAction():
         normalized_target = (
             normalize_human_target(target) or normalize_object_target(target)
         )
+
+        normalized_search_target = (
+            normalize_human_target(self.search_action.last_found_target) or normalize_object_target(self.search_action.last_found_target)
+        )
+
+        if require_search and (
+            self.search_action.active
+            or normalized_search_target != normalized_target
+        ):
+            return ActionResult(
+                action_id=action_id,
+                action_type="track_action",
+                status="failed",
+                target=target,
+                outcome="precondition_failed",
+                reason_code="TARGET_NOT_SEARCHED",
+                retryable=True,
+            )
 
         self.action_id = action_id
         self.target = normalized_target
@@ -286,9 +317,16 @@ class TrackAction():
             jpeg_bytes,
             normalized_target,
             snapshot,
+            allow_grounding_dino=allow_grounding_dino,
         )
 
-    async def _start_object_tracking(self, jpeg_bytes, target, snapshot):
+    async def _start_object_tracking(
+        self,
+        jpeg_bytes,
+        target,
+        snapshot,
+        allow_grounding_dino=True,
+    ):
         tracking_bbox = None
         detection_source = None
         detection_confidence = None
@@ -311,7 +349,7 @@ class TrackAction():
                 detection_source = "yolo"
                 detection_confidence = detection["confidence"]
 
-        if tracking_bbox is None:
+        if tracking_bbox is None and allow_grounding_dino:
             self.yolo.vision_mode = "none"
             await asyncio.sleep(0.1)
             try:
@@ -360,7 +398,7 @@ class TrackAction():
         )
 
         feedback = await self.send_robot_command({
-            "command": "track_object",
+            "command": "track_action",
             "action_id": self.action_id,
         })
 
@@ -396,9 +434,9 @@ class TrackAction():
                 target_y = tracking_update.normalized_y
 
                 delta_pan_angle, delta_tilt_angle = self.target_to_angles(target_x, target_y)
-    
+
                 await self.zmq_pub_socket.send_json({
-                    "delta_pan_angle": delta_pan_angle, 
+                    "delta_pan_angle": delta_pan_angle,
                     "delta_tilt_angle": delta_tilt_angle
                 })
 
@@ -410,7 +448,7 @@ class TrackAction():
                     self.stable_tick = 0
                     self.stable = False
             else:
-                if succeeded: 
+                if succeeded:
                     await self.stop_tracking(
                         reason_code="OBJECT_LOST",
                         status="failed",
@@ -418,7 +456,7 @@ class TrackAction():
                     )
 
             await asyncio.sleep(0.05)
-    
+
     async def _start_person_tracking(self, target):
         detections = [
             detection
@@ -431,6 +469,7 @@ class TrackAction():
             action_id = self.action_id or "unassigned"
             self.action_id = None
             self.target = None
+            self.yolo.vision_mode = "dj"
             return ActionResult(
                 action_id=action_id,
                 action_type="track_action",
@@ -448,7 +487,7 @@ class TrackAction():
         self.person_stable_count = 0
 
         feedback = await self.send_robot_command({
-            "command": "track_object",
+            "command": "track_action",
             "action_id": self.action_id,
         })
 
@@ -544,7 +583,7 @@ class TrackAction():
                         current_reached = False
                         predicted_target = None
 
-                        print(f"TRACING TO: {next_name}")
+                        print(f"\nTRACING TO: {next_name}\n")
 
                     else:
                         if predicted_target is not None:
@@ -553,7 +592,7 @@ class TrackAction():
                             await asyncio.sleep(0.05)
                             continue
 
-                else: 
+                else:
                     if (abs(target_x - 0.5) < self.stable_threshold and abs(target_y - 0.5) < self.stable_threshold):
                         predicted_target = self.predict_next_keypoint(person)
                         current_reached = True
@@ -623,7 +662,7 @@ class TrackAction():
             await asyncio.sleep(check_interval)
 
         return False
-        
+
 
     async def wait_until_finished(self):
         return await self.completion_future
@@ -637,16 +676,28 @@ class TrackAction():
         if not self.active:
             return
 
+        tracking_task = self._tracking_task
+
         await self.send_robot_command({
-            "command": "stop_tracking_object",
+            "command": "stop_tracking",
             "action_id": self.action_id,
         })
 
-        return self.complete_tracking(
+        result = self.complete_tracking(
             status=status,
             outcome=outcome,
             reason_code=reason_code,
         )
+
+        if (
+            tracking_task is not None
+            and tracking_task is not asyncio.current_task()
+            and not tracking_task.done()
+        ):
+            tracking_task.cancel()
+            await asyncio.gather(tracking_task, return_exceptions=True)
+
+        return result
 
     def complete_tracking(
         self,
@@ -682,6 +733,10 @@ class TrackAction():
         self.csrt_tracker.stop_tracking()
         self.action_id = None
         self.target = None
+        self._tracking_task = None
+
+        if status == "failed" and reason_code in {"PERSON_LOST", "OBJECT_LOST"}:
+            self.search_action.last_found_target = None
 
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
@@ -694,11 +749,11 @@ class TrackAction():
 
         tan_half_fov_h = math.tan(math.radians(HORIZONTAL_FOV_DEG / 2.0))
         tan_half_fov_v = math.tan(math.radians(VERTICAL_FOV_DEG / 2.0))
-        
+
         pan_angle = math.degrees(math.atan((center_x_error * 2.0) * tan_half_fov_h))
         tilt_angle = math.degrees(math.atan((center_y_error * 2.0) * tan_half_fov_v))
-        
+
         delta_pan = -pan_angle
         delta_tilt = tilt_angle
-        
+
         return delta_pan, delta_tilt

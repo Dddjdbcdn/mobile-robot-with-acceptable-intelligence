@@ -20,12 +20,12 @@ from database.state import robot_state,update_camera_state
 
 from utilities.database_functions import load_json, update_memory, build_system_prompt
 from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
-
 from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
 from actions.move_action import MoveAction
+from actions.move_camera_action import MoveCameraAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream, send_camera_image
@@ -38,6 +38,7 @@ from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
+from cognition.goal_executor import GoalExecutor
 
 context = zmq.asyncio.Context()
 
@@ -55,6 +56,7 @@ zmq_req_lock = asyncio.Lock()
 
 IDENTITY_PATH = "database/identity.json"
 MEMORY_PATH = "database/memory.json"
+ACTION_GUIDE_PATH = "database/action_guide.json"
 TOOLS_PATHS = [
     "tools/database_tools.json",
     "tools/action_tools.json",
@@ -106,16 +108,30 @@ async def background_status_monitor(cognitive_manager):
 
             elif message.get("type") == "state":
                 update_camera_state(message)
-                await cognitive_manager.publish_world_state({
-                    **message,
-                    "track_action_active": cognitive_manager.track_action.active,
-                    "tracking_stable": cognitive_manager.track_action.stable,
-                    "tracked_target": cognitive_manager.track_action.target,
-                })
+                # await cognitive_manager.publish_world_state({
+                #     **message,
+                #     "track_action_active": cognitive_manager.track_action.active,
+                #     "tracking_stable": cognitive_manager.track_action.stable,
+                #     "tracked_target": cognitive_manager.track_action.target,
+                # })
 
         except Exception as e:
             print(f"[System Error in Monitor]: {e}")
             await asyncio.sleep(1)
+
+async def send_typed_messages(response_manager):
+    print("[System: Typed chat ready. Type a message and press Enter.]")
+
+    while True:
+        try:
+            message = await asyncio.to_thread(input, "\nYou: ")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if not message.strip():
+            continue
+
+        await response_manager.send_user_text(message)
 
 async def receive_events(ws,app,response_manager,camera,cognitive_manager):
     human_speaking = False
@@ -128,12 +144,13 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
             error = event.get("error", {})
 
             print(
-                "\n❌ OPENAI ERROR"
+                "\n\n❌ OPENAI ERROR"
                 f"\ntype: {error.get('type')}"
                 f"\ncode: {error.get('code')}"
                 f"\nmessage: {error.get('message')}"
                 f"\nparam: {error.get('param')}"
                 f"\nevent_id: {error.get('event_id')}"
+                "\n"
             )
 
         elif event_type == "response.created":
@@ -143,13 +160,30 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
 
         elif event_type == "response.done":
             response = event.get("response", {})
+
             response_manager.handle_response_done(response)
 
             usage = response.get("usage") or {}
-            used = usage.get("input_tokens", 0)
+            metadata = response.get("metadata") or {}
 
-            MAX_TOKENS = 32000
-            print(f"\n🪙 Tokens left: {MAX_TOKENS - used:,} / {MAX_TOKENS:,}")
+            if response.get("status") != "completed":
+                print(
+                    "\n\n[RESPONSE DONE]",
+                    {
+                        "id": response.get("id"),
+                        "conversation_id": response.get("conversation_id"),
+                        "kind": metadata.get("kind"),
+                        "status": response.get("status"),
+                        "status_details": response.get("status_details"),
+                        "input_tokens": usage.get("input_tokens"),
+                        "output_tokens": usage.get("output_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                        "input_details": usage.get("input_token_details"),
+                        "output_details": usage.get("output_token_details"),
+                        "output_items": len(response.get("output", [])),
+                    },
+                    "\n",
+                )
 
 
             if response.get("status") != "completed":
@@ -178,10 +212,10 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
                 app.clear_queue()
                 human_speaking = True
 
-                print("[SPEECH STARTED]")
+                print("\n[SPEECH STARTED]")
 
         elif event_type == "input_audio_buffer.speech_started":
-            print("[VAD TRIGGERED]")
+            print("\n[VAD TRIGGERED]")
 
         elif event_type == "input_audio_buffer.speech_stopped":
             if human_speaking:
@@ -221,7 +255,7 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
 
             if yolo.detections:
                 display_frame = draw_yolo_overlay(display_frame,yolo)
-            if (tracking_update is not None and tracking_update.is_tracking and tracking_update.success):
+            if (tracking_update is not None and tracking_update.success):
                 display_frame = draw_csrt_overlay(display_frame,tracking_update.target,tracking_update.bbox_xywh)
 
             cv2.imshow(window_name, display_frame)
@@ -245,20 +279,25 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
         await asyncio.sleep(0.03)
 
 async def main():
-    print("🤖 DJ STARTING TO CONNECT")
+    print("\n🤖 DJ STARTING TO CONNECT")
     cognitive_manager = None
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
+    action_guide_file = load_json(ACTION_GUIDE_PATH)
 
     tools_file = []
     for path in TOOLS_PATHS:
         tools_file.extend(load_json(path))
 
-    system_prompt = build_system_prompt(identity_file, memory_file)
+    system_prompt = build_system_prompt(
+        identity_file,
+        memory_file,
+        action_guide_file,
+    )
 
     app = AudioApp()
-    print("✅ AUDIO IS READY")
+    print("\n✅ AUDIO IS READY")
 
     camera = CameraStream(
             camera_index=0,
@@ -270,7 +309,7 @@ async def main():
             fps=30,
         )
     camera.start()
-    print("✅ CAMERA IS READY")
+    print("\n✅ CAMERA IS READY")
 
     csrt_tracker = CSRTTrackingManager(
         camera=camera,
@@ -278,7 +317,7 @@ async def main():
     )
 
     csrt_tracker.start_worker()
-    print("✅ CSRT TRACKER IS READY")
+    print("\n✅ CSRT TRACKER IS READY")
 
     grounding_dino = GroundingDINOService(
         repo=GROUNDING_DINO_REPO,
@@ -305,13 +344,13 @@ async def main():
 
     async def wait_for_dino():
         await grounding_dino.wait_until_ready()
-        print("✅ GROUNDING DINO IS READY")
+        print("\n✅ GROUNDING DINO IS READY")
     async def wait_for_depth():
         await depth_anything.wait_until_ready()
-        print("✅ DEPTH ANYTHING IS READY")
+        print("\n✅ DEPTH ANYTHING IS READY")
     async def wait_for_yolo():
         await yolo.wait_until_ready()
-        print("✅ YOLO IS READY")
+        print("\n✅ YOLO IS READY")
     async def send_robot_command(payload):
         async with zmq_req_lock:
             await zmq_req_socket.send_json(payload)
@@ -330,6 +369,11 @@ async def main():
 
             response_manager = ResponseManager(ws=ws,app=app)
 
+            search_action = SearchAction(
+                ws=ws,
+                send_robot_command=send_robot_command,
+                camera=camera,
+            )
             track_action = TrackAction(
                 csrt_tracker=csrt_tracker,
                 grounding_dino=grounding_dino,
@@ -337,18 +381,24 @@ async def main():
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
                 send_robot_command=send_robot_command,
+                search_action=search_action
             )
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
                 track_action=track_action,
             )
-            search_action = SearchAction(
-                ws=ws,
-                send_robot_command=send_robot_command,
-                camera=camera,
-            )
             see_action = SeeAction(ws=ws, camera=camera)
             move_action = MoveAction(send_robot_command=send_robot_command)
+            move_camera_action = MoveCameraAction(
+                send_robot_command=send_robot_command
+            )
+            goal_executor = GoalExecutor(
+                move_action=move_action,
+                search_action=search_action,
+                track_action=track_action,
+                approach_action=approach_action,
+                move_camera_action=move_camera_action,
+            )
 
             cognitive_manager = CognitionManager(
                 approach_action=approach_action,
@@ -356,6 +406,8 @@ async def main():
                 see_action=see_action,
                 track_action=track_action,
                 move_action=move_action,
+                move_camera_action=move_camera_action,
+                goal_executor=goal_executor,
                 response_manager=response_manager,
             )
 
@@ -402,6 +454,7 @@ async def main():
 
             await asyncio.gather(
                 send_mic_audio(ws, app),
+                send_typed_messages(response_manager),
                 receive_events(ws,app,response_manager,camera,cognitive_manager),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
@@ -415,7 +468,7 @@ async def main():
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        print("Cleaning up audio hardware...")
+        print("\nCleaning up audio hardware...")
         app.stop()
         camera.stop()
         cv2.destroyAllWindows()

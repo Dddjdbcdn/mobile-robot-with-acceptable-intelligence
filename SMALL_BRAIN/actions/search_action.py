@@ -43,6 +43,12 @@ TILT_POSITION_ANGLE = {
 
 PAN_SWEEP_ORDER = ("leftmost", "center", "rightmost")
 SWEEP_TILT_ORDER = ("center", "upmost", "downmost")
+SEARCH_EFFORT_ROWS = {
+    "center": ("center",),
+    "high": ("upmost",),
+    "low": ("downmost",),
+    "best_effort": ("upmost", "downmost"),
+}
 
 from actions.action_result import ActionResult
 
@@ -55,6 +61,7 @@ class SearchAction:
         self.action_id = None
 
         self.completion_future = None
+        self.last_found_target = None
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -63,6 +70,8 @@ class SearchAction:
         self.action_id = None
         self.search_id = None
         self.target = None
+        self.effort = "center"
+        self.sweep_tilt_order = SEARCH_EFFORT_ROWS[self.effort]
         self.sweep_index = 0
         self.pan_angle = PAN_POSITION_ANGLE["center"]
         self.tilt_angle = TILT_POSITION_ANGLE["center"]
@@ -106,10 +115,10 @@ class SearchAction:
             return
 
         sweep_index = int(self.sweep_index)
-        if sweep_index >= len(SWEEP_TILT_ORDER):
+        if sweep_index >= len(self.sweep_tilt_order):
             raise RuntimeError("Sweep index exceeded configured tilt rows")
 
-        tilt_position = SWEEP_TILT_ORDER[sweep_index]
+        tilt_position = self.sweep_tilt_order[sweep_index]
         frames: list[dict[str, Any]] = []
 
         CURRENT_ORDER = PAN_SWEEP_ORDER if tilt_position != "upmost" else ("rightmost", "center", "leftmost")
@@ -184,7 +193,7 @@ class SearchAction:
         request_id = uuid.uuid4().hex
         self.pending_request_id = request_id
 
-        tilt_position = SWEEP_TILT_ORDER[int(self.sweep_index)]
+        tilt_position = self.sweep_tilt_order[int(self.sweep_index)]
 
         images_order = "image_1: leftmost, image_2: center, image_3: rightmost"
 
@@ -283,7 +292,7 @@ class SearchAction:
 
         batch_result = {
             "sweep_index": int(self.sweep_index),
-            "tilt_position": SWEEP_TILT_ORDER[int(self.sweep_index)],
+            "tilt_position": self.sweep_tilt_order[int(self.sweep_index)],
             "assessment": args,
         }
         self.batch_results.append(batch_result)
@@ -322,14 +331,23 @@ class SearchAction:
                 return
 
         self.sweep_index += 1
-        if self.sweep_index < len(SWEEP_TILT_ORDER):
+        if self.sweep_index < len(self.sweep_tilt_order):
             await self.capture_sweep_batch()
             return
         else:
             await self.move_camera_angles(PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"])
             await self.complete_searching(
                 status="failed",
-                outcome="not_found"
+                outcome=(
+                    "search_guidance_required"
+                    if self.effort == "center"
+                    else "not_found"
+                ),
+                reason_code=(
+                    "SEARCH_GUIDANCE_REQUIRED"
+                    if self.effort == "center"
+                    else "TARGET_NOT_VISIBLE"
+                ),
             )
         return
 
@@ -351,14 +369,14 @@ class SearchAction:
 
         await self.move_camera_angles(target_pan, target_tilt)
 
-    async def start_searching(self, target, action_id):
+    async def start_searching(self, target, action_id, effort="center"):
         if self.active:
             return ActionResult(
                 action_id=action_id,
                 action_type="search_action",
-                status="failed",
+                status="already_running",
                 target=target,
-                outcome="rejected",
+                outcome="already_running",
                 reason_code="SEARCH_BUSY",
                 retryable=True,
                 data={
@@ -377,11 +395,24 @@ class SearchAction:
                 reason_code="SEARCH_TARGET_REQUIRED",
             )
 
+        normalized_effort = str(effort or "center").strip().lower().replace("-", "_")
+        if normalized_effort not in SEARCH_EFFORT_ROWS:
+            return ActionResult(
+                action_id=action_id,
+                action_type="search_action",
+                status="failed",
+                target=normalized_target,
+                outcome="invalid_request",
+                reason_code="UNKNOWN_SEARCH_EFFORT",
+            )
+
         self.reset_state()
         self.active = True
         self.action_id = action_id
         self.search_id = action_id
         self.target = normalized_target
+        self.effort = normalized_effort
+        self.sweep_tilt_order = SEARCH_EFFORT_ROWS[normalized_effort]
         self.pan_angle = robot_state["camera"]["pan_angle"]
         self.tilt_angle = robot_state["camera"]["tilt_angle"]
 
@@ -395,16 +426,13 @@ class SearchAction:
             status="running",
             target=normalized_target,
             outcome="searching",
-            data={
-                "strategy": "camera_sweep",
-                "configured_sweep_rows": len(SWEEP_TILT_ORDER),
-            },
+            data={"effort": self.effort},
         )
 
     async def wait_until_finished(self):
         return await self.completion_future
 
-    async def stop_searching(self,reason="USER_REQUESTED"):
+    async def stop_searching(self,reason=None):
         if not self.active:
             return
 
@@ -429,6 +457,8 @@ class SearchAction:
 
         action_id = self.action_id
         target = str(self.target)
+        effort = self.effort
+        configured_rows = tuple(self.sweep_tilt_order)
         scan_results = list(self.batch_results)
         first_frame_result = self.first_frame_result
         final_camera_pose = {
@@ -436,21 +466,27 @@ class SearchAction:
             "tilt_angle": self.tilt_angle,
         }
         searched_rows = len(scan_results)
-        coverage = min(1.0, searched_rows / max(1, len(SWEEP_TILT_ORDER)))
+        coverage = min(1.0, searched_rows / max(1, len(configured_rows)))
 
         data = {
             "initial_frame_assessment": first_frame_result,
             "scan_results": scan_results,
             "searched_rows": searched_rows,
-            "configured_sweep_rows": len(SWEEP_TILT_ORDER),
+            "configured_sweep_rows": len(configured_rows),
+            "configured_tilt_positions": list(configured_rows),
             "search_coverage": coverage,
             "final_camera_pose": final_camera_pose,
+            "effort": effort,
         }
-
-        print(
-            "[Visual search completed] "
-            f"action_id={action_id}, target={target}, status={status}"
-        )
+        if reason_code == "SEARCH_GUIDANCE_REQUIRED":
+            data["user_guidance"] = {
+                "question": (
+                    f"I couldn't find {target} at center height. "
+                    "Is it high, low, not in frame, or should I try my best?"
+                ),
+                "effort_options": ["high", "low", "best_effort"],
+                "not_in_frame_requires_no_retry": True,
+            }
 
         action_result = ActionResult(
             action_id=action_id,
@@ -468,6 +504,7 @@ class SearchAction:
         )
 
         completion_future = self.completion_future
+        self.last_found_target = self.target if status == "succeeded" else None
         self.reset_state()
 
         if completion_future is not None and not completion_future.done():
@@ -554,7 +591,6 @@ def save_candidate_debug_image(
 def clear_images_folder(folder_path="results/search_results", extensions=(".jpg", ".jpeg", ".png", ".webp")):
     target_dir = Path(folder_path)
     if not target_dir.is_dir():
-        print(f"[Cleanup] Folder '{folder_path}' does not exist.")
         return 0
 
     deleted_count = 0
@@ -564,6 +600,6 @@ def clear_images_folder(folder_path="results/search_results", extensions=(".jpg"
                 item.unlink()
                 deleted_count += 1
             except OSError as e:
-                print(f"[Cleanup] Failed to delete {item.name}: {e}")
+                pass
 
     return deleted_count

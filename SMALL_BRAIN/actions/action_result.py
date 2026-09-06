@@ -10,7 +10,7 @@ class ActionResult:
 
     action_id: str
     action_type: str
-    status: str # running / succeeded / failed / cancelled
+    status: str # running / succeeded / failed / cancelled / already_running
     target: str | None = None
     outcome: str | None = None
     reason_code: str | None = None

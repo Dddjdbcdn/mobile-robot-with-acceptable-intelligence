@@ -25,24 +25,12 @@ def update_memory(memory_file,category, new_info):
     return "Invalid memory category."
 
 def _format_section(title, items):
-    """Format strings or grouped rules into readable prompt sections."""
+    """Format a list of strings into readable lines."""
     if isinstance(items, list):
         return "\n".join(f"- {item}" for item in items)
-
-    if isinstance(items, dict):
-        sections = []
-        for name, rules in items.items():
-            prefix, separator, label = name.partition("_")
-            if not (separator and prefix.isdigit()):
-                label = name
-            heading = label.replace("_", " ").upper()
-            sections.append(f"### {heading} ###")
-            sections.append(_format_section(heading, rules))
-        return "\n".join(sections)
-
     return str(items)
 
-def build_system_prompt(identity, memory, action_guide):
+def build_system_prompt(identity, memory):
     """Combines the static identity and dynamic memory into DJ's system prompt."""
 
     sections = []
@@ -60,7 +48,7 @@ def build_system_prompt(identity, memory, action_guide):
     sections.append(_format_section("Rules", identity["rules"]))
 
     sections.append("\n=== HOW TO PERFORM ACTIONS ===")
-    sections.append(_format_section("Action_Guide", action_guide))
+    sections.append(_format_section("Action_Guide", identity["action_guide"]))
 
     has_memory = any(v for v in memory.values() if v)
     if has_memory:

@@ -21,9 +21,9 @@ class ApproachAction:
             return ActionResult(
                 action_id=action_id,
                 action_type="approach_action",
-                status="failed",
+                status="already_running",
                 target=target,
-                outcome="rejected",
+                outcome="already_running",
                 reason_code="APPROACH_BUSY",
                 retryable=True,
                 data={"active_action_id": self.action_id},
@@ -88,9 +88,7 @@ class ApproachAction:
                 reason_code="NAVIGATION_REJECTED",
                 data={"message": str(message)},
             )
-
-        print("OBJECT APPROACHING STARTED")
-
+            
         return ActionResult(
             action_id=action_id,
             action_type="approach_action",
@@ -110,7 +108,7 @@ class ApproachAction:
     async def wait_until_finished(self):
         return await self.completion_future
 
-    async def stop_approaching(self, reason="USER_REQUESTED"):
+    async def stop_approaching(self, reason=None):
         if not self.active:
             return
 
@@ -160,5 +158,4 @@ class ApproachAction:
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
 
-        print("OBJECT APPROACHING COMPLETED")
         return result

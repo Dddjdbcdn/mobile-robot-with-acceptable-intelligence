@@ -23,6 +23,26 @@ class ResponseManager:
             await self._cancel_active_response()
             await self._create_response_and_wait(system_msg)
 
+    async def send_user_text(self, message: str) -> None:
+        """Add typed user input and ask for the usual spoken response."""
+        message = message.strip()
+        if not message:
+            return
+
+        async with self._voice_transition_lock:
+            self.app.clear_queue()
+            await self._cancel_active_response()
+            await self.ws.send(json.dumps({
+                "event_id": f"typed_message_{uuid.uuid4().hex}",
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                },
+            }))
+            await self._create_response_and_wait(system_msg=None)
+
     async def send_system_context(self, message) -> None:
         """Inform the model without creating or interrupting a response."""
         await self.ws.send(json.dumps({

@@ -1,0 +1,34 @@
+{
+  "1_tool_selection": [
+    "Choose the semantic tool that directly matches the user goal: find_target to locate, watch_target for continuous camera attention, and approach_target to move near a target.",
+    "For find, watch, and approach requests, call exactly one matching high-level tool. Its executor owns all prerequisite steps; never manually call search_action, track_action, or approach_action.",
+    "Use see_action only for a one-shot visual question about the current frame. It does not search, move, aim, or maintain attention.",
+    "Use move_action only when blind relative movement itself is the goal, including explicit turns, backing up, small nudges, or expressive motion. Never use it to approach a target."
+  ],
+  "2_target_positioning": [
+    "For a named target described as left, right, up, down, or in a corner, always use the matching camera_region and leave direction unset. The only automatic body direction supported by target tools is behind.",
+    "A target behind DJ requires direction behind because the camera cannot cover the rear. Saying that a target is behind, left, right, high, low, or in a region is only a location hint and never confirms visibility. If camera_region is also provided, the executor turns around first and then aims within the new view. No other direction value may trigger an automatic body turn."
+  ],
+  "3_action_lifecycle": [
+    "A running find_target or approach_target result means the executor is still working. Wait for its terminal ROBOT ACTION EVENT instead of issuing another action.",
+    "A successful watch_target result means continuous tracking has started. Do not wait for tracking to finish; use stop_tracking only when the user asks DJ to stop watching.",
+    "Before acting, inspect decision_state.active_actions. Do not duplicate an active goal or repeat a prerequisite already owned by the executor.",
+    "Only stop or replace an active action when the user requests it, changes the target, or safety requires stopping."
+  ],
+  "4_search_and_retry": [
+    "Start target searches with effort=center. If the goal fails with SEARCH_GUIDANCE_REQUIRED, ask whether the target is high, low, not in frame, or whether DJ should try its best. Retry only from the user's answer: effort=high, effort=low, or effort=best_effort. If it is not in frame, do not retry.",
+    "If a target goal fails with TARGET_NOT_VISIBLE after expanded search or a camera_region hint, do not automatically rotate left or right. Ask the user for clarification, unless the user says the target is behind or explicitly asks DJ to turn its body. Never loop.",
+    "If tracking reports PERSON_LOST, OBJECT_LOST, or TRACKING_STABILITY_TIMEOUT, retry the same high-level tool at most once so the executor can search again. If it fails again, ask the user to become visible or reposition the target."
+  ],
+  "5_failure_and_safety": [
+    "If navigation fails or is rejected, do not substitute blind movement. Report the problem briefly and ask the user to clear the path or provide guidance.",
+    "For execution errors, unsafe conditions, or repeated failures, stop retrying and report the structured reason. Never enter an unbounded retry loop.",
+    "Set user_confirms_visible true only on a follow-up after a previous same-target search failed with SEARCH_GUIDANCE_REQUIRED or TARGET_NOT_VISIBLE and the user explicitly insists the target is visible in DJ's current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, together with direction or camera_region, from DJ's own visual guess, or with find_target. Confirmation authorizes one direct tracker attempt instead of another VLM search. If that detector attempt fails, report the failure without retrying, searching, rotating, or moving until the user gives new guidance."
+  ],
+  "6_camera_control": [
+    "Use move_camera when the user asks DJ to aim only the camera at a direction or region without naming a visual target. Map top-left, up, top-right, left, straight ahead, right, bottom-left, down, and bottom-right to the matching semantic region.",
+    "Distinguish camera aiming from body motion: look left or point your camera left means move_camera left, while turn left or rotate left means move_action. If a named target must remain in view, use watch_target instead.",
+    "Never call move_camera while find_target, watch_target, approach_target, search, tracking, or approach owns the camera. Never stop tracking merely because the user changes from watching a target to approaching the same target; call approach_target directly so the executor can reuse active tracking. Stop tracking only when the user explicitly asks DJ to stop watching, the target changes, or safety requires it.",
+    "Pass camera_region directly to find_target, watch_target, or approach_target; never call move_camera as a separate prerequisite for a named-target goal. The executor aims the camera before searching."
+  ]
+}

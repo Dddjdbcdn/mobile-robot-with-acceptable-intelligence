@@ -8,7 +8,6 @@ import uuid
 
 from actions.action_result import ActionResult
 
-
 @dataclass(frozen=True, slots=True)
 class ToolRequest:
     function_name: str
@@ -48,6 +47,7 @@ class CognitionManager:
         "stop_tracking",
         "stop_approaching",
         "stop_moving",
+        "stop_goal",
     }
 
     def __init__(
@@ -57,6 +57,8 @@ class CognitionManager:
         see_action,
         track_action,
         move_action,
+        move_camera_action,
+        goal_executor,
         response_manager,
         idle_salience_threshold=0.75,
         idle_wakeup_cooldown=15.0,
@@ -67,6 +69,8 @@ class CognitionManager:
         self.see_action = see_action
         self.track_action = track_action
         self.move_action = move_action
+        self.move_camera_action = move_camera_action
+        self.goal_executor = goal_executor
         self.response_manager = response_manager
 
         self.events = asyncio.Queue()
@@ -99,7 +103,7 @@ class CognitionManager:
             response_metadata=response_metadata or {},
         )
 
-        print(f"[{function_name} function is called]. Args: {args}")
+        print(f"\n🌼 [FUNCTION CALLED]: NAME: {function_name}. ARGS: {args}\n")
         await self.events.put(request)
 
     async def handle_tool_msg(self, message):
@@ -178,27 +182,55 @@ class CognitionManager:
         name = request.function_name
         args = request.arguments
 
+        semantic_goals = {
+            "find_target": "search",
+            "watch_target": "track",
+            "approach_target": "approach",
+        }
+        if name in semantic_goals:
+            return await self.goal_executor.start(
+                goal=semantic_goals[name],
+                target=args.get("target"),
+                direction=args.get("direction"),
+                camera_region=args.get("camera_region"),
+                user_confirms_visible=args.get(
+                    "user_confirms_visible", False
+                ),
+                effort=args.get("effort", "center"),
+                action_id=request.action_id,
+            )
+
+        if name == "move_camera":
+            camera_owner = None
+            if self.goal_executor.active:
+                camera_owner = self.goal_executor.action_type
+            elif self.search_action.active:
+                camera_owner = "search_action"
+            elif self.track_action.active:
+                camera_owner = "track_action"
+            elif self.approach_action.active:
+                camera_owner = "approach_action"
+
+            if camera_owner is not None:
+                return ActionResult(
+                    action_id=request.action_id,
+                    action_type="move_camera",
+                    status="failed",
+                    target=args.get("region"),
+                    outcome="precondition_failed",
+                    reason_code="CAMERA_IN_USE",
+                    retryable=True,
+                    data={"camera_owner": camera_owner},
+                )
+
+            return await self.move_camera_action.move_to_region(
+                region=args.get("region"),
+                action_id=request.action_id,
+            )
+
         if name == "see_action":
             return await self.see_action.see(
                 query=args.get("query"),
-                action_id=request.action_id,
-            )
-
-        if name == "search_action":
-            return await self.search_action.start_searching(
-                target=args.get("target"),
-                action_id=request.action_id,
-            )
-
-        if name == "track_action":
-            return await self.track_action.start_tracking(
-                target=args.get("target"),
-                action_id=request.action_id,
-            )
-
-        if name == "approach_action":
-            return await self.approach_action.start_approaching(
-                target=args.get("target"),
                 action_id=request.action_id,
             )
 
@@ -234,6 +266,10 @@ class CognitionManager:
                 self.move_action,
                 "stop_moving",
             ),
+            "stop_goal": (
+                self.goal_executor,
+                "stop",
+            ),
         }[request.function_name]
         was_active = bool(getattr(action, "active", False))
         if was_active:
@@ -266,9 +302,6 @@ class CognitionManager:
             )
 
         asyncio.create_task(assessment, name=request.function_name)
-        # These calls come from responses created with conversation="none".
-        # Their arguments are the complete one-shot assessment, and their
-        # call IDs cannot be answered in the default Realtime conversation.
 
     async def handle_action_executed(self, event):
         if event.request is not self.current_action:
@@ -299,12 +332,14 @@ class CognitionManager:
             self._action_envelope("command_result", result),
         )
 
-        if isinstance(result, ActionResult) and result.status == "running":
+        print(f"\n🌸 [ACTION RESULT]: {result}\n")
+
+        if result.status == "running":
             action = {
-                "search_action": self.search_action,
-                "track_action": self.track_action,
-                "approach_action": self.approach_action,
                 "move_action": self.move_action,
+                "find_target": self.goal_executor,
+                "watch_target": self.goal_executor,
+                "approach_target": self.goal_executor,
             }.get(event.request.function_name)
 
             async def wait_for_completion(action):
@@ -325,8 +360,8 @@ class CognitionManager:
                     wait_for_completion(action),
                     name=f"cognition-finish-{event.request.action_id}",
                 )
-
-        await self.response_manager.create_voice_response()
+        else:
+            await self.response_manager.create_voice_response()
 
     async def handle_lifecycle_finished(self, event):
         result = event.result
@@ -347,28 +382,74 @@ class CognitionManager:
             )
         self.action_results.append(result)
 
+        if (
+            isinstance(result, ActionResult)
+            and result.action_type == "watch_target"
+            and result.status == "succeeded"
+            and self.track_action.active
+        ):
+            async def wait_for_tracking_end():
+                try:
+                    tracking_result = await self.track_action.wait_until_finished()
+                    tracking_event = ActionLifecycleFinished(
+                        event.request, result=tracking_result
+                    )
+                except BaseException as error:
+                    tracking_event = ActionLifecycleFinished(
+                        event.request, error=error
+                    )
+                await self.events.put(tracking_event)
+
+            asyncio.create_task(
+                wait_for_tracking_end(),
+                name=f"watch-finish-{event.request.action_id}",
+            )
+
         summary = (
-            "[ROBOT ACTION EVENT]\n"
+            "🌳 [ACTION LIFECYCLE FINISHED] "
             + json.dumps(
                 self._action_envelope("action_finished", result),
                 separators=(",", ":"),
             )
         )
+        print(f"\n{summary}\n")
         await self.response_manager.send_system_context(summary)
         await self.response_manager.create_voice_response()
 
     def _action_envelope(self, event_type, result):
         return {
-            "schema": "robot.action_event.v1",
             "event_type": event_type,
             "result": self._serialize(result),
-            "robot_state": self._decision_state(),
-            "decision_instruction": (
-                "Re-evaluate the current user goal using this result. "
-                "Choose the next action only if useful; do not assume success "
-                "from a running action."
-            ),
+            "decision_state": self._decision_state(),
+            "decision_instruction": self._decision_instruction(result),
         }
+
+    def _decision_instruction(self, result):
+        if (
+            isinstance(result, ActionResult)
+            and result.reason_code
+            in {"PERSON_DETECTION_FAILED", "OBJECT_DETECTION_FAILED"}
+            and result.data.get("user_confirms_visible") is True
+        ):
+            return (
+                "The user's visibility confirmation has already been honored "
+                "with one direct detector attempt. Report that detection failed. "
+                "Do not retry, search, rotate, or move unless the user gives new guidance."
+            )
+        if (
+            isinstance(result, ActionResult)
+            and result.reason_code == "SEARCH_GUIDANCE_REQUIRED"
+        ):
+            return (
+                "Ask whether the target is high, low, not in frame, or whether "
+                "DJ should try its best. Do not start another search until the "
+                "user answers."
+            )
+        return (
+            "Re-evaluate the unresolved user goal using this result. "
+            "If you have not satisfied the user goal, you must continue choosing action based on action guides. "
+            "Do not repeat the action you just finished"
+        )
 
     def _decision_state(self):
         active_actions = []
@@ -377,6 +458,7 @@ class CognitionManager:
             ("track_action", self.track_action, "active"),
             ("approach_action", self.approach_action, "active"),
             ("move_action", self.move_action, "active"),
+            ("move_camera", self.move_camera_action, "active"),
         ):
             if getattr(action, active_attribute, False):
                 active_actions.append({
@@ -385,22 +467,16 @@ class CognitionManager:
                     "target": getattr(action, "target", None),
                 })
 
-        track_active = bool(getattr(self.track_action, "active", False))
-        tracking_stable = bool(getattr(self.track_action, "stable", False))
-        tracked_target = getattr(self.track_action, "target", None)
-        return {
-            "active_actions": active_actions,
-            "track_action_active": track_active,
-            "tracking_stable": tracking_stable,
-            "tracked_target": tracked_target,
-            "camera_tof_range": self.world_state.get("camera_tof_range"),
-            "servo_pan_angle": self.world_state.get("servo_pan_angle"),
-            "servo_tilt_angle": self.world_state.get("servo_tilt_angle"),
-            "constraints": {
-                "can_approach": track_active and tracking_stable,
-                "approach_requires_target": tracked_target,
-            },
-        }
+        if self.goal_executor.active:
+            active_actions.append({
+                "action_id": self.goal_executor.action_id,
+                "action_type": self.goal_executor.action_type,
+                "target": self.goal_executor.target,
+            })
+
+        state = {"active_actions": active_actions}
+
+        return state
 
     async def _handle_world_state(self, payload):
         previous = self.world_state

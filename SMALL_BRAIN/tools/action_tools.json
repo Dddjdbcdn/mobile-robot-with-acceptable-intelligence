@@ -2,97 +2,249 @@
   {
     "type": "function",
     "name": "see_action",
-    "description": "Capture and inspect the current camera frame. Use this when the user asks what is visible, whether something is visible, to look at object, describe the scene, or when visual context is needed before deciding what to do.",
+    "description": "Answer a one-shot visual question from the current camera frame. Use for what-do-you-see, description, or visual verification requests. This tool does not search, move, aim, or maintain attention.",
     "parameters": {
       "type": "object",
       "properties": {
         "query": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "A self-contained visual inspection instruction that matches the user's requested output exactly. Keep the requested answer minimal unless the user asks for detail. Do not add unrelated environment description. The query must preserve the user's requested level of detail. By default, request the shortest direct answer that fully satisfies the user. Do not request a general scene description unless the user explicitly asks for one. Elaborate only when the user explicitly asks for details, explanation, description, reasoning, or a full scene analysis."
         }
       },
-      "required": ["query"],
+      "required": [
+        "query"
+      ],
       "additionalProperties": false
     }
   },
   {
     "type": "function",
-    "name": "search_action",
-    "description": "Start an interruptible visual search for an object or person. A running result only confirms the search started. Wait for the matching terminal ROBOT ACTION EVENT before deciding whether the target was found. After not_found, change viewpoint before retrying.",
+    "name": "find_target",
+    "description": "Locate and center a target.",
     "parameters": {
       "type": "object",
       "properties": {
         "target": {
           "type": "string",
-          "description": "The object or person to search."
-        }
-      },
-      "required": ["target"],
-      "additionalProperties": false
-    }
-  },
-    {
-    "type": "function",
-    "name": "track_action",
-    "description": "Start continuously tracking an object or person. Tracking remains active after the tool returns running. Use robot state and later action events to detect stability or target loss.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "target": {
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
           "type": "string",
-          "description": "The object or person to track."
+          "enum": ["center", "high", "low", "best_effort"],
+          "description": "Search stage. Use center initially. After a center miss, high scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows. Use continuation values only from the user's guidance."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
         }
-      },
-      "required": ["target"],
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
-    "name": "approach_action",
-    "description": "Start approaching an object or person. Call only when that exact target is actively tracked and tracking is stable. Wait for the matching terminal ROBOT ACTION EVENT to know whether the target was reached.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "type": "string",
-          "description": "The object or person to approach."
-        }
-      },
-      "required": ["target"],
-      "additionalProperties": false
-    }
-  },
-
-  {
-  "type": "function",
-  "name": "move_action",
-  "description": "Start one interruptible relative robot movement. A running result means motion began, not that it completed. Wait for the matching terminal ROBOT ACTION EVENT before relying on the new viewpoint.",
-  "parameters": {
-      "type": "object",
-      "properties": {
-          "linear_velocity": {
-              "type": "number",
-              "description": "Forward/backward speed in meters per second (m/s). Range: [-0.5, 0.5]. Positive values move the robot forward, negative values move it backward. Try to keep the linear velocity absolute value above 0.05 m/s to overcome friction"
-          },
-          "distance": {
-              "type": "number",
-              "description": "Distance to travel linearly in meters (m). Range: [0.0,0.5]. The direction (forward or backward) is determined inside the linear velocity property."
-          },
-          "angular_velocity": {
-              "type": "number",
-              "description": "Rotational speed in radians per second (rad/s). Range: [-3.0, 3.0]. Positive values rotate counter-clockwise (left), negative values rotate clockwise (right). Try to keep the angular velocity absolute above value 0.5 rad/s to overcome friction"
-          },
-          "angle": {
-              "type": "number",
-              "description": "Angle to rotate in radians (rad). Range: [0.0, 6.283]. The direction (clockwise or counterclockwise) is determined inside the angular velocity property."
-          }
       },
       "required": [
-          "linear_velocity",
-          "distance",
-          "angular_velocity",
-          "angle"
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "watch_target",
+    "description": "Start continuous camera tracking. If succeeded, tracking remains active until stopped.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["center", "high", "low", "best_effort"],
+          "description": "Search stage after direct detection misses. Use center initially. After its miss, high or low scans that remaining row and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+        },
+        "user_confirms_visible": {
+          "type": "boolean",
+          "description": "One-shot detector override for a follow-up after a previous search for this same target failed. Set true only when the user then explicitly insists the target is visible in DJ’s current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, or together with direction or camera_region. A failed detector attempt is terminal until new user guidance."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "approach_target",
+    "description": "Move near a target. If the same target is already being tracked, call this tool directly without calling stop_tracking; the executor reuses active tracking.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["center", "high", "low", "best_effort"],
+          "description": "Search stage after direct detection misses. Use center initially. After its miss, high or low scans that remaining row and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+        },
+        "user_confirms_visible": {
+          "type": "boolean",
+          "description": "One-shot detector override for a follow-up after a previous search for this same target failed. Set true only when the user then explicitly insists the target is visible in DJ’s current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, or together with direction or camera_region. A failed detector attempt is terminal until new user guidance."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "move_camera",
+    "description": "Aim only the camera at an absolute semantic region without rotating or translating the robot body. Use when the user says to look up, down, left, right, center, or toward a corner without naming a target to track. Do not use while a target goal or continuous tracking owns the camera.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "region": {
+          "type": "string",
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right"
+          ],
+          "description": "Absolute camera region requested by the user. Natural phrases such as top-left map to upper_left, straight ahead maps to center, and bottom-right maps to lower_right."
+        }
+      },
+      "required": [
+        "region"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "move_action",
+    "description": "Perform one explicit blind relative movement or expressive motion. Use only when the movement itself is the user goal, such as turn around, rotate left, back up, or move forward a specified amount. Do not use it to locate, watch, or approach a target; pass spatial hints to the appropriate target tool instead.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "linear_velocity": {
+          "type": "number",
+          "description": "Forward/backward speed in meters per second (m/s). Range: [-0.5, 0.5]. Positive values move the robot forward, negative values move it backward. Try to keep the linear velocity absolute value above 0.05 m/s to overcome friction"
+        },
+        "distance": {
+          "type": "number",
+          "description": "Distance to travel linearly in meters (m). Range: [0.0,0.5]. The direction (forward or backward) is determined inside the linear velocity property."
+        },
+        "angular_velocity": {
+          "type": "number",
+          "description": "Rotational speed in radians per second (rad/s). Range: [-3.0, 3.0]. Positive values rotate counter-clockwise (left), negative values rotate clockwise (right). Try to keep the angular velocity absolute above value 0.5 rad/s to overcome friction"
+        },
+        "angle": {
+          "type": "number",
+          "description": "Angle to rotate in radians (rad). Range: [0.0, 6.283]. The direction (clockwise or counterclockwise) is determined inside the angular velocity property."
+        }
+      },
+      "required": [
+        "linear_velocity",
+        "distance",
+        "angular_velocity",
+        "angle"
       ],
       "additionalProperties": false
     }

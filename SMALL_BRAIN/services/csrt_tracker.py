@@ -182,6 +182,7 @@ class CSRTTrackingManager:
     # HELPER 2: LIVE TRACKING BLOCK
     # ==========================================
     def _track_live_frame(self):
+        tracker = self.tracker
         if not self.camera.wait_for_frame_after(self.current_sequence, timeout=0.2):
             return
 
@@ -191,7 +192,7 @@ class CSRTTrackingManager:
         self._last_track_time = now
 
         newest = self.camera.snapshot()
-        ok, bbox = self.tracker.update(newest.tracking_bgr)
+        ok, bbox = tracker.update(newest.tracking_bgr)
         self.current_sequence = newest.sequence
 
         if not ok:

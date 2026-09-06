@@ -29,8 +29,8 @@ class MoveAction:
             return ActionResult(
                 action_id=action_id,
                 action_type="move_action",
-                status="failed",
-                outcome="rejected",
+                status="already_running",
+                outcome="already_running",
                 reason_code="MOVE_BUSY",
                 retryable=True,
                 data={"active_action_id": self.action_id},
@@ -71,8 +71,7 @@ class MoveAction:
                 reason_code="MOVE_REJECTED",
                 data={"message": str(message)},
             )
-
-        print("MOVING STARTED")
+            
         return ActionResult(
             action_id=action_id,
             action_type="move_action",
@@ -89,7 +88,7 @@ class MoveAction:
     async def wait_until_finished(self) -> ActionResult:
         return await self.completion_future
 
-    async def stop_moving(self, reason_code: str = "USER_REQUESTED") -> ActionResult:
+    async def stop_moving(self, reason_code=None):
         if not self.active:
             return ActionResult(
                 action_id="unassigned",
@@ -148,5 +147,4 @@ class MoveAction:
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
 
-        print("MOVING COMPLETED")
         return result

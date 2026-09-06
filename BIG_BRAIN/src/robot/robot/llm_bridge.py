@@ -133,8 +133,9 @@ class LLMRosBridge(Node):
         self.current_nav_goal_handle = None
         self.current_nav_action_id = None
         self.move_action_timer = None
-        self.track_object_timer = None
+        self.track_action_timer = None
         self.navigation_active = False
+        self.moving_active = False
         self.max_tracking_time = 10.0
 
         self.zmq_thread = threading.Thread(target=self.listen_for_llm, daemon=True)
@@ -215,6 +216,7 @@ class LLMRosBridge(Node):
             self.move_action_timer = None
             if send_event:
                 self.send_event("move_action", "completed", action_id)
+            self.moving_active = False
             return
 
         lin = lin_vel if elapsed < fwd_dur else 0.0
@@ -257,18 +259,21 @@ class LLMRosBridge(Node):
         if self.move_action_timer:
             self.move_action_timer.cancel()
             self.move_action_timer = None
+            self.moving_active = False
         if self.current_nav_goal_handle:
             self.current_nav_goal_handle.cancel_goal_async()
             self.current_nav_goal_handle = None
+            self.navigation_active = False
 
         self.publish_cmd(0.0, 0.0)
 
-    def track_object_loop(self, start_time):
+    def track_action_loop(self, start_time):
         remaining_pan_angle = self.servo.publish_servo_command(
             tracking=True
         )
 
         if self.navigation_active: return
+        if self.moving_active: return
 
         remaining_rad = math.radians(remaining_pan_angle)
 
@@ -295,8 +300,8 @@ class LLMRosBridge(Node):
         if self.move_action_timer is not None:
             self.move_action_timer.cancel()
 
-        if self.track_object_timer is not None:
-            self.track_object_timer.cancel()
+        if self.track_action_timer is not None:
+            self.track_action_timer.cancel()
 
         self.publish_cmd(0.0, 0.0)
 
@@ -349,17 +354,20 @@ class LLMRosBridge(Node):
                             True,
                         ),
                     )
+                    self.moving_active = True
                     self.rep_socket.send_json({"status": "accepted", "message": "Blind move started"})
 
-                elif cmd == "track_object":
+                elif cmd == "track_action":
                     start_time = self.get_clock().now()
-                    self.track_object_timer = self.create_timer(0.05, lambda: self.track_object_loop(start_time))
+                    if self.track_action_timer is None:
+                        self.track_action_timer = self.create_timer(0.05, lambda: self.track_action_loop(start_time))
+
                     self.rep_socket.send_json({"status": "accepted", "message": "Object is being tracked"})
 
-                elif cmd == "stop_tracking_object":
-                    if self.track_object_timer is not None:
-                        self.track_object_timer.cancel()
-                        self.track_object_timer = None
+                elif cmd == "stop_tracking":
+                    if self.track_action_timer is not None:
+                        self.track_action_timer.cancel()
+                        self.track_action_timer = None
 
                     self.publish_cmd(0.0, 0.0)
 
