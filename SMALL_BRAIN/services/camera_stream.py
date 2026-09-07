@@ -8,8 +8,6 @@ from pathlib import Path
 import asyncio
 import zmq
 
-from database.state import robot_state
-
 class CameraSnapshot:
     def __init__(self, sequence, captured_at, full_bgr, tracking_bgr):
         self.sequence = sequence

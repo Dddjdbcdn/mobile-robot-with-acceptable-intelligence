@@ -8,6 +8,7 @@
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
+  <depend>nav_msgs</depend>
   <depend>xacro</depend>
 
   <exec_depend>robot_state_publisher</exec_depend>

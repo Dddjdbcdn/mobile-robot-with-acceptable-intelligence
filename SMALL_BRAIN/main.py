@@ -16,16 +16,16 @@ import zmq
 import zmq.asyncio
 from typing import Any
 
-from database.state import robot_state,update_camera_state
-
 from utilities.database_functions import load_json, update_memory, build_system_prompt
 from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
+
 from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
 from actions.move_action import MoveAction
 from actions.move_camera_action import MoveCameraAction
+from actions.navigate_semantic_action import NavigateSemanticAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream, send_camera_image
@@ -33,12 +33,14 @@ from services.response_manager import ResponseManager
 
 from services.groundingdino_service import GroundingDINOService
 from services.csrt_tracker import CSRTTrackingManager
-from services.depthanything_service import DepthAnythingService
+from services.depthanything_service import DepthAnythingService # unused
 from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
 from cognition.goal_executor import GoalExecutor
+from cognition.state import robot_state,update_state
+from cognition.semantic_memory import SemanticMemory
 
 context = zmq.asyncio.Context()
 
@@ -56,6 +58,7 @@ zmq_req_lock = asyncio.Lock()
 
 IDENTITY_PATH = "database/identity.json"
 MEMORY_PATH = "database/memory.json"
+SEMANTIC_MEMORY_PATH = "database/semantic_memory.json"
 ACTION_GUIDE_PATH = "database/action_guide.json"
 TOOLS_PATHS = [
     "tools/database_tools.json",
@@ -75,8 +78,6 @@ DEBUG_MODE = False
 GROUNDING_DINO_REPO = Path("vision_models/groundingdino_tools/GroundingDINO")
 GROUNDING_DINO_CONFIG = Path("vision_models/groundingdino_tools/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
 GROUNDING_DINO_MODEL = Path("vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml")
-
-DEPTH_ANYTHING_MODEL = Path("vision_models/depthanything_tools/openvino_models/dav2_metric_indoor_vitb_896x504_fp16.xml")
 
 tool_tasks: set[asyncio.Task[Any]] = set()
 
@@ -107,7 +108,7 @@ async def background_status_monitor(cognitive_manager):
                 await cognitive_manager.handle_tool_msg(message)
 
             elif message.get("type") == "state":
-                update_camera_state(message)
+                update_state(message)
                 # await cognitive_manager.publish_world_state({
                 #     **message,
                 #     "track_action_active": cognitive_manager.track_action.active,
@@ -119,19 +120,42 @@ async def background_status_monitor(cognitive_manager):
             print(f"[System Error in Monitor]: {e}")
             await asyncio.sleep(1)
 
+async def _read_stdin_line(prompt: str) -> str:
+    """Read one terminal line without creating an uncancellable executor thread."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    stdin_fd = sys.stdin.fileno()
+
+    def stdin_ready():
+        loop.remove_reader(stdin_fd)
+        try:
+            line = sys.stdin.readline()
+        except BaseException as error:
+            if not future.done():
+                future.set_exception(error)
+            return
+        if not future.done():
+            future.set_result(line)
+
+    print(prompt, end="", flush=True)
+    loop.add_reader(stdin_fd, stdin_ready)
+    try:
+        return await future
+    finally:
+        loop.remove_reader(stdin_fd)
+
+
 async def send_typed_messages(response_manager):
     print("[System: Typed chat ready. Type a message and press Enter.]")
 
     while True:
-        try:
-            message = await asyncio.to_thread(input, "\nYou: ")
-        except (EOFError, KeyboardInterrupt):
+        message = await _read_stdin_line("\nYou: ")
+        if message == "":
             return
-
         if not message.strip():
             continue
 
-        await response_manager.send_user_text(message)
+        await response_manager.send_user_text(message.rstrip("\n"))
 
 async def receive_events(ws,app,response_manager,camera,cognitive_manager):
     human_speaking = False
@@ -285,6 +309,7 @@ async def main():
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
     action_guide_file = load_json(ACTION_GUIDE_PATH)
+    semantic_memory = SemanticMemory(SEMANTIC_MEMORY_PATH)
 
     tools_file = []
     for path in TOOLS_PATHS:
@@ -325,29 +350,16 @@ async def main():
         model=GROUNDING_DINO_MODEL,
         device="GPU",
     )
-
-    depth_anything = DepthAnythingService(
-        model=DEPTH_ANYTHING_MODEL,
-        max_depth_m=20.0,
-        device="GPU",
-        resize_mode="stretch",
-        depth_scale=0.508
-    )
-
     yolo = YoloService(
         camera=camera
     )
 
     grounding_dino.start_background()
-    depth_anything.start_background()
     yolo.start_background()
 
     async def wait_for_dino():
         await grounding_dino.wait_until_ready()
         print("\n✅ GROUNDING DINO IS READY")
-    async def wait_for_depth():
-        await depth_anything.wait_until_ready()
-        print("\n✅ DEPTH ANYTHING IS READY")
     async def wait_for_yolo():
         await yolo.wait_until_ready()
         print("\n✅ YOLO IS READY")
@@ -381,7 +393,8 @@ async def main():
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
                 send_robot_command=send_robot_command,
-                search_action=search_action
+                search_action=search_action,
+                semantic_memory=semantic_memory,
             )
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
@@ -392,12 +405,17 @@ async def main():
             move_camera_action = MoveCameraAction(
                 send_robot_command=send_robot_command
             )
+            semantic_navigation_action = NavigateSemanticAction(
+                send_robot_command=send_robot_command,
+                semantic_memory=semantic_memory,
+            )
             goal_executor = GoalExecutor(
                 move_action=move_action,
                 search_action=search_action,
                 track_action=track_action,
                 approach_action=approach_action,
                 move_camera_action=move_camera_action,
+                semantic_memory=semantic_memory,
             )
 
             cognitive_manager = CognitionManager(
@@ -407,6 +425,7 @@ async def main():
                 track_action=track_action,
                 move_action=move_action,
                 move_camera_action=move_camera_action,
+                semantic_navigation_action=semantic_navigation_action,
                 goal_executor=goal_executor,
                 response_manager=response_manager,
             )
@@ -460,7 +479,6 @@ async def main():
                 cognitive_manager.cognition_loop(),
                 display_camera_loop(camera,csrt_tracker,yolo,track_action),
                 wait_for_dino(),
-                wait_for_depth(),
                 wait_for_yolo()
             )
     except websockets.exceptions.ConnectionClosed:
@@ -474,7 +492,6 @@ async def main():
         cv2.destroyAllWindows()
         csrt_tracker.stop_worker()
         await grounding_dino.close()
-        await depth_anything.close()
         await yolo.close()
         if cognitive_manager is not None:
             await cognitive_manager.shutdown()

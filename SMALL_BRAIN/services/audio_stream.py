@@ -33,7 +33,11 @@ class AudioApp:
         
         # Dedicated thread for blocking audio playback
         self.running = True
-        self.play_thread = threading.Thread(target=self.playback_worker)
+        self.play_thread = threading.Thread(
+            target=self.playback_worker,
+            name="audio-playback",
+            daemon=True,
+        )
         self.play_thread.start()
 
     def mic_callback(self, in_data, frame_count, time_info, status):
@@ -63,14 +67,26 @@ class AudioApp:
             except queue.Empty:
                 continue
 
-    def stop(self):
+    def stop(self, join_timeout=2.0):
         self.running = False
-        self.play_thread.join()
-        self.input_stream.stop_stream()
+        self.clear_queue()
+
+        # Stop new callbacks first, then give an in-progress speaker write a
+        # bounded amount of time to finish. The daemon flag is the final guard
+        # against a faulty audio backend preventing interpreter shutdown.
+        if self.input_stream.is_active():
+            self.input_stream.stop_stream()
+        self.play_thread.join(timeout=join_timeout)
+        if self.play_thread.is_alive() and self.output_stream.is_active():
+            self.output_stream.stop_stream()
+            self.play_thread.join(timeout=join_timeout)
+
         self.input_stream.close()
-        self.output_stream.stop_stream()
+        if self.output_stream.is_active():
+            self.output_stream.stop_stream()
         self.output_stream.close()
         self.p.terminate()
+
     
     def clear_queue(self):
         """Instantly empty the playback queue when the user interrupts."""

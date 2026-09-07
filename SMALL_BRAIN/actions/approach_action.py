@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from actions.action_result import ActionResult
-from database.state import robot_state
+from cognition.state import robot_state
 
 from actions.track_action import normalize_human_target, normalize_object_target
 

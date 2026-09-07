@@ -3,7 +3,7 @@ import cv2
 import time
 import math
 
-from database.state import robot_state 
+from cognition.state import robot_state 
 
 camera_horizontal_fov_deg: float = 85.0
 camera_vertical_fov_deg: float = 52.0

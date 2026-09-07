@@ -10,13 +10,15 @@ from std_msgs.msg import String
 from std_msgs.msg import Float32
 from sensor_msgs.msg import Imu, Range, PointCloud2
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 import zmq
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 import tf2_geometry_msgs
 import time
 from geometry_msgs.msg import PoseStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from robot.room_geometry import RoomGeometryEstimator
 
 class CameraServo():
     def __init__(self, pan_pub, tilt_pub):
@@ -123,12 +125,33 @@ class LLMRosBridge(Node):
         self.servo_tilt_pub = self.create_publisher(Float32, '/stm32/servo_tilt', 10)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.servo = CameraServo(self.servo_pan_pub,self.servo_tilt_pub)
+
         self.camera_tof_range = 0.0
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Range, '/camera_tof', self.camera_tof_callback, qos)
         self.create_subscription(String, '/yolo/detections', self.yolo_callback, 10)
 
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.map_message = None
+        self.robot_pose = None
+        self.room_geometry = None
+        self.room_geometry_estimator = RoomGeometryEstimator()
+        self.create_subscription(
+            OccupancyGrid, '/map', self.map_callback, map_qos
+        )
+
         self.state_timer = self.create_timer(0.05, self.state_pub_loop)
+        self.robot_pose_timer = self.create_timer(0.1, self.update_robot_pose)
+        self.room_geometry_timer = self.create_timer(
+            1.0, self.update_room_geometry
+        )
 
         self.current_nav_goal_handle = None
         self.current_nav_action_id = None
@@ -136,6 +159,7 @@ class LLMRosBridge(Node):
         self.track_action_timer = None
         self.navigation_active = False
         self.moving_active = False
+        self.tracking_body_active = False
         self.max_tracking_time = 10.0
 
         self.zmq_thread = threading.Thread(target=self.listen_for_llm, daemon=True)
@@ -143,11 +167,6 @@ class LLMRosBridge(Node):
 
         self.background_listener_thread = threading.Thread(target=self.background_listener, daemon=True)
         self.background_listener_thread.start()
-
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.servo = CameraServo(self.servo_pan_pub,self.servo_tilt_pub)
 
     def publish_cmd(self, linear_x, angular_z):
         msg = TwistStamped()
@@ -164,8 +183,51 @@ class LLMRosBridge(Node):
                 "type": "state",
                 "camera_tof_range": self.camera_tof_range,
                 "servo_pan_angle": self.servo.pan_angle,
-                "servo_tilt_angle": self.servo.tilt_angle
+                "servo_tilt_angle": self.servo.tilt_angle,
+                "robot_pose": self.robot_pose,
+                "room_geometry": self.room_geometry,
                 }
+            )
+
+    def update_robot_pose(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.02),
+            )
+        except Exception:
+            return None
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        yaw = math.atan2(
+            2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+            1.0 - 2.0 * (rotation.y ** 2 + rotation.z ** 2),
+        )
+        pose = {
+            "x": translation.x,
+            "y": translation.y,
+            "yaw": yaw,
+            "frame_id": "map",
+        }
+
+        if pose is not None:
+            self.robot_pose = pose
+
+    def map_callback(self, msg):
+        self.map_message = msg
+
+    def update_room_geometry(self):
+        pose = self.robot_pose
+        if self.map_message is None or pose is None:
+            return
+        try:
+            self.room_geometry = self.room_geometry_estimator.estimate(
+                self.map_message, pose["x"], pose["y"], pose["yaw"]
+            )
+        except Exception as error:
+            self.get_logger().warning(
+                f"Could not estimate room geometry: {error}"
             )
 
     def camera_tof_callback(self, msg):
@@ -272,10 +334,17 @@ class LLMRosBridge(Node):
             tracking=True
         )
 
-        if self.navigation_active: return
-        if self.moving_active: return
+        if self.navigation_active or self.moving_active:
+            self.tracking_body_active = False
+            return
 
         remaining_rad = math.radians(remaining_pan_angle)
+
+        if abs(remaining_rad) <= math.radians(1.0):
+            if self.tracking_body_active:
+                self.publish_cmd(0.0, 0.0)
+                self.tracking_body_active = False
+            return
 
         body_kp = 100.0
         ang_vel = body_kp * remaining_rad
@@ -284,6 +353,7 @@ class LLMRosBridge(Node):
         ang_vel = max(min(ang_vel, max_ang_vel),-max_ang_vel)
 
         self.publish_cmd(0.0, ang_vel)
+        self.tracking_body_active = True
 
     def background_listener(self):
         while rclpy.ok():
@@ -389,7 +459,7 @@ class LLMRosBridge(Node):
                     angle = float(request.get("angle", 0.0))
 
                     pose_in = PoseStamped()
-                    pose_in.header.frame_id = 'base_footprint' 
+                    pose_in.header.frame_id = str(request.get("frame_id", "base_footprint"))
                     pose_in.header.stamp = self.get_clock().now().to_msg()
                     
                     pose_in.pose.position.x = x
@@ -400,14 +470,17 @@ class LLMRosBridge(Node):
                     pose_in.pose.orientation.z = math.sin(angle / 2.0)
                     pose_in.pose.orientation.w = math.cos(angle / 2.0)
 
-                    try:
-                        timeout = rclpy.duration.Duration(seconds=0.1)
-                        pose_map = self.tf_buffer.transform(pose_in, 'map', timeout=timeout)
-                    except Exception as e:
-                        self.navigation_active = False
-                        self.current_nav_action_id = None
-                        self.rep_socket.send_json({"status": "error", "message": f"TF Transform failed: {e}"})
-                        continue
+                    if pose_in.header.frame_id == "map":
+                        pose_map = pose_in
+                    else:
+                        try:
+                            timeout = rclpy.duration.Duration(seconds=0.1)
+                            pose_map = self.tf_buffer.transform(pose_in, 'map', timeout=timeout)
+                        except Exception as e:
+                            self.navigation_active = False
+                            self.current_nav_action_id = None
+                            self.rep_socket.send_json({"status": "error", "message": f"TF Transform failed: {e}"})
+                            continue
 
                     goal = NavigateToPose.Goal()
                     goal.pose = pose_map

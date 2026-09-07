@@ -9,7 +9,7 @@ from actions.search_action import (
     PAN_POSITION_ANGLE,
     TILT_POSITION_ANGLE,
 )
-from database.state import robot_state
+from cognition.state import robot_state
 
 
 SEMANTIC_CAMERA_REGIONS = {

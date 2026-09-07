@@ -48,6 +48,7 @@ class CognitionManager:
         "stop_approaching",
         "stop_moving",
         "stop_goal",
+        "stop_navigation",
     }
 
     def __init__(
@@ -60,6 +61,7 @@ class CognitionManager:
         move_camera_action,
         goal_executor,
         response_manager,
+        semantic_navigation_action=None,
         idle_salience_threshold=0.75,
         idle_wakeup_cooldown=15.0,
         active_context_interval=3.0,
@@ -70,6 +72,7 @@ class CognitionManager:
         self.track_action = track_action
         self.move_action = move_action
         self.move_camera_action = move_camera_action
+        self.semantic_navigation_action = semantic_navigation_action
         self.goal_executor = goal_executor
         self.response_manager = response_manager
 
@@ -108,6 +111,8 @@ class CognitionManager:
 
     async def handle_tool_msg(self, message):
         self.approach_action.handle_navigation_event(message)
+        if self.semantic_navigation_action is not None:
+            self.semantic_navigation_action.handle_navigation_event(message)
         self.move_action.handle_moving_event(message)
 
     async def publish_world_state(self, payload):
@@ -200,6 +205,22 @@ class CognitionManager:
                 action_id=request.action_id,
             )
 
+        if name == "navigate_semantic":
+            if self.semantic_navigation_action is None:
+                return ActionResult(
+                    action_id=request.action_id,
+                    action_type=name,
+                    status="failed",
+                    outcome="unsupported_action",
+                    reason_code="SEMANTIC_NAVIGATION_UNAVAILABLE",
+                )
+            return await self.semantic_navigation_action.start(
+                destination=args.get("destination"),
+                object_a=args.get("object_a"),
+                object_b=args.get("object_b"),
+                action_id=request.action_id,
+            )
+
         if name == "move_camera":
             camera_owner = None
             if self.goal_executor.active:
@@ -270,6 +291,10 @@ class CognitionManager:
                 self.goal_executor,
                 "stop",
             ),
+            "stop_navigation": (
+                self.semantic_navigation_action,
+                "stop",
+            ),
         }[request.function_name]
         was_active = bool(getattr(action, "active", False))
         if was_active:
@@ -337,6 +362,7 @@ class CognitionManager:
         if result.status == "running":
             action = {
                 "move_action": self.move_action,
+                "navigate_semantic": self.semantic_navigation_action,
                 "find_target": self.goal_executor,
                 "watch_target": self.goal_executor,
                 "approach_target": self.goal_executor,
@@ -440,10 +466,47 @@ class CognitionManager:
             isinstance(result, ActionResult)
             and result.reason_code == "SEARCH_GUIDANCE_REQUIRED"
         ):
+            action_type = result.data.get(
+                "continuation_guidance", {}
+            ).get("unresolved_action_type", result.action_type)
+            target = result.target
+            if result.data.get("direction") == "behind":
+                choices = "high, low, elsewhere out of frame, or best effort"
+                behind_rule = (
+                    "The behind turn was already performed, so do not offer or "
+                    "send direction=behind again."
+                )
+            else:
+                choices = (
+                    "high, low, behind DJ, elsewhere out of frame, or best effort"
+                )
+                behind_rule = (
+                    f"If the user says behind, immediately retry {action_type} "
+                    f"for {target!r} with direction=behind and effort=center."
+                )
             return (
-                "Ask whether the target is high, low, not in frame, or whether "
-                "DJ should try its best. Do not start another search until the "
-                "user answers."
+                f"The unresolved user goal remains {action_type} for {target!r}; "
+                "the failed search was only its internal prerequisite. Ask one "
+                f"concise question whether the target is {choices}. "
+                f"{behind_rule} For high, low, or best effort, immediately retry "
+                f"the same {action_type} goal with the corresponding effort. "
+                "Preserve any compatible guidance the user combines in one answer. "
+                "Do not switch to find_target unless that was the failed top-level "
+                "goal, and do not ask for confirmation after a valid answer. If the "
+                "target is elsewhere out of frame, do not retry."
+            )
+        if (
+            isinstance(result, ActionResult)
+            and result.action_type == "find_target"
+            and result.status == "succeeded"
+        ):
+            return (
+                "The target is now found and the location hint has already been "
+                "consumed. Re-evaluate the unresolved user goal. If the user also "
+                "asked DJ to watch or approach this same target, call the matching "
+                "high-level tool without direction or camera_region so it reuses "
+                "the current target view. Do not turn or aim toward the same hint "
+                "again."
             )
         return (
             "Re-evaluate the unresolved user goal using this result. "
@@ -459,6 +522,7 @@ class CognitionManager:
             ("approach_action", self.approach_action, "active"),
             ("move_action", self.move_action, "active"),
             ("move_camera", self.move_camera_action, "active"),
+            ("navigate_semantic", self.semantic_navigation_action, "active"),
         ):
             if getattr(action, active_attribute, False):
                 active_actions.append({

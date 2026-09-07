@@ -1,0 +1,50 @@
+{
+  "objects": {
+    "bottle": {
+      "confidence": 0.502,
+      "consecutive_misses": 0,
+      "map_x": 0.6123439555817252,
+      "map_y": -1.2220546137493067,
+      "observations": 1,
+      "observed_at": 1788774533.0745604,
+      "observer_pose": {
+        "x": 1.3385553430567618,
+        "y": -1.4980155340106198,
+        "yaw": 2.5551307535120684
+      },
+      "range_m": 0.7799999713897705,
+      "target": "bottle"
+    },
+    "fan": {
+      "confidence": 0.812,
+      "consecutive_misses": 0,
+      "map_x": 2.3068200986987564,
+      "map_y": 0.26939687343639146,
+      "observations": 2,
+      "observed_at": 1788774517.2411785,
+      "observer_pose": {
+        "x": 1.3394538743866884,
+        "y": -1.4990789423800792,
+        "yaw": 1.3204092799232425
+      },
+      "range_m": 2.049999952316284,
+      "target": "fan"
+    },
+    "guitar": {
+      "confidence": 0.767,
+      "consecutive_misses": 0,
+      "map_x": -2.109784573654086,
+      "map_y": -1.3427580591124921,
+      "observations": 2,
+      "observed_at": 1788774636.1795967,
+      "observer_pose": {
+        "x": -0.4931953438907942,
+        "y": -0.6500989977110914,
+        "yaw": -2.980682967037869
+      },
+      "range_m": 1.7699999809265137,
+      "target": "guitar"
+    }
+  },
+  "version": 1
+}

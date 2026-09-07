@@ -7,10 +7,7 @@
       "type": "object",
       "properties": {
         "query": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": "string",
           "description": "A self-contained visual inspection instruction that matches the user's requested output exactly. Keep the requested answer minimal unless the user asks for detail. Do not add unrelated environment description. The query must preserve the user's requested level of detail. By default, request the shortest direct answer that fully satisfies the user. Do not request a general scene description unless the user explicitly asks for one. Elaborate only when the user explicitly asks for details, explanation, description, reasoning, or a full scene analysis."
         }
       },
@@ -33,7 +30,12 @@
         },
         "effort": {
           "type": "string",
-          "enum": ["center", "high", "low", "best_effort"],
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
           "description": "Search stage. Use center initially. After a center miss, high scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows. Use continuation values only from the user's guidance."
         },
         "direction": {
@@ -64,7 +66,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
         }
       },
       "required": [
@@ -86,7 +88,12 @@
         },
         "effort": {
           "type": "string",
-          "enum": ["center", "high", "low", "best_effort"],
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
           "description": "Search stage after direct detection misses. Use center initially. After its miss, high or low scans that remaining row and best_effort scans both remaining rows."
         },
         "direction": {
@@ -121,7 +128,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
         }
       },
       "required": [
@@ -133,7 +140,7 @@
   {
     "type": "function",
     "name": "approach_target",
-    "description": "Move near a target. If the same target is already being tracked, call this tool directly without calling stop_tracking; the executor reuses active tracking.",
+    "description": "Locate, track, and move near a target as one complete goal. Use this as the only tool when moving near the target is the user's final intended outcome, even if the request also says to find, follow, track, or lock onto it first; do not call find_target or watch_target as a prerequisite. If the same target was just found or is already being tracked, call this tool directly without stop_tracking and omit any direction or camera_region hint already consumed by that earlier action, so the executor reuses the current target view.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -143,7 +150,12 @@
         },
         "effort": {
           "type": "string",
-          "enum": ["center", "high", "low", "best_effort"],
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
           "description": "Search stage after direct detection misses. Use center initially. After its miss, high or low scans that remaining row and best_effort scans both remaining rows."
         },
         "direction": {
@@ -178,7 +190,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim for a target-location hint. Prefer this over turning the body when the hinted region is within the camera’s range. The executor aims before searching; do not call move_camera separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
         }
       },
       "required": [
@@ -245,6 +257,52 @@
         "distance",
         "angular_velocity",
         "angle"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "navigate_semantic",
+    "description": "Navigate with Nav2 to a semantic room position computed from the current occupancy map, or to the midpoint between two remembered objects. Use this for destinations such as the middle of the room, the left wall, a room corner, or between named objects. Do not substitute move_action.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "destination": {
+          "type": "string",
+          "enum": [
+            "center",
+            "nearest_wall",
+            "front_wall",
+            "left_wall",
+            "back_wall",
+            "right_wall",
+            "nearest_corner",
+            "front_left_corner",
+            "back_left_corner",
+            "back_right_corner",
+            "front_right_corner",
+            "between_objects"
+          ],
+          "description": "Room-relative destination. Directions are relative to DJ's body heading when ROS2 most recently estimated the room geometry."
+        },
+        "object_a": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "First remembered object; required only for between_objects."
+        },
+        "object_b": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Second remembered object; required only for between_objects."
+        }
+      },
+      "required": [
+        "destination"
       ],
       "additionalProperties": false
     }

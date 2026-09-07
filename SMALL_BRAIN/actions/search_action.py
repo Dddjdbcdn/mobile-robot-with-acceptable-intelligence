@@ -12,7 +12,7 @@ import uuid
 # Assuming these are available in your environment
 from utilities.database_functions import load_json
 
-from database.state import robot_state
+from cognition.state import robot_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
@@ -482,9 +482,12 @@ class SearchAction:
             data["user_guidance"] = {
                 "question": (
                     f"I couldn't find {target} at center height. "
-                    "Is it high, low, not in frame, or should I try my best?"
+                    "Is it high, low, behind DJ, somewhere else out of frame, "
+                    "or should I try my best?"
                 ),
                 "effort_options": ["high", "low", "best_effort"],
+                "direction_options": ["behind"],
+                "behind_requires_retry": True,
                 "not_in_frame_requires_no_retry": True,
             }
 

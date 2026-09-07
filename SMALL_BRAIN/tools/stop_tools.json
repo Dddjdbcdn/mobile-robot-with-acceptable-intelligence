@@ -28,5 +28,15 @@
       "properties": {},
       "additionalProperties": false
     }
+  },
+  {
+    "type": "function",
+    "name": "stop_navigation",
+    "description": "Cancel an active navigate_semantic request.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
   }
 ]

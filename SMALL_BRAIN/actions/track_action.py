@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+from cognition.state import robot_state
+
 HORIZONTAL_FOV_DEG = 85
 VERTICAL_FOV_DEG = 52
 
@@ -238,7 +240,7 @@ def normalize_object_target(target):
 
 from actions.action_result import ActionResult
 class TrackAction():
-    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, search_action,STABLE_THRESHOLD=0.05):
+    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, search_action, STABLE_THRESHOLD=0.05, semantic_memory=None):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
         self.yolo = yolo
@@ -255,6 +257,9 @@ class TrackAction():
         self.completion_future = None
         self.action_id = None
         self.search_action = search_action
+        self.semantic_memory = semantic_memory
+        self.detection_confidence = 1.0
+        self._memory_recorded_for_session = False
 
         self.person_path = []
         self.person_path_index = 0
@@ -299,6 +304,8 @@ class TrackAction():
         self.target = normalized_target
         self.stable = False
         self.stable_tick = 0
+        self.detection_confidence = 1.0
+        self._memory_recorded_for_session = False
 
         jpeg_bytes = await asyncio.to_thread(
             self.camera.jpeg_bytes_snapshot,
@@ -390,6 +397,8 @@ class TrackAction():
                 retryable=True,
             )
 
+        self.detection_confidence = float(detection_confidence or 1.0)
+
         self.csrt_tracker.begin_tracking(
             detection_sequence=snapshot.sequence,
             initialization_frame=snapshot.tracking_bgr,
@@ -444,6 +453,7 @@ class TrackAction():
                     self.stable_tick += 1
                     if self.stable_tick >= 10:
                         self.stable = True
+                        await self._remember_stable_object()
                 else:
                     self.stable_tick = 0
                     self.stable = False
@@ -456,6 +466,26 @@ class TrackAction():
                     )
 
             await asyncio.sleep(0.05)
+
+    async def _remember_stable_object(self):
+        if (
+            self.semantic_memory is None
+            or self._memory_recorded_for_session
+            or self.target in human_trackable_parts
+        ):
+            return
+        state_snapshot = {
+            "pose": dict(robot_state.get("pose") or {}),
+            "camera": dict(robot_state.get("camera") or {}),
+        }
+        record = await asyncio.to_thread(
+            self.semantic_memory.remember,
+            self.target,
+            state_snapshot,
+            self.detection_confidence,
+        )
+        if record is not None:
+            self._memory_recorded_for_session = True
 
     async def _start_person_tracking(self, target):
         detections = [

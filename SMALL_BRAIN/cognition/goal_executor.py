@@ -6,8 +6,10 @@ import math
 from typing import Awaitable, Callable
 
 from actions.action_result import ActionResult
+from cognition.state import robot_state
 from actions.move_camera_action import SEMANTIC_CAMERA_REGIONS
 from actions.track_action import (
+    human_trackable_parts,
     is_yolo_trackable_target,
     normalize_human_target,
     normalize_object_target,
@@ -46,7 +48,20 @@ class GoalExecutor:
     }
 
     TURN_COMMANDS = {
+        "left": {"angular_velocity": 1.0, "angle": math.pi / 2.0},
+        "right": {"angular_velocity": -1.0, "angle": math.pi / 2.0},
         "behind": {"angular_velocity": -3.0, "angle": math.pi},
+    }
+
+    EXPLICIT_TARGET_DIRECTIONS = {"behind"}
+
+    CAMERA_EDGE_BODY_FALLBACKS = {
+        "upper_left": ("up", "left"),
+        "left": ("center", "left"),
+        "lower_left": ("down", "left"),
+        "upper_right": ("up", "right"),
+        "right": ("center", "right"),
+        "lower_right": ("down", "right"),
     }
 
     def __init__(
@@ -56,12 +71,14 @@ class GoalExecutor:
         track_action,
         approach_action,
         move_camera_action,
+        semantic_memory=None,
     ):
         self.move_action = move_action
         self.search_action = search_action
         self.track_action = track_action
         self.approach_action = approach_action
         self.move_camera_action = move_camera_action
+        self.semantic_memory = semantic_memory
 
         self.active = False
         self.action_id: str | None = None
@@ -75,6 +92,9 @@ class GoalExecutor:
         self._satisfied_facts: set[str] = set()
         self._completed_steps: list[str] = []
         self._started_tracking = False
+        self._memory_recall_attempted = False
+        self._memory_search_pose_used = False
+        self._body_fallback_attempted = False
         self.user_confirms_visible = False
         self.user_confirmation_requested = False
         self.confirmation_retry_target: str | None = None
@@ -124,7 +144,7 @@ class GoalExecutor:
                 action_id, None, "GOAL_TARGET_REQUIRED", "invalid_request",
                 requested_action_type,
             )
-        if normalized_direction not in {None, *self.TURN_COMMANDS}:
+        if normalized_direction not in {None, *self.EXPLICIT_TARGET_DIRECTIONS}:
             return self._invalid_result(
                 action_id, target, "UNKNOWN_DIRECTION", "invalid_request",
                 requested_action_type,
@@ -168,6 +188,9 @@ class GoalExecutor:
         self._satisfied_facts = set()
         self._completed_steps = []
         self._started_tracking = False
+        self._memory_recall_attempted = False
+        self._memory_search_pose_used = False
+        self._body_fallback_attempted = False
         self.user_confirms_visible = confirmation_accepted
         self.user_confirmation_requested = confirmation_requested
         self.effort = normalized_effort
@@ -242,14 +265,31 @@ class GoalExecutor:
                 in {"SEARCH_GUIDANCE_REQUIRED", "TARGET_NOT_VISIBLE"}
             ):
                 self.confirmation_retry_target = self._normalize_target(self.target)
+            failure_data = {
+                "failed_step": error.step,
+                "step_result": self._result_data(error.result),
+            }
+            if error.result.reason_code == "SEARCH_GUIDANCE_REQUIRED":
+                failure_data["continuation_guidance"] = {
+                    "unresolved_action_type": self.action_type,
+                    "target": self.target,
+                    "preserve_action_type": True,
+                    "retry_answers": {
+                        "high": {"effort": "high"},
+                        "low": {"effort": "low"},
+                        "best_effort": {"effort": "best_effort"},
+                        "behind": {
+                            "direction": "behind",
+                            "effort": "center",
+                        },
+                    },
+                    "out_of_frame_requires_no_retry": True,
+                }
             self._complete(
                 status="failed",
                 outcome="goal_failed",
                 reason_code=error.result.reason_code or "GOAL_STEP_FAILED",
-                data={
-                    "failed_step": error.step,
-                    "step_result": self._result_data(error.result),
-                },
+                data=failure_data,
             )
             return
         except Exception as error:
@@ -278,11 +318,16 @@ class GoalExecutor:
 
         rule = self.FACT_RULES[fact]
 
-        # For tracking and approach, try a precise detector before invoking the
-        # visual search. Orientation and explicit camera hints still happen first.
+        if fact == "target_found":
+            await self._try_recalled_search_pose()
+
+        if fact == "target_tracked" and await self._try_recalled_target():
+            return
+
         if (
             fact == "target_tracked"
             and not self.user_confirms_visible
+            and not self._memory_recall_attempted
             and is_yolo_trackable_target(self.target)
         ):
             await self._ensure("oriented")
@@ -311,10 +356,135 @@ class GoalExecutor:
             self, rule.handler_name
         )
         result = await handler()
+        if (
+            fact == "target_found"
+            and result.status != "succeeded"
+            and self._memory_search_pose_used
+        ):
+            self.semantic_memory.mark_miss(self._normalize_target(self.target))
+        if fact == "target_found" and result.status != "succeeded":
+            fallback_result = await self._try_camera_edge_body_fallback(result)
+            if fallback_result is not None:
+                result = fallback_result
         if result.status != "succeeded":
             raise GoalStepFailed(fact, result)
         self._satisfied_facts.add(fact)
         self._completed_steps.append(fact)
+
+    async def _try_recalled_search_pose(self) -> bool:
+        """Aim a find goal at remembered map coordinates before searching."""
+        normalized_target = self._normalize_target(self.target)
+        if (
+            self.semantic_memory is None
+            or self._memory_recall_attempted
+            or normalized_target in human_trackable_parts
+            or self.direction is not None
+            or self.camera_region is not None
+            or self.user_confirms_visible
+        ):
+            return False
+
+        record = self.semantic_memory.recall(normalized_target)
+        pose = robot_state.get("pose") or {}
+        if not isinstance(record, dict) or not all(
+            isinstance(pose.get(key), (int, float)) for key in ("x", "y", "yaw")
+        ):
+            return False
+
+        self._memory_recall_attempted = True
+        bearing = math.atan2(
+            float(record["map_y"]) - float(pose["y"]),
+            float(record["map_x"]) - float(pose["x"]),
+        )
+        relative_angle = math.atan2(
+            math.sin(bearing - float(pose["yaw"])),
+            math.cos(bearing - float(pose["yaw"])),
+        )
+        if abs(relative_angle) > math.radians(4.0):
+            result = await self.move_action.start_moving(
+                linear_velocity=0.0,
+                distance=0.0,
+                angular_velocity=1.0 if relative_angle > 0.0 else -1.0,
+                angle=abs(relative_angle),
+                action_id=self._step_id("memory_orient"),
+            )
+            result = await self._terminal_result(self.move_action, result)
+            if result.status != "succeeded":
+                return False
+
+        camera_result = await self.move_camera_action.move_to_region(
+            region="center",
+            action_id=self._step_id("memory_camera"),
+        )
+        if camera_result.status != "succeeded":
+            return False
+
+        self.search_action.last_found_target = None
+        self._memory_search_pose_used = True
+        self._satisfied_facts.update({"oriented", "camera_aimed"})
+        self._completed_steps.append("memory_recalled")
+        return True
+
+    async def _try_recalled_target(self) -> bool:
+        normalized_target = self._normalize_target(self.target)
+        if (
+            self.semantic_memory is None
+            or normalized_target in human_trackable_parts
+            or self.direction is not None
+            or self.camera_region is not None
+            or self.user_confirms_visible
+        ):
+            return False
+
+        record = self.semantic_memory.recall(normalized_target)
+        pose = robot_state.get("pose") or {}
+        if not isinstance(record, dict) or not all(
+            isinstance(pose.get(key), (int, float)) for key in ("x", "y", "yaw")
+        ):
+            return False
+
+        self._memory_recall_attempted = True
+        bearing = math.atan2(
+            float(record["map_y"]) - float(pose["y"]),
+            float(record["map_x"]) - float(pose["x"]),
+        )
+        relative_angle = math.atan2(
+            math.sin(bearing - float(pose["yaw"])),
+            math.cos(bearing - float(pose["yaw"])),
+        )
+        if abs(relative_angle) > math.radians(4.0):
+            result = await self.move_action.start_moving(
+                linear_velocity=0.0,
+                distance=0.0,
+                angular_velocity=1.0 if relative_angle > 0.0 else -1.0,
+                angle=abs(relative_angle),
+                action_id=self._step_id("memory_orient"),
+            )
+            result = await self._terminal_result(self.move_action, result)
+            if result.status != "succeeded":
+                return False
+
+        camera_result = await self.move_camera_action.move_to_region(
+            region="center",
+            action_id=self._step_id("memory_camera"),
+        )
+        if camera_result.status != "succeeded":
+            return False
+
+        self.search_action.last_found_target = None
+        track_result = await self._track(
+            require_search=False,
+            allow_grounding_dino=True,
+        )
+        if track_result.status != "succeeded":
+            self.semantic_memory.mark_miss(normalized_target)
+            return False
+
+        self._satisfied_facts.update({"target_found", "target_tracked"})
+        self._completed_steps.extend(
+            ["memory_recalled", "target_found", "target_tracked"]
+        )
+        return True
 
     def _fact_is_satisfied(self, fact: str) -> bool:
         normalized_target = self._normalize_target(self.target)
@@ -344,18 +514,76 @@ class GoalExecutor:
         return False
 
     async def _orient(self) -> ActionResult:
-        command = self.TURN_COMMANDS[self.direction]
+        return await self._turn_body(self.direction, "orient")
+
+    async def _turn_body(self, direction: str, step: str) -> ActionResult:
+        command = self.TURN_COMMANDS[direction]
         result = await self.move_action.start_moving(
             linear_velocity=0.0,
             distance=0.0,
             angular_velocity=command["angular_velocity"],
             angle=command["angle"],
-            action_id=self._step_id("orient"),
+            action_id=self._step_id(step),
         )
         result = await self._terminal_result(self.move_action, result)
         if result.status == "succeeded":
             self.search_action.last_found_target = None
         return result
+
+    async def _try_camera_edge_body_fallback(
+        self, initial_search_result: ActionResult
+    ) -> ActionResult | None:
+        fallback = self.CAMERA_EDGE_BODY_FALLBACKS.get(self.camera_region)
+        if (
+            fallback is None
+            or self.direction is not None
+            or self._body_fallback_attempted
+            or initial_search_result.reason_code
+            not in {"SEARCH_GUIDANCE_REQUIRED", "TARGET_NOT_VISIBLE"}
+        ):
+            return None
+
+        self._body_fallback_attempted = True
+        centered_region, turn_direction = fallback
+
+        camera_result = await self.move_camera_action.move_to_region(
+            region=centered_region,
+            action_id=self._step_id("body_fallback_camera"),
+        )
+        if camera_result.status != "succeeded":
+            return camera_result
+        self._completed_steps.append("body_fallback_camera_centered")
+
+        turn_result = await self._turn_body(
+            turn_direction, "body_fallback_turn"
+        )
+        if turn_result.status != "succeeded":
+            return turn_result
+        self._completed_steps.append(f"body_turned_{turn_direction}")
+
+        retry_result = await self._search("body_fallback_search")
+        if retry_result.status == "succeeded":
+            return retry_result
+
+        return ActionResult(
+            action_id=retry_result.action_id,
+            action_type=retry_result.action_type,
+            status=retry_result.status,
+            target=retry_result.target,
+            outcome=retry_result.outcome,
+            reason_code=retry_result.reason_code,
+            retryable=retry_result.retryable,
+            data={
+                **retry_result.data,
+                "automatic_body_fallback": {
+                    "initial_camera_region": self.camera_region,
+                    "centered_camera_region": centered_region,
+                    "body_direction": turn_direction,
+                    "initial_reason_code": initial_search_result.reason_code,
+                    "attempted_once": True,
+                },
+            },
+        )
 
     async def _aim_camera(self) -> ActionResult:
         result = await self.move_camera_action.move_to_region(
@@ -366,7 +594,7 @@ class GoalExecutor:
             self.search_action.last_found_target = None
         return result
 
-    async def _search(self) -> ActionResult:
+    async def _search(self, step: str = "search") -> ActionResult:
         if (
             self.search_action.active
             and self._normalize_target(self.search_action.target)
@@ -376,7 +604,7 @@ class GoalExecutor:
 
         result = await self.search_action.start_searching(
             target=self.target,
-            action_id=self._step_id("search"),
+            action_id=self._step_id(step),
             effort=self.effort,
         )
         return await self._terminal_result(self.search_action, result)
