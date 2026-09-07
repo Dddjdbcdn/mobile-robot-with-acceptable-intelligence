@@ -41,7 +41,11 @@ class Shutdown:
 
 
 class CognitionManager:
-    OOB_TOOLS = {"assess_frame_search", "assess_batch_search"}
+    OOB_TOOLS = {
+        "assess_frame_search",
+        "assess_batch_search",
+        "assess_approach_verification",
+    }
     STOP_TOOLS = {
         "stop_searching",
         "stop_tracking",
@@ -325,6 +329,11 @@ class CognitionManager:
                 request.arguments,
                 request.response_metadata,
             )
+        elif request.function_name == "assess_approach_verification":
+            assessment = self.approach_action.assess_approach_verification(
+                request.arguments,
+                request.response_metadata,
+            )
 
         asyncio.create_task(assessment, name=request.function_name)
 
@@ -451,6 +460,23 @@ class CognitionManager:
         }
 
     def _decision_instruction(self, result):
+        if (
+            isinstance(result, ActionResult)
+            and result.reason_code in {
+                "APPROACH_VERIFICATION_REQUIRED",
+                "APPROACH_VERIFICATION_TIMEOUT",
+                "APPROACH_RANGE_INVALID",
+                "TARGET_NOT_TRACKED_AFTER_NAVIGATION",
+            }
+        ):
+            return (
+                "The approach could not safely confirm or continue toward the "
+                "target. Explain the visibility, range, or occlusion "
+                "evidence briefly and ask whether DJ should continue carefully or "
+                "whether the user can uncover or reposition the target. Do not claim "
+                "success. Retry approach_target only if the user explicitly asks to "
+                "continue."
+            )
         if (
             isinstance(result, ActionResult)
             and result.reason_code

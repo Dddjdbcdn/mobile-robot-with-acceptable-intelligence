@@ -95,6 +95,7 @@ class GoalExecutor:
         self._memory_recall_attempted = False
         self._memory_search_pose_used = False
         self._body_fallback_attempted = False
+        self._approach_result_data: dict = {}
         self.user_confirms_visible = False
         self.user_confirmation_requested = False
         self.confirmation_retry_target: str | None = None
@@ -191,6 +192,7 @@ class GoalExecutor:
         self._memory_recall_attempted = False
         self._memory_search_pose_used = False
         self._body_fallback_attempted = False
+        self._approach_result_data = {}
         self.user_confirms_visible = confirmation_accepted
         self.user_confirmation_requested = confirmation_requested
         self.effort = normalized_effort
@@ -640,13 +642,19 @@ class GoalExecutor:
             and self._normalize_target(self.approach_action.target)
             == self._normalize_target(self.target)
         ):
-            return await self.approach_action.wait_until_finished()
+            result = await self.approach_action.wait_until_finished()
+            if result.status == "succeeded":
+                self._approach_result_data = dict(result.data)
+            return result
 
         result = await self.approach_action.start_approaching(
             target=self.target,
             action_id=self._step_id("approach"),
         )
-        return await self._terminal_result(self.approach_action, result)
+        result = await self._terminal_result(self.approach_action, result)
+        if result.status == "succeeded":
+            self._approach_result_data = dict(result.data)
+        return result
 
     @staticmethod
     async def _terminal_result(action, result: ActionResult) -> ActionResult:
@@ -679,6 +687,16 @@ class GoalExecutor:
                 ),
                 "effort": self.effort,
                 "completed_steps": list(self._completed_steps),
+                **(
+                    {
+                        "verified": self._approach_result_data.get(
+                            "verified", False
+                        ),
+                        "approach_result": dict(self._approach_result_data),
+                    }
+                    if self.goal == "approach" and self._approach_result_data
+                    else {}
+                ),
                 **(data or {}),
             },
         )

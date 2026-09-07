@@ -74,5 +74,41 @@
     "required": ["result","confidence"],
     "additionalProperties": false
     }
+  },
+  {
+    "type": "function",
+    "name": "assess_approach_verification",
+    "description": "Verify from a fresh robot-camera frame whether an approach goal actually reached its target.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "type": "string",
+          "enum": ["reached", "too_far", "uncertain"],
+          "description": "Use reached only when the target is visibly present and clearly near the robot. Use too_far only when the target is identifiable and visibly still too far away. Use uncertain when visibility, perspective, or occlusion prevents a reliable judgment."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in the result from 0 to 1."
+        },
+        "target_visible": {
+          "type": "boolean",
+          "description": "Whether the requested target is identifiable in the frame."
+        },
+        "occlusion": {
+          "type": "string",
+          "enum": ["clear", "partial", "heavy", "not_visible"],
+          "description": "How much the target is occluded."
+        },
+        "evidence": {
+          "type": "string",
+          "description": "Brief visual evidence for the distance and occlusion judgment."
+        }
+      },
+      "required": ["result", "confidence", "target_visible", "occlusion", "evidence"],
+      "additionalProperties": false
+    }
   }
 ]

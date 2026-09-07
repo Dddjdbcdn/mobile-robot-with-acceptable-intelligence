@@ -399,6 +399,8 @@ async def main():
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
                 track_action=track_action,
+                ws=ws,
+                camera=camera,
             )
             see_action = SeeAction(ws=ws, camera=camera)
             move_action = MoveAction(send_robot_command=send_robot_command)
