@@ -168,6 +168,11 @@ class LLMRosBridge(Node):
         self.background_listener_thread = threading.Thread(target=self.background_listener, daemon=True)
         self.background_listener_thread.start()
 
+        self.reset_semantic_memory()
+
+    def reset_semantic_memory():
+
+
     def publish_cmd(self, linear_x, angular_z):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
