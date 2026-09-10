@@ -9,7 +9,6 @@ from actions.action_result import ActionResult
 from cognition.state import robot_state
 from actions.move_camera_action import SEMANTIC_CAMERA_REGIONS
 from actions.track_action import (
-    human_trackable_parts,
     is_yolo_trackable_target,
     normalize_human_target,
     normalize_object_target,
@@ -40,9 +39,7 @@ class GoalExecutor:
     FACT_RULES = {
         "oriented": FactRule((), "_orient"),
         "camera_aimed": FactRule((), "_aim_camera"),
-        "target_found": FactRule(
-            ("oriented", "camera_aimed"), "_search"
-        ),
+        "target_found": FactRule(("oriented", "camera_aimed"), "_search"),
         "target_tracked": FactRule(("target_found",), "_track"),
         "target_reached": FactRule(("target_tracked",), "_approach"),
     }
@@ -116,6 +113,10 @@ class GoalExecutor:
         normalized_camera_region = (
             str(camera_region or "").strip().lower().replace("-", "_") or None
         )
+        if normalized_direction in SEMANTIC_CAMERA_REGIONS:
+            if normalized_camera_region is None:
+                normalized_camera_region = normalized_direction
+                normalized_direction = None
         normalized_effort = str(effort or "center").strip().lower().replace("-", "_")
         target = str(target or "").strip()
         normalized_target = self._normalize_target(target)
@@ -379,7 +380,6 @@ class GoalExecutor:
         if (
             self.semantic_memory is None
             or self._memory_recall_attempted
-            or normalized_target in human_trackable_parts
             or self.direction is not None
             or self.camera_region is not None
             or self.user_confirms_visible
@@ -414,9 +414,9 @@ class GoalExecutor:
             if result.status != "succeeded":
                 return False
 
-        camera_result = await self.move_camera_action.move_to_region(
+        camera_result = await self._move_camera_for_goal(
             region="center",
-            action_id=self._step_id("memory_camera"),
+            step="memory_camera",
         )
         if camera_result.status != "succeeded":
             return False
@@ -431,7 +431,6 @@ class GoalExecutor:
         normalized_target = self._normalize_target(self.target)
         if (
             self.semantic_memory is None
-            or normalized_target in human_trackable_parts
             or self.direction is not None
             or self.camera_region is not None
             or self.user_confirms_visible
@@ -466,9 +465,9 @@ class GoalExecutor:
             if result.status != "succeeded":
                 return False
 
-        camera_result = await self.move_camera_action.move_to_region(
+        camera_result = await self._move_camera_for_goal(
             region="center",
-            action_id=self._step_id("memory_camera"),
+            step="memory_camera",
         )
         if camera_result.status != "succeeded":
             return False
@@ -548,9 +547,9 @@ class GoalExecutor:
         self._body_fallback_attempted = True
         centered_region, turn_direction = fallback
 
-        camera_result = await self.move_camera_action.move_to_region(
+        camera_result = await self._move_camera_for_goal(
             region=centered_region,
-            action_id=self._step_id("body_fallback_camera"),
+            step="body_fallback_camera",
         )
         if camera_result.status != "succeeded":
             return camera_result
@@ -563,7 +562,9 @@ class GoalExecutor:
             return turn_result
         self._completed_steps.append(f"body_turned_{turn_direction}")
 
-        retry_result = await self._search("body_fallback_search")
+        retry_result = await self._search(
+            "body_fallback_search", initial_view_only=True
+        )
         if retry_result.status == "succeeded":
             return retry_result
 
@@ -588,15 +589,29 @@ class GoalExecutor:
         )
 
     async def _aim_camera(self) -> ActionResult:
-        result = await self.move_camera_action.move_to_region(
+        result = await self._move_camera_for_goal(
             region=self.camera_region,
-            action_id=self._step_id("aim_camera"),
+            step="aim_camera",
         )
         if result.status == "succeeded":
             self.search_action.last_found_target = None
         return result
 
-    async def _search(self, step: str = "search") -> ActionResult:
+    async def _move_camera_for_goal(self, region: str, step: str) -> ActionResult:
+        if self.track_action.active:
+            await self.track_action.stop_tracking(
+                reason_code="REPLACED",
+                status="cancelled",
+                outcome="replaced_by_new_goal",
+            )
+        return await self.move_camera_action.move_to_region(
+            region=region,
+            action_id=self._step_id(step),
+        )
+
+    async def _search(
+        self, step: str = "search", initial_view_only=None
+    ) -> ActionResult:
         if (
             self.search_action.active
             and self._normalize_target(self.search_action.target)
@@ -604,10 +619,16 @@ class GoalExecutor:
         ):
             return await self.search_action.wait_until_finished()
 
+        if initial_view_only is None:
+            initial_view_only = (
+                self.direction is None
+                and self.camera_region in self.CAMERA_EDGE_BODY_FALLBACKS
+            )
         result = await self.search_action.start_searching(
             target=self.target,
             action_id=self._step_id(step),
             effort=self.effort,
+            initial_view_only=initial_view_only,
         )
         return await self._terminal_result(self.search_action, result)
 

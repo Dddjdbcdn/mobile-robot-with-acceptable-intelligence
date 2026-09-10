@@ -68,9 +68,9 @@ class CognitionManager:
         goal_executor,
         response_manager,
         semantic_navigation_action,
-        idle_prompt_seconds=15.0,
-        boot_observation_delay=3.0,
-        long_idle_person_seek_seconds=60.0,
+        idle_prompt_seconds=60.0,
+        boot_observation_delay=6.0,
+        long_idle_person_seek_seconds=120.0,
         proximity_cooldown=8.0,
     ):
         self.approach_action = approach_action

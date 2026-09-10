@@ -9,7 +9,7 @@ import time
 
 
 class SemanticMemory:
-    """Persistent, confidence-weighted map observations of tracked objects."""
+    """Persistent, confidence-weighted map observations of tracked targets."""
 
     def __init__(self, path, max_range_m=5.0, state_max_age_s=0.5):
         self.path = Path(path)

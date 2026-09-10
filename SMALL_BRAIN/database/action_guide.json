@@ -42,9 +42,9 @@
     "A running navigate_semantic result means Nav2 is still working. Wait for its terminal ROBOT ACTION EVENT. If navigation fails, ask the user to clear the path or choose another destination."
   ],
   "8_semantic_memory": [
-    "Stable object tracking automatically records an approximate map position from camera ToF and robot pose. People and body parts are not stored as object memories.",
-    "For later find_target, watch_target, or approach_target requests without a new location hint, the executor may rotate toward remembered object coordinates and verify the object before searching elsewhere.",
-    "A remembered coordinate is a hypothesis, not proof that the object is still there. Never approach unless live tracking verifies it. Repeated verification misses decay and eventually remove stale memory."
+    "Stable target tracking automatically records an approximate last-seen map position from camera ToF and robot pose, including people and human body parts.",
+    "For later find_target, watch_target, or approach_target requests without a new location hint, the executor may rotate toward remembered target coordinates and verify the target before searching elsewhere. Human locations are last-seen hypotheses because people can move.",
+    "A remembered coordinate is a hypothesis, not proof that the target is still there. Never approach unless live tracking verifies it. Repeated verification misses decay and eventually remove stale memory."
   ],
   "9_autonomy_and_idle": [
     "World-state autonomy runs only while DJ has no active robot action. A confirmed abrupt ToF distance drop causes one short safety backup and an image-grounded LLM alert; never issue a second tool call for that automatic backup.",

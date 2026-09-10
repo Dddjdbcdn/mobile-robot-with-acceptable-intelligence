@@ -47,7 +47,7 @@ SEARCH_EFFORT_ROWS = {
     "center": ("center",),
     "high": ("upmost",),
     "low": ("downmost",),
-    "best_effort": ("upmost", "downmost"),
+    "best_effort": ("center", "upmost", "downmost"),
 }
 
 from actions.action_result import ActionResult
@@ -71,6 +71,7 @@ class SearchAction:
         self.search_id = None
         self.target = None
         self.effort = "center"
+        self.initial_view_only = False
         self.sweep_tilt_order = SEARCH_EFFORT_ROWS[self.effort]
         self.sweep_index = 0
         self.pan_angle = PAN_POSITION_ANGLE["center"]
@@ -276,8 +277,15 @@ class SearchAction:
             )
             return
 
-        else:
-            await self.capture_sweep_batch()
+        if self.initial_view_only:
+            await self.complete_searching(
+                status="failed",
+                outcome="not_found",
+                reason_code="TARGET_NOT_VISIBLE",
+            )
+            return
+
+        await self.capture_sweep_batch()
         return
 
     async def assess_batch_search(self, args, response_metadata) -> None:
@@ -369,7 +377,13 @@ class SearchAction:
 
         await self.move_camera_angles(target_pan, target_tilt)
 
-    async def start_searching(self, target, action_id, effort="center"):
+    async def start_searching(
+        self,
+        target,
+        action_id,
+        effort="center",
+        initial_view_only=False,
+    ):
         if self.active:
             return ActionResult(
                 action_id=action_id,
@@ -412,6 +426,7 @@ class SearchAction:
         self.search_id = action_id
         self.target = normalized_target
         self.effort = normalized_effort
+        self.initial_view_only = initial_view_only is True
         self.sweep_tilt_order = SEARCH_EFFORT_ROWS[normalized_effort]
         self.pan_angle = robot_state["camera"]["pan_angle"]
         self.tilt_angle = robot_state["camera"]["tilt_angle"]
@@ -426,7 +441,10 @@ class SearchAction:
             status="running",
             target=normalized_target,
             outcome="searching",
-            data={"effort": self.effort},
+            data={
+                "effort": self.effort,
+                "initial_view_only": self.initial_view_only,
+            },
         )
 
     async def wait_until_finished(self):
@@ -458,6 +476,7 @@ class SearchAction:
         action_id = self.action_id
         target = str(self.target)
         effort = self.effort
+        initial_view_only = self.initial_view_only
         configured_rows = tuple(self.sweep_tilt_order)
         scan_results = list(self.batch_results)
         first_frame_result = self.first_frame_result
@@ -477,6 +496,7 @@ class SearchAction:
             "search_coverage": coverage,
             "final_camera_pose": final_camera_pose,
             "effort": effort,
+            "initial_view_only": initial_view_only,
         }
         if reason_code == "SEARCH_GUIDANCE_REQUIRED":
             data["user_guidance"] = {

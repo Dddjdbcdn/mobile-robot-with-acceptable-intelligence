@@ -58,8 +58,8 @@ class Stm32SensorBridge(Node):
             y_idx = i // 8
             
             x_dir = 1.0
-            y_dir = (self.tof_cx - x_idx) * (sensor_width / 8.0)
-            z_dir = -(self.tof_cy - y_idx) * (sensor_width / 8.0)
+            y_dir = - (self.tof_cx - x_idx) * (sensor_width / 8.0)
+            z_dir = - (self.tof_cy - y_idx) * (sensor_width / 8.0)
             
             self.ray_dirs.append((x_dir, y_dir, z_dir))
 

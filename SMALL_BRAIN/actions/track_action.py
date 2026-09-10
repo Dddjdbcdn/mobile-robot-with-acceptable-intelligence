@@ -453,7 +453,7 @@ class TrackAction():
                     self.stable_tick += 1
                     if self.stable_tick >= 10:
                         self.stable = True
-                        await self._remember_stable_object()
+                        await self._remember_stable_target()
                 else:
                     self.stable_tick = 0
                     self.stable = False
@@ -467,11 +467,10 @@ class TrackAction():
 
             await asyncio.sleep(0.05)
 
-    async def _remember_stable_object(self):
+    async def _remember_stable_target(self):
         if (
             self.semantic_memory is None
             or self._memory_recorded_for_session
-            or self.target in human_trackable_parts
         ):
             return
         state_snapshot = {
@@ -511,6 +510,7 @@ class TrackAction():
             )
 
         person = max(detections, key=lambda detection: detection["confidence"])
+        self.detection_confidence = float(person.get("confidence") or 1.0)
         self.person_path = self.find_best_person_path(person, target)
 
         self.person_path_index = 0
@@ -639,6 +639,7 @@ class TrackAction():
                     self.stable_tick += 1
                     if self.stable_tick >= 10:
                         self.stable = True
+                        await self._remember_stable_target()
                 else:
                     self.stable_tick = 0
                     self.stable = False

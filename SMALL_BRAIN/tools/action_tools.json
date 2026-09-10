@@ -47,7 +47,7 @@
             "behind",
             null
           ],
-          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
         },
         "camera_region": {
           "type": [
@@ -66,7 +66,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
         }
       },
       "required": [
@@ -105,7 +105,7 @@
             "behind",
             null
           ],
-          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
         },
         "user_confirms_visible": {
           "type": "boolean",
@@ -128,7 +128,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
         }
       },
       "required": [
@@ -167,7 +167,7 @@
             "behind",
             null
           ],
-          "description": "Set to behind only when the named target is behind DJ and outside the camera’s reachable view. For left, right, up, down, or corners, leave this unset and use camera_region."
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
         },
         "user_confirms_visible": {
           "type": "boolean",
@@ -190,7 +190,7 @@
             "lower_right",
             null
           ],
-          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Never set center as a default; omit camera_region when no location was provided so semantic memory remains available. The executor aims and searches with the camera first. If a left or right edge hint misses, it automatically centers camera pan while preserving the requested height, rotates the body once toward that side, and searches again. Do not request that inferred turn separately."
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
         }
       },
       "required": [
