@@ -1,6 +1,7 @@
 import math
 import threading
 import json
+from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -170,8 +171,23 @@ class LLMRosBridge(Node):
 
         self.reset_semantic_memory()
 
-    def reset_semantic_memory():
+    def reset_semantic_memory(self):
+        semantic_memory_path = next(
+            (
+                parent / "SMALL_BRAIN" / "database" / "semantic_memory.json"
+                for parent in Path(__file__).resolve().parents
+                if (parent / "SMALL_BRAIN" / "database").is_dir()
+            ),
+            None,
+        )
+        if semantic_memory_path is None:
+            raise FileNotFoundError("Could not locate semantic_memory.json")
 
+        with semantic_memory_path.open("w", encoding="utf-8") as file:
+            json.dump({"objects": {}, "version": 1}, file, indent=2)
+            file.write("\n")
+
+        self.get_logger().info("Semantic memory cleared for the new map")
 
     def publish_cmd(self, linear_x, angular_z):
         msg = TwistStamped()

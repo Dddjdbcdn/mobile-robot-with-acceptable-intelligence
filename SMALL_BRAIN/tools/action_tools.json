@@ -310,7 +310,7 @@
   {
     "type": "function",
     "name": "go_idle",
-    "description": "Put DJ into settled idle mode when the user explicitly asks it to wait, stop talking, go idle, settle down, rest, or stop initiating interactions. This stops active robot behavior, centers the camera, and suppresses autonomous proximity reactions, idle conversation, and person-seeking until the user speaks or gives another command.",
+    "description": "Put DJ into settled idle mode when the user explicitly asks it to wait, chill, stop talking, go idle, settle down, rest, or stop initiating interactions. This stops active robot behavior, centers the camera, and suppresses autonomous proximity reactions, idle conversation, and person-seeking until the user speaks or gives another command.",
     "parameters": {
       "type": "object",
       "properties": {},
