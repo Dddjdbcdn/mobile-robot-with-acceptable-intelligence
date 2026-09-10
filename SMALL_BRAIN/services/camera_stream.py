@@ -155,29 +155,3 @@ class CameraStream:
                 lambda: (self.latest and self.latest.sequence > sequence) or self.stop_event.is_set(),
                 timeout=timeout
             )
-
-# Standalone helper functions 
-async def send_camera_image(ws, jpeg_bytes, instruction):
-    jpeg_bytes = bytes(jpeg_bytes)
-    if not jpeg_bytes or not jpeg_bytes.startswith(b"\xff\xd8"):
-        raise ValueError("Invalid JPEG bytes. Encode the OpenCV frame with cv2.imencode('.jpg', frame).")
-
-    encoded_image = base64.b64encode(jpeg_bytes).decode("ascii")
-    image_url = f"data:image/jpeg;base64,{encoded_image}"
-
-    image_event = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": instruction.strip()},
-                {"type": "input_image", "image_url": image_url},
-            ],
-        },
-    }
-
-    await ws.send(json.dumps(image_event))
-    print(f"\n[Camera] IMAGE ADDED")
-
-    return {"jpeg_bytes": len(jpeg_bytes), "base64_characters": len(encoded_image)}

@@ -28,7 +28,7 @@ from actions.move_camera_action import MoveCameraAction
 from actions.navigate_semantic_action import NavigateSemanticAction
 
 from services.audio_stream import AudioApp, send_mic_audio
-from services.camera_stream import CameraStream, send_camera_image
+from services.camera_stream import CameraStream
 from services.response_manager import ResponseManager
 
 from services.groundingdino_service import GroundingDINOService
@@ -109,19 +109,18 @@ async def background_status_monitor(cognitive_manager):
 
             elif message.get("type") == "state":
                 update_state(message)
-                # await cognitive_manager.publish_world_state({
-                #     **message,
-                #     "track_action_active": cognitive_manager.track_action.active,
-                #     "tracking_stable": cognitive_manager.track_action.stable,
-                #     "tracked_target": cognitive_manager.track_action.target,
-                # })
+                await cognitive_manager.publish_world_state({
+                    **message,
+                    "track_action_active": cognitive_manager.track_action.active,
+                    "tracking_stable": cognitive_manager.track_action.stable,
+                    "tracked_target": cognitive_manager.track_action.target,
+                })
 
         except Exception as e:
             print(f"[System Error in Monitor]: {e}")
             await asyncio.sleep(1)
 
-async def _read_stdin_line(prompt: str) -> str:
-    """Read one terminal line without creating an uncancellable executor thread."""
+async def _read_stdin_line(prompt):
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     stdin_fd = sys.stdin.fileno()
@@ -145,7 +144,7 @@ async def _read_stdin_line(prompt: str) -> str:
         loop.remove_reader(stdin_fd)
 
 
-async def send_typed_messages(response_manager):
+async def send_typed_messages(response_manager, cognitive_manager=None):
     print("[System: Typed chat ready. Type a message and press Enter.]")
 
     while True:
@@ -154,6 +153,9 @@ async def send_typed_messages(response_manager):
             return
         if not message.strip():
             continue
+
+        if cognitive_manager is not None:
+            cognitive_manager.note_user_activity()
 
         await response_manager.send_user_text(message.rstrip("\n"))
 
@@ -232,9 +234,16 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "conversation.item.input_audio_transcription.delta":
             transcript = event.get("delta", "")
 
+            def has_meaningful_speech(text):
+                text = text.strip()
+                if not text: return False
+                if text.startswith(("[", "(")): return False
+                return sum(char.isalnum() for char in text) >= 2
+
             if not human_speaking and has_meaningful_speech(transcript):
                 app.clear_queue()
                 human_speaking = True
+                cognitive_manager.note_user_activity()
 
                 print("\n[SPEECH STARTED]")
 
@@ -475,7 +484,7 @@ async def main():
 
             await asyncio.gather(
                 send_mic_audio(ws, app),
-                send_typed_messages(response_manager),
+                send_typed_messages(response_manager, cognitive_manager),
                 receive_events(ws,app,response_manager,camera,cognitive_manager),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
@@ -497,12 +506,6 @@ async def main():
         await yolo.close()
         if cognitive_manager is not None:
             await cognitive_manager.shutdown()
-
-def has_meaningful_speech(text: str) -> bool:
-    text = text.strip()
-    if not text: return False
-    if text.startswith(("[", "(")): return False
-    return sum(char.isalnum() for char in text) >= 2
 
 if __name__ == "__main__":
     try:

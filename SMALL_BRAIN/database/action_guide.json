@@ -45,5 +45,10 @@
     "Stable object tracking automatically records an approximate map position from camera ToF and robot pose. People and body parts are not stored as object memories.",
     "For later find_target, watch_target, or approach_target requests without a new location hint, the executor may rotate toward remembered object coordinates and verify the object before searching elsewhere.",
     "A remembered coordinate is a hypothesis, not proof that the object is still there. Never approach unless live tracking verifies it. Repeated verification misses decay and eventually remove stale memory."
+  ],
+  "9_autonomy_and_idle": [
+    "World-state autonomy runs only while DJ has no active robot action. A confirmed abrupt ToF distance drop causes one short safety backup and an image-grounded LLM alert; never issue a second tool call for that automatic backup.",
+    "After roughly ten seconds with no response or action, DJ may receive a fresh camera frame and initiate one brief, scene-grounded question. At boot and after prolonged user absence, inspect the frame for a person; greet a visible person naturally, or use find_target for user when nobody is visible and a bounded search is appropriate.",
+    "Call go_idle only when the user explicitly asks DJ to go idle, settle, rest, or stop initiating interactions. Settled mode stops active behavior, centers the camera, and suppresses all autonomous backups, prompts, and person searches. Any later user speech or non-idle command wakes DJ naturally."
   ]
 }

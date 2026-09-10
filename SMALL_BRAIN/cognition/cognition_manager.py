@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
 import json
+from statistics import median
 import time
 import uuid
 
@@ -65,10 +67,11 @@ class CognitionManager:
         move_camera_action,
         goal_executor,
         response_manager,
-        semantic_navigation_action=None,
-        idle_salience_threshold=0.75,
-        idle_wakeup_cooldown=15.0,
-        active_context_interval=3.0,
+        semantic_navigation_action,
+        idle_prompt_seconds=15.0,
+        boot_observation_delay=3.0,
+        long_idle_person_seek_seconds=60.0,
+        proximity_cooldown=8.0,
     ):
         self.approach_action = approach_action
         self.search_action = search_action
@@ -87,11 +90,25 @@ class CognitionManager:
         self._running = False
 
         self.world_state = {}
+        self._pending_world_state: dict | None = None
+        self._world_state_queued = False
         self._last_idle_wakeup = 0.0
         self._last_active_context = 0.0
-        self.idle_salience_threshold = idle_salience_threshold
-        self.idle_wakeup_cooldown = idle_wakeup_cooldown
-        self.active_context_interval = active_context_interval
+        self._started_at = time.monotonic()
+        self._last_activity_at = self._started_at
+        self._last_user_activity_at = self._started_at
+        self._last_person_seek_at = 0.0
+        self._last_proximity_reaction = 0.0
+        self._boot_observation_pending = True
+        self._settled = False
+        self._autonomy_task: asyncio.Task | None = None
+        self._tof_history = deque(maxlen=5)
+        self._proximity_candidate_count = 0
+
+        self.idle_prompt_seconds = idle_prompt_seconds
+        self.boot_observation_delay = boot_observation_delay
+        self.long_idle_person_seek_seconds = long_idle_person_seek_seconds
+        self.proximity_cooldown = proximity_cooldown
 
     async def handle_tool_call(
         self,
@@ -101,6 +118,11 @@ class CognitionManager:
         response_metadata=None,
     ):
         args = json.loads(arguments) if arguments else {}
+        if function_name not in self.OOB_TOOLS:
+            self._last_activity_at = time.monotonic()
+            if function_name != "go_idle":
+                self._settled = False
+                self._cancel_passive_autonomy()
 
         request = ToolRequest(
             function_name=function_name,
@@ -115,14 +137,38 @@ class CognitionManager:
 
     async def handle_tool_msg(self, message):
         self.approach_action.handle_navigation_event(message)
-        if self.semantic_navigation_action is not None:
-            self.semantic_navigation_action.handle_navigation_event(message)
+        self.semantic_navigation_action.handle_navigation_event(message)
         self.move_action.handle_moving_event(message)
 
     async def publish_world_state(self, payload):
-        await self.events.put(WorldState(payload))
+        self._pending_world_state = dict(payload)
+        if self._world_state_queued:
+            return
+        self._world_state_queued = True
+        await self.events.put(WorldState({}))
+
+    def note_user_activity(self):
+        now = time.monotonic()
+        self._last_user_activity_at = now
+        self._last_activity_at = now
+        self._boot_observation_pending = False
+        self._settled = False
+        self._cancel_passive_autonomy()
+
+    def _cancel_passive_autonomy(self):
+        task = self._autonomy_task
+        if (
+            task is not None
+            and not task.done()
+            and task.get_name() != "proximity-reaction"
+        ):
+            task.cancel()
 
     async def shutdown(self):
+        autonomy_task = self._autonomy_task
+        if autonomy_task is not None and not autonomy_task.done():
+            autonomy_task.cancel()
+            await asyncio.gather(autonomy_task, return_exceptions=True)
         await self.events.put(Shutdown())
 
     async def cognition_loop(self):
@@ -138,7 +184,10 @@ class CognitionManager:
             elif isinstance(event, ActionLifecycleFinished):
                 await self.handle_lifecycle_finished(event)
             elif isinstance(event, WorldState):
-                await self._handle_world_state(event.payload)
+                payload = self._pending_world_state or event.payload
+                self._pending_world_state = None
+                self._world_state_queued = False
+                await self._handle_world_state(payload)
             elif isinstance(event, Shutdown):
                 self._running = False
 
@@ -190,6 +239,9 @@ class CognitionManager:
     async def execute_request(self, request):
         name = request.function_name
         args = request.arguments
+
+        if name == "go_idle":
+            return await self._enter_idle_mode(request.action_id)
 
         semantic_goals = {
             "find_target": "search",
@@ -271,6 +323,60 @@ class CognitionManager:
             status="failed",
             outcome="unsupported_action",
             reason_code="UNKNOWN_ACTION",
+        )
+
+    async def _enter_idle_mode(self, action_id):
+        self._settled = True
+        autonomy_task = self._autonomy_task
+        if (
+            autonomy_task is not None
+            and autonomy_task is not asyncio.current_task()
+            and not autonomy_task.done()
+        ):
+            autonomy_task.cancel()
+            await asyncio.gather(autonomy_task, return_exceptions=True)
+
+        stopped = []
+        if self.goal_executor.active:
+            await self.goal_executor.stop("USER_REQUESTED_IDLE")
+            stopped.append("goal")
+        if (
+            self.semantic_navigation_action is not None
+            and self.semantic_navigation_action.active
+        ):
+            await self.semantic_navigation_action.stop("USER_REQUESTED_IDLE")
+            stopped.append("navigation")
+        if self.approach_action.active:
+            await self.approach_action.stop_approaching("USER_REQUESTED_IDLE")
+            stopped.append("approach")
+        if self.move_action.active:
+            await self.move_action.stop_moving("USER_REQUESTED_IDLE")
+            stopped.append("movement")
+        if self.track_action.active:
+            await self.track_action.stop_tracking("USER_REQUESTED_IDLE")
+            stopped.append("tracking")
+
+        camera_result = None
+        if not self.move_camera_action.active:
+            camera_result = await self.move_camera_action.move_to_region(
+                region="center",
+                action_id=f"{action_id}:settle_camera",
+            )
+        self._tof_history.clear()
+        self._proximity_candidate_count = 0
+        return ActionResult(
+            action_id=action_id,
+            action_type="go_idle",
+            status="succeeded",
+            outcome="settled",
+            data={
+                "settled": True,
+                "stopped": stopped,
+                "camera_centered": (
+                    camera_result is not None
+                    and camera_result.status == "succeeded"
+                ),
+            },
         )
 
     async def execute_stop(self, request):
@@ -360,6 +466,7 @@ class CognitionManager:
                 },
             )
         self.action_results.append(result)
+        self._last_activity_at = time.monotonic()
 
         await self.response_manager.send_function_output(
             event.request.call_id,
@@ -396,10 +503,15 @@ class CognitionManager:
                     name=f"cognition-finish-{event.request.action_id}",
                 )
         else:
-            await self.response_manager.create_voice_response()
+            if not self._settled or result.action_type == "go_idle":
+                await self.response_manager.create_voice_response()
 
     async def handle_lifecycle_finished(self, event):
         result = event.result
+        autonomous_person_seek = (
+            event.request.response_metadata.get("origin") == "autonomy"
+            and event.request.response_metadata.get("kind") == "person_seek"
+        )
         if event.error is not None:
             result = ActionResult(
                 action_id=event.request.action_id,
@@ -416,6 +528,7 @@ class CognitionManager:
                 },
             )
         self.action_results.append(result)
+        self._last_activity_at = time.monotonic()
 
         if (
             isinstance(result, ActionResult)
@@ -440,26 +553,70 @@ class CognitionManager:
                 name=f"watch-finish-{event.request.action_id}",
             )
 
+        should_respond = not self._settled
+        decision_instruction = None
+        if autonomous_person_seek:
+            person_found = (
+                isinstance(result, ActionResult)
+                and result.action_type == "watch_target"
+                and result.status == "succeeded"
+                and self.track_action.active
+            )
+            if person_found:
+                decision_instruction = (
+                    "DJ autonomously chose to look for a person and has now found "
+                    "one and started tracking them. Greet the visible person once, "
+                    "briefly and naturally, in first person. Do not say the user "
+                    "asked DJ to look, and do not call another tool."
+                )
+            else:
+                should_respond = False
+                decision_instruction = (
+                    "This was an autonomous background person-seek lifecycle event. "
+                    "No greeting is needed because a new person was not just found. "
+                    "Remain silent and do not retry or ask for search guidance."
+                )
+
         summary = (
             "🌳 [ACTION LIFECYCLE FINISHED] "
             + json.dumps(
-                self._action_envelope("action_finished", result),
+                self._action_envelope(
+                    "action_finished",
+                    result,
+                    decision_instruction=decision_instruction,
+                ),
                 separators=(",", ":"),
             )
         )
         print(f"\n{summary}\n")
         await self.response_manager.send_system_context(summary)
-        await self.response_manager.create_voice_response()
+        if should_respond:
+            await self.response_manager.create_voice_response()
 
-    def _action_envelope(self, event_type, result):
+    def _action_envelope(
+        self, event_type, result, decision_instruction=None
+    ):
         return {
             "event_type": event_type,
             "result": self._serialize(result),
             "decision_state": self._decision_state(),
-            "decision_instruction": self._decision_instruction(result),
+            "decision_instruction": (
+                decision_instruction
+                if decision_instruction is not None
+                else self._decision_instruction(result)
+            ),
         }
 
     def _decision_instruction(self, result):
+        if (
+            isinstance(result, ActionResult)
+            and result.action_type == "go_idle"
+            and result.status == "succeeded"
+        ):
+            return (
+                "Acknowledge briefly that DJ is settled, then remain silent and do "
+                "not call another tool until the user speaks again."
+            )
         if (
             isinstance(result, ActionResult)
             and result.reason_code in {
@@ -564,100 +721,253 @@ class CognitionManager:
                 "target": self.goal_executor.target,
             })
 
-        state = {"active_actions": active_actions}
+        state = {
+            "active_actions": active_actions,
+            "settled": self._settled,
+            "autonomy_active": (
+                self._autonomy_task is not None
+                and not self._autonomy_task.done()
+            ),
+        }
 
         return state
 
     async def _handle_world_state(self, payload):
         previous = self.world_state
         self.world_state = dict(payload)
-        salience, reasons = self._score_salience(previous, self.world_state)
         now = time.monotonic()
 
-        if self._decision_state()["active_actions"]:
-            interval_elapsed = now - self._last_active_context
-            if salience >= 0.5 or interval_elapsed >= self.active_context_interval:
-                self._last_active_context = now
-                await self.response_manager.send_system_context(
-                    self._state_summary(salience, reasons)
-                )
+        if self._settled or self._robot_action_in_progress():
+            self._tof_history.clear()
+            self._proximity_candidate_count = 0
+            if not self._settled:
+                self._last_activity_at = now
+            return
 
-            if salience >= self.idle_salience_threshold:
-                asyncio.create_task(
-                    self.response_manager.create_voice_response(),
-                    name="active-state-wakeup",
-                )
+        proximity = self._observe_abrupt_approach(previous, self.world_state)
+        if (
+            proximity is not None
+            and now - self._last_proximity_reaction >= self.proximity_cooldown
+        ):
+            self._last_proximity_reaction = now
+            self._last_activity_at = now
+            self._replace_autonomy_task(
+                self._run_proximity_reaction(proximity),
+                "proximity-reaction",
+            )
+            return
+
+        if self.response_manager.busy or (self._autonomy_task is not None and not self._autonomy_task.done()):
             return
 
         if (
-            salience >= self.idle_salience_threshold
-            and now - self._last_idle_wakeup >= self.idle_wakeup_cooldown
+            self._boot_observation_pending
+            and now - self._started_at >= self.boot_observation_delay
         ):
-            self._last_idle_wakeup = now
-            summary = self._state_summary(salience, reasons)
-            await self.response_manager.send_system_context(summary)
-            asyncio.create_task(
-                self.response_manager.create_voice_response(
-                    system_msg=(
-                        "[SALIENT WORLD EVENT] Re-evaluate the current goal. "
-                        "Speak or act only when this event requires intervention."
-                    )
-                ),
-                name="salience-wakeup",
+            self._boot_observation_pending = False
+            self._last_person_seek_at = now
+            self._last_activity_at = now
+            self._replace_autonomy_task(
+                self._run_person_seek("boot_person_seek"),
+                "boot-person-seek",
             )
-
-    @staticmethod
-    def _score_salience(previous, current):
-        score = 0.0
-        reasons = []
-
-        distance = current.get("camera_tof_range")
-        old_distance = previous.get("camera_tof_range")
-        if isinstance(distance, (int, float)) and distance > 0.0:
-            old_is_near = (
-                isinstance(old_distance, (int, float))
-                and 0.0 < old_distance <= 0.45
-            )
-            if distance <= 0.35 and not old_is_near:
-                score = 1.0
-                reasons.append(f"very close obstacle at {distance:.2f} m")
-            elif distance <= 0.75 and not (
-                isinstance(old_distance, (int, float))
-                and 0.0 < old_distance <= 0.85
-            ):
-                score = max(score, 0.75)
-                reasons.append(f"nearby obstacle at {distance:.2f} m")
-            elif isinstance(old_distance, (int, float)) and old_distance > 0.0:
-                if abs(distance - old_distance) >= 0.5:
-                    score = max(score, 0.55)
-                    reasons.append("large distance change")
+            return
 
         if (
-            previous
-            and current.get("track_action_active")
-            != previous.get("track_action_active")
+            now - self._last_user_activity_at >= self.long_idle_person_seek_seconds
+            and now - self._last_person_seek_at >= self.long_idle_person_seek_seconds
         ):
-            score = max(score, 0.8)
-            reasons.append(
-                "track action active changed to "
-                f"{current.get('track_action_active')}"
+            self._last_person_seek_at = now
+            self._last_activity_at = now
+            self._replace_autonomy_task(
+                self._run_person_seek("long_idle_person_seek"),
+                "idle-person-seek",
             )
-        if previous and (
-            current.get("tracking_stable") != previous.get("tracking_stable")
-        ):
-            score = max(score, 0.8)
-            reasons.append(
-                f"tracking stability changed to {current.get('tracking_stable')}"
-            )
-        return score, reasons
+            return
 
-    def _state_summary(self, salience, reasons):
-        state = {
-            **self._decision_state(),
-            "salience": round(salience, 2),
-            "reasons": reasons,
+        latest_activity = max(
+            self._last_activity_at,
+            getattr(self.response_manager, "last_activity_at", 0.0),
+        )
+        if now - latest_activity >= self.idle_prompt_seconds:
+            self._last_idle_wakeup = now
+            self._last_activity_at = now
+            self._replace_autonomy_task(
+                self._run_visual_wakeup("idle_conversation"),
+                "idle-conversation",
+            )
+
+    def _robot_action_in_progress(self):
+        only_tracking_in_progress = len(self._decision_state()["active_actions"]) == 1 and self._decision_state()["active_actions"][0]["action_type"] == "track_action"
+        action_in_progress = bool(self._decision_state()["active_actions"]) and not only_tracking_in_progress
+        return (
+            self.current_action_task is not None
+            or action_in_progress
+        )
+
+    def _replace_autonomy_task(self, coroutine, name):
+        old_task = self._autonomy_task
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        task = asyncio.create_task(coroutine, name=name)
+        self._autonomy_task = task
+
+        def autonomy_done(done_task):
+            if self._autonomy_task is done_task:
+                self._autonomy_task = None
+            if done_task.cancelled():
+                return
+            try:
+                done_task.result()
+            except Exception as error:
+                print(
+                    f"[Autonomy error: {done_task.get_name()}] "
+                    f"{type(error).__name__}: {error}"
+                )
+
+        task.add_done_callback(autonomy_done)
+
+    def _observe_abrupt_approach(self, previous, current):
+        distance = current.get("camera_tof_range")
+        if (
+            not isinstance(distance, (int, float))
+            or not 0.01 <= float(distance) <= 1.0
+        ):
+            self._tof_history.clear()
+            self._proximity_candidate_count = 0
+            return None
+
+        distance = float(distance)
+        if len(self._tof_history) < 4:
+            self._tof_history.append(distance)
+            return None
+
+        baseline = float(median(self._tof_history))
+        drop = baseline - distance
+        approaching = (
+            (distance <= 0.5
+            and drop >= 0.20)
+            or distance <= 0.05
+        )
+        self._proximity_candidate_count = (
+            self._proximity_candidate_count + 1 if approaching else 0
+        )
+        self._tof_history.append(distance)
+        if self._proximity_candidate_count < 2:
+            return None
+
+        self._proximity_candidate_count = 0
+        self._tof_history.clear()
+        return {
+            "previous_distance": baseline,
+            "current_distance": distance,
+            "drop": drop,
         }
-        return "[WORLD STATE] " + json.dumps(state, separators=(",", ":"))
+
+    async def _run_proximity_reaction(self, proximity):
+        if self._settled or self._robot_action_in_progress():
+            return
+
+        move_result = await self.move_action.start_moving(
+            linear_velocity=-0.15,
+            distance=0.20,
+            angular_velocity=0.0,
+            angle=0.0,
+            action_id=f"autonomy-proximity-{uuid.uuid4().hex}",
+        )
+        vision_result = await self.see_action.see(
+            query=(
+                "[AUTONOMOUS PROXIMITY OBSERVATION] Something may have rapidly "
+                f"approached DJ: ToF changed from {proximity['previous_distance']:.2f} "
+                f"m to {proximity['current_distance']:.2f} m. A short safety backup "
+                f"was requested with status {move_result.status}."
+            ),
+            action_id=f"autonomy-see-proximity-{uuid.uuid4().hex}",
+            autonomous=True,
+        )
+        self.action_results.append(vision_result)
+        if vision_result.status == "succeeded":
+            await self.response_manager.create_voice_response(
+                system_msg=(
+                    "This perception and backup were initiated autonomously by DJ, "
+                    "not requested by the user. Briefly react in first person based "
+                    "on the supplied frame. Do not call a movement or vision tool; "
+                    "both actions have already been handled."
+                )
+            )
+
+        if move_result.status == "running":
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self.move_action.wait_until_finished()),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                if self.move_action.active:
+                    await self.move_action.stop_moving("AUTONOMY_TIMEOUT")
+
+    async def _run_visual_wakeup(self, kind):
+        if self._settled or self._robot_action_in_progress():
+            return
+        instruction = (
+            "DJ chose to observe the current scene after a quiet idle period."
+        )
+        vision_result = await self.see_action.see(
+            query=instruction,
+            action_id=f"autonomy-see-{kind}-{uuid.uuid4().hex}",
+            autonomous=True,
+        )
+        self.action_results.append(vision_result)
+        if vision_result.status != "succeeded":
+            return
+
+        response_instruction = (
+            "DJ initiated the preceding visual observation autonomously after a "
+            "quiet period; the user did not request it. Make one brief, natural, "
+            "first-person scene-grounded comment or question. Do not call "
+            "see_action again or imply that the user asked DJ to look."
+        )
+        await self.response_manager.create_voice_response(
+            system_msg=response_instruction
+        )
+
+    async def _run_person_seek(self, trigger):
+        if self._settled or self._robot_action_in_progress():
+            return
+
+        action_id = f"autonomy-watch-person-{uuid.uuid4().hex}"
+        request = ToolRequest(
+            function_name="watch_target",
+            arguments={"target": "person", "effort": "best_effort"},
+            call_id="",
+            action_id=action_id,
+            response_metadata={
+                "origin": "autonomy",
+                "kind": "person_seek",
+                "trigger": trigger,
+            },
+        )
+        try:
+            result = await self.goal_executor.start(
+                goal="track",
+                target="person",
+                action_id=action_id,
+                effort="best_effort",
+            )
+            if result.status == "running":
+                result = await asyncio.shield(
+                    self.goal_executor.wait_until_finished()
+                )
+            await self.events.put(ActionLifecycleFinished(request, result=result))
+        except asyncio.CancelledError:
+            if (
+                self.goal_executor.active
+                and self.goal_executor.action_id == action_id
+            ):
+                await self.goal_executor.stop("AUTONOMY_INTERRUPTED")
+            raise
+        except BaseException as error:
+            await self.events.put(ActionLifecycleFinished(request, error=error))
 
     @classmethod
     def _serialize(cls, value):

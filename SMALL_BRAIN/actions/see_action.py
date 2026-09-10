@@ -1,6 +1,6 @@
 import asyncio
-
-from services.camera_stream import send_camera_image
+import base64
+import json
 
 from actions.action_result import ActionResult
 
@@ -9,7 +9,7 @@ class SeeAction:
         self.ws = ws
         self.camera = camera
 
-    async def see(self, query, action_id):
+    async def see(self, query, action_id, autonomous=False):
         normalized_query = (query or "").strip()
         if not normalized_query:
             return ActionResult(
@@ -28,10 +28,18 @@ class SeeAction:
                 "results/action_results/see_snapshot.jpg",
             )
             snapshot = self.camera.snapshot()
-            image_result = await send_camera_image(
+            image_instruction = normalized_query
+            if autonomous:
+                image_instruction = (
+                    "[INTERNAL AUTONOMOUS PERCEPTION] DJ initiated this observation "
+                    "without a user request. Treat the attached image as DJ's own "
+                    "current visual perception. Do not say or imply that the user "
+                    f"asked for this inspection. {normalized_query}"
+                )
+            image_result = await self.send_camera_image(
                 self.ws,
                 jpeg_bytes,
-                instruction=normalized_query,
+                instruction=image_instruction,
             )
         except Exception as error:
             return ActionResult(
@@ -51,8 +59,34 @@ class SeeAction:
             outcome="image_context_added",
             data={
                 "query": normalized_query,
+                "source": "autonomy" if autonomous else "user",
                 "frame_sequence": getattr(snapshot, "sequence", None),
                 "captured_at": getattr(snapshot, "captured_at", None),
                 **image_result,
             },
         )
+
+    async def send_camera_image(self, ws, jpeg_bytes, instruction):
+        jpeg_bytes = bytes(jpeg_bytes)
+        if not jpeg_bytes or not jpeg_bytes.startswith(b"\xff\xd8"):
+            raise ValueError("Invalid JPEG bytes. Encode the OpenCV frame with cv2.imencode('.jpg', frame).")
+
+        encoded_image = base64.b64encode(jpeg_bytes).decode("ascii")
+        image_url = f"data:image/jpeg;base64,{encoded_image}"
+
+        image_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": instruction.strip()},
+                    {"type": "input_image", "image_url": image_url},
+                ],
+            },
+        }
+
+        await ws.send(json.dumps(image_event))
+        print(f"\n[Camera] IMAGE ADDED")
+
+        return {"jpeg_bytes": len(jpeg_bytes), "base64_characters": len(encoded_image)}

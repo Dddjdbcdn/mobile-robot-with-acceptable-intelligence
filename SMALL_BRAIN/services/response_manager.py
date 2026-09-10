@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 RESPONSE_TIMEOUT = 10.0
 
@@ -17,17 +18,26 @@ class ResponseManager:
 
         self._voice_created = asyncio.Event()
         self._pending_create_id = None
+        self.last_activity_at = time.monotonic()
 
+    @property
+    def busy(self) -> bool:
+        return (
+            self.active_response_id is not None
+            or self._pending_create_id is not None
+        )
+        
     async def create_voice_response(self, system_msg=None) -> None:
+        self.last_activity_at = time.monotonic()
         async with self._voice_transition_lock:
             await self._cancel_active_response()
             await self._create_response_and_wait(system_msg)
 
     async def send_user_text(self, message: str) -> None:
-        """Add typed user input and ask for the usual spoken response."""
         message = message.strip()
         if not message:
             return
+        self.last_activity_at = time.monotonic()
 
         async with self._voice_transition_lock:
             self.app.clear_queue()
@@ -139,6 +149,7 @@ class ResponseManager:
         if not response_id: return
 
         self.active_response_id = response_id
+        self.last_activity_at = time.monotonic()
         self._voice_idle.clear()
 
         if request_id == self._pending_create_id:
@@ -152,6 +163,7 @@ class ResponseManager:
             return
 
         self.active_response_id = None
+        self.last_activity_at = time.monotonic()
         self._voice_idle.set()
 
     async def send_function_output(self, call_id, output) -> None:
