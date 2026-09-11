@@ -50,31 +50,26 @@ def generate_launch_description():
         XMLLaunchDescriptionSource(
             os.path.join(get_package_share_directory('astra_camera'), 'launch', 'astra.launch.xml')
         ),
-    )
-
-    usb_camera_node = Node(
-        package='image_tools',
-        executable='cam2image',
-        name='cam2image',
-        parameters=[{
-            'device_id': 0,
-            'width': 1280,
-            'height': 720,
-        }],
-        remappings=[
-            ('/image', '/usb_camera/image_raw')
-        ],
-        arguments=['--ros-args', '--log-level', 'WARN'],
-        output='screen'
-    )
-
-    rqt_image_view_node = Node(
-        package='rqt_image_view',
-        executable='rqt_image_view',
-        name='rqt_image_view',
-        arguments=['/usb_camera/image_raw'], 
-        additional_env={'DISPLAY': ':0'}, # Changed from env to additional_env         
-        output='screen'
+        launch_arguments={
+            'camera_name': 'camera',
+            'enable_color': 'true',
+            'enable_depth': 'true',
+            'enable_ir': 'false',
+            # Register depth onto the color pixel grid for RGB detections.
+            'depth_registration': 'true',
+            'color_depth_synchronization': 'true',
+            'enable_point_cloud': 'true',
+            # robot_state_publisher owns the camera TF declared in the URDF.
+            'publish_tf': 'false',
+            'color_width': '640',
+            'color_height': '480',
+            'color_fps': '30',
+            'depth_width': '640',
+            'depth_height': '480',
+            'depth_fps': '30',
+            # Avoid immediately reopening Mini-series firmware after failure.
+            'connection_delay': '1000',
+        }.items(),
     )
 
     return LaunchDescription([
@@ -83,6 +78,4 @@ def generate_launch_description():
         delayed_stm32_reset,
         lidar_node,
         depth_camera_node,
-        # usb_camera_node,
-        # rqt_image_view_node
     ])

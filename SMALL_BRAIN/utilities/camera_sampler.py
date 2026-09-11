@@ -169,7 +169,14 @@ def draw_tof_overlay(
     return frame
 
 def draw_csrt_overlay(frame,target,bbox):
-    x, y, w, h = [int(v * 2) for v in bbox]
+    frame_h, frame_w = frame.shape[:2]
+    scale_x = frame_w / 640.0
+    scale_y = frame_h / 360.0
+    x, y, w, h = bbox
+    x = int(x * scale_x)
+    y = int(y * scale_y)
+    w = int(w * scale_x)
+    h = int(h * scale_y)
     
     # Mirror tracker X coordinate
     x = frame.shape[1] - x - w

@@ -3,9 +3,15 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.substitutions import Command
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
-    robot_description = Command(['xacro ', os.path.join(get_package_share_directory('robot'), 'urdf', 'mobile_robot.xacro')])
+    robot_description = ParameterValue(
+        Command([
+            'xacro ', os.path.join(get_package_share_directory('robot'), 'urdf', 'mobile_robot.xacro')
+        ]),
+        value_type=str,
+    )
 
     robot_state_publisher = Node(
         package='robot_state_publisher',

@@ -68,6 +68,7 @@ class YoloService():
                 continue
 
             frame = latest.tracking_bgr
+            source_generation = latest.source_generation
 
             detections = []
 
@@ -91,7 +92,12 @@ class YoloService():
                     self.parse_pose(pose_results[0])
                 )
 
-            self.detections = detections
+            current = self.camera.latest
+            if (
+                current is not None
+                and current.source_generation == source_generation
+            ):
+                self.detections = detections
 
             elapsed = time.perf_counter() - loop_start
             remaining = 1/self.fps - elapsed

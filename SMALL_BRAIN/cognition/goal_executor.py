@@ -69,6 +69,7 @@ class GoalExecutor:
         approach_action,
         move_camera_action,
         semantic_memory=None,
+        astra_action=None,
     ):
         self.move_action = move_action
         self.search_action = search_action
@@ -76,6 +77,7 @@ class GoalExecutor:
         self.approach_action = approach_action
         self.move_camera_action = move_camera_action
         self.semantic_memory = semantic_memory
+        self.astra_action = astra_action
 
         self.active = False
         self.action_id: str | None = None
@@ -97,6 +99,7 @@ class GoalExecutor:
         self.user_confirmation_requested = False
         self.confirmation_retry_target: str | None = None
         self.effort = "center"
+        self._use_astra = False
 
     async def start(
         self,
@@ -197,9 +200,13 @@ class GoalExecutor:
         self.user_confirms_visible = confirmation_accepted
         self.user_confirmation_requested = confirmation_requested
         self.effort = normalized_effort
-        if normalized_direction is None:
+        self._use_astra = (
+            self.astra_action is not None
+            and self.astra_action.camera.source == "astra"
+        )
+        if self._use_astra or normalized_direction is None:
             self._satisfied_facts.add("oriented")
-        if normalized_camera_region is None:
+        if self._use_astra or normalized_camera_region is None:
             self._satisfied_facts.add("camera_aimed")
 
         self.completion_future = asyncio.get_running_loop().create_future()
@@ -238,12 +245,20 @@ class GoalExecutor:
         if runner is not None and runner is not asyncio.current_task():
             runner.cancel()
 
+        if self.astra_action is not None and self.astra_action.approaching_active:
+            await self.astra_action.stop_approaching(reason_code)
         if self.approach_action.active:
             await self.approach_action.stop_approaching(reason_code)
         if self.search_action.active:
             await self.search_action.stop_searching(reason_code)
         if self.move_action.active:
             await self.move_action.stop_moving(reason_code)
+        if (
+            self._started_tracking
+            and self.astra_action is not None
+            and self.astra_action.tracking_active
+        ):
+            await self.astra_action.stop_tracking(reason_code)
         if self._started_tracking and self.track_action.active:
             await self.track_action.stop_tracking(reason_code)
 
@@ -321,14 +336,30 @@ class GoalExecutor:
 
         rule = self.FACT_RULES[fact]
 
+        if self._use_astra and fact == "target_found":
+            result = await self._track(
+                require_search=False,
+                allow_grounding_dino=True,
+            )
+            if result.status != "succeeded":
+                raise GoalStepFailed(fact, result)
+            self._satisfied_facts.update({"target_found", "target_tracked"})
+            self._completed_steps.extend(["target_found", "target_tracked"])
+            return
+
         if fact == "target_found":
             await self._try_recalled_search_pose()
 
-        if fact == "target_tracked" and await self._try_recalled_target():
+        if (
+            fact == "target_tracked"
+            and not self._use_astra
+            and await self._try_recalled_target()
+        ):
             return
 
         if (
             fact == "target_tracked"
+            and not self._use_astra
             and not self.user_confirms_visible
             and not self._memory_recall_attempted
             and is_yolo_trackable_target(self.target)
@@ -494,6 +525,12 @@ class GoalExecutor:
         if fact == "camera_aimed":
             return fact in self._satisfied_facts
         if fact == "target_found":
+            if self._use_astra:
+                return (
+                    self.astra_action.tracking_active
+                    and self._normalize_target(self.astra_action.target)
+                    == normalized_target
+                )
             if (
                 "oriented" not in self._satisfied_facts
                 or "camera_aimed" not in self._satisfied_facts
@@ -508,9 +545,12 @@ class GoalExecutor:
             found_target = self._normalize_target(self.search_action.last_found_target)
             return not self.search_action.active and found_target == normalized_target
         if fact == "target_tracked":
+            active_tracker = (
+                self.astra_action if self._use_astra else self.track_action
+            )
             return (
-                self.track_action.active
-                and self._normalize_target(self.track_action.target) == normalized_target
+                active_tracker.active
+                and self._normalize_target(active_tracker.target) == normalized_target
             )
         return False
 
@@ -639,7 +679,10 @@ class GoalExecutor:
     ) -> ActionResult:
         if require_search is None:
             require_search = not self.user_confirms_visible
-        result = await self.track_action.start_tracking(
+        tracking_action = (
+            self.astra_action if self._use_astra else self.track_action
+        )
+        result = await tracking_action.start_tracking(
             target=self.target,
             action_id=self._step_id("track"),
             require_search=require_search,
@@ -658,21 +701,27 @@ class GoalExecutor:
         return result
 
     async def _approach(self) -> ActionResult:
+        approach_action = (
+            self.astra_action if self._use_astra else self.approach_action
+        )
         if (
-            self.approach_action.active
-            and self._normalize_target(self.approach_action.target)
+            approach_action.approaching_active
+            if self._use_astra
+            else approach_action.active
+        ) and (
+            self._normalize_target(approach_action.target)
             == self._normalize_target(self.target)
         ):
-            result = await self.approach_action.wait_until_finished()
+            result = await approach_action.wait_until_finished()
             if result.status == "succeeded":
                 self._approach_result_data = dict(result.data)
             return result
 
-        result = await self.approach_action.start_approaching(
+        result = await approach_action.start_approaching(
             target=self.target,
             action_id=self._step_id("approach"),
         )
-        result = await self._terminal_result(self.approach_action, result)
+        result = await self._terminal_result(approach_action, result)
         if result.status == "succeeded":
             self._approach_result_data = dict(result.data)
         return result
@@ -732,6 +781,7 @@ class GoalExecutor:
         self.user_confirms_visible = False
         self.user_confirmation_requested = False
         self.effort = "center"
+        self._use_astra = False
         self._runner = None
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)

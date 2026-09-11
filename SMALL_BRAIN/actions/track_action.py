@@ -570,6 +570,9 @@ class TrackAction():
     async def _person_tracking_loop(self):
         current_reached = False
         predicted_target = None
+        missing_keypoint_since = None
+        keypoint_timeout_seconds = 2.0
+        loop = asyncio.get_running_loop()
 
         while self.active:
             detections = [
@@ -597,9 +600,22 @@ class TrackAction():
 
             if not current_reached:
                 if current_keypoint is None:
+                    if missing_keypoint_since is None:
+                        missing_keypoint_since = loop.time()
+                    elif (
+                        loop.time() - missing_keypoint_since
+                        >= keypoint_timeout_seconds
+                    ):
+                        await self.stop_tracking(
+                            reason_code="PERSON_KEYPOINT_TIMEOUT",
+                            status="failed",
+                            outcome="target_keypoint_lost",
+                        )
+                        return
                     await asyncio.sleep(0.05)
                     continue
 
+                missing_keypoint_since = None
                 target_x = current_keypoint["normalized_x"]
                 target_y = current_keypoint["normalized_y"]
 
@@ -612,6 +628,7 @@ class TrackAction():
                         self.person_path_index += 1
                         current_reached = False
                         predicted_target = None
+                        missing_keypoint_since = None
 
                         print(f"\nTRACING TO: {next_name}\n")
 
@@ -766,7 +783,11 @@ class TrackAction():
         self.target = None
         self._tracking_task = None
 
-        if status == "failed" and reason_code in {"PERSON_LOST", "OBJECT_LOST"}:
+        if status == "failed" and reason_code in {
+            "PERSON_LOST",
+            "PERSON_KEYPOINT_TIMEOUT",
+            "OBJECT_LOST",
+        }:
             self.search_action.last_found_target = None
 
         if completion_future is not None and not completion_future.done():

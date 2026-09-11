@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import signal
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from utilities.database_functions import load_json, update_memory, build_system_
 from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
 
 from actions.approach_action import ApproachAction
+from actions.astra_approach_action import AstraApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
@@ -109,11 +111,16 @@ async def background_status_monitor(cognitive_manager):
 
             elif message.get("type") == "state":
                 update_state(message)
+                active_tracker = cognitive_manager._active_tracking_action()
                 await cognitive_manager.publish_world_state({
                     **message,
-                    "track_action_active": cognitive_manager.track_action.active,
-                    "tracking_stable": cognitive_manager.track_action.stable,
-                    "tracked_target": cognitive_manager.track_action.target,
+                    "track_action_active": active_tracker is not None,
+                    "tracking_stable": (
+                        active_tracker.stable if active_tracker is not None else False
+                    ),
+                    "tracked_target": (
+                        active_tracker.target if active_tracker is not None else None
+                    ),
                 })
 
         except Exception as e:
@@ -264,8 +271,31 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
+async def camera_source_signal_loop(camera):
+    """Switch cameras from SSH without feeding characters to the text prompt."""
+    loop = asyncio.get_running_loop()
+    switch_requested = asyncio.Event()
+    handled_signals = (signal.SIGQUIT, signal.SIGUSR1)
+
+    for handled_signal in handled_signals:
+        loop.add_signal_handler(handled_signal, switch_requested.set)
+
+    try:
+        while True:
+            await switch_requested.wait()
+            switch_requested.clear()
+            try:
+                selected = camera.toggle_source()
+                print(f"\n[System: Camera source switched to {selected}.]")
+            except RuntimeError as error:
+                print(f"\n[System: Camera switch refused: {error}.]")
+    finally:
+        for handled_signal in handled_signals:
+            loop.remove_signal_handler(handled_signal)
+
+
 async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
-    print("[System: Starting live camera display...]")
+    print("[System: Camera switching ready: press Ctrl+\\ in SSH.]")
 
     window_name = "Robot Vision"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -277,6 +307,17 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
         try:
             snapshot = camera.snapshot()
             display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
+
+            cv2.putText(
+                display_frame,
+                f"SOURCE: {snapshot.source.upper()}  |  CTRL+\\ TO SWITCH",
+                (20, display_frame.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
             display_frame = draw_tof_overlay(
                 display_frame,
@@ -341,6 +382,8 @@ async def main():
             tracking_height=360,
             history_frames=60,
             fps=30,
+            astra_endpoint="tcp://127.0.0.1:5558",
+            initial_source=os.environ.get("CAMERA_SOURCE", "usb").lower(),
         )
     camera.start()
     print("\n✅ CAMERA IS READY")
@@ -362,6 +405,12 @@ async def main():
     yolo = YoloService(
         camera=camera
     )
+
+    def reset_vision_for_source_change(_previous_source, _new_source):
+        csrt_tracker.stop_tracking()
+        yolo.detections = []
+
+    camera.add_source_change_callback(reset_vision_for_source_change)
 
     grounding_dino.start_background()
     yolo.start_background()
@@ -411,6 +460,16 @@ async def main():
                 ws=ws,
                 camera=camera,
             )
+            astra_action = AstraApproachAction(
+                csrt_tracker=csrt_tracker,
+                grounding_dino=grounding_dino,
+                yolo=yolo,
+                camera=camera,
+                send_robot_command=send_robot_command,
+                standoff_m=float(
+                    os.environ.get("ASTRA_APPROACH_STANDOFF_M", "0.65")
+                ),
+            )
             see_action = SeeAction(ws=ws, camera=camera)
             move_action = MoveAction(send_robot_command=send_robot_command)
             move_camera_action = MoveCameraAction(
@@ -427,6 +486,7 @@ async def main():
                 approach_action=approach_action,
                 move_camera_action=move_camera_action,
                 semantic_memory=semantic_memory,
+                astra_action=astra_action,
             )
 
             cognitive_manager = CognitionManager(
@@ -439,7 +499,35 @@ async def main():
                 semantic_navigation_action=semantic_navigation_action,
                 goal_executor=goal_executor,
                 response_manager=response_manager,
+                astra_action=astra_action,
             )
+
+            async def stop_actions_for_source_change(previous_source, new_source):
+                if goal_executor.active:
+                    await goal_executor.stop("CAMERA_SOURCE_CHANGED")
+                if previous_source == "usb":
+                    if approach_action.active:
+                        await approach_action.stop_approaching(
+                            "CAMERA_SOURCE_CHANGED"
+                        )
+                    if track_action.active:
+                        await track_action.stop_tracking(
+                            "CAMERA_SOURCE_CHANGED"
+                        )
+                elif previous_source == "astra":
+                    await astra_action.source_changed(
+                        previous_source, new_source
+                    )
+
+            def cancel_source_owned_actions(previous_source, new_source):
+                asyncio.create_task(
+                    stop_actions_for_source_change(
+                        previous_source, new_source
+                    ),
+                    name=f"camera-source-cleanup-{previous_source}",
+                )
+
+            camera.add_source_change_callback(cancel_source_owned_actions)
 
             session_update = {
                 "type": "session.update",
@@ -489,6 +577,7 @@ async def main():
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
                 display_camera_loop(camera,csrt_tracker,yolo,track_action),
+                camera_source_signal_loop(camera),
                 wait_for_dino(),
                 wait_for_yolo()
             )

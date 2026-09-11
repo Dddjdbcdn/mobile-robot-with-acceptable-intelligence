@@ -5,9 +5,15 @@ from launch.actions import RegisterEventHandler, TimerAction
 from launch.event_handlers import OnProcessStart
 from launch.substitutions import Command
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
-    robot_description = Command(['xacro ', os.path.join(get_package_share_directory('robot'), 'urdf', 'mobile_robot.xacro')])
+    robot_description = ParameterValue(
+        Command([
+            'xacro ', os.path.join(get_package_share_directory('robot'), 'urdf', 'mobile_robot.xacro')
+        ]),
+        value_type=str,
+    )
     controller_config = os.path.join(get_package_share_directory('robot'), 'config', 'controller.yaml')
     
     controller_manager = Node(

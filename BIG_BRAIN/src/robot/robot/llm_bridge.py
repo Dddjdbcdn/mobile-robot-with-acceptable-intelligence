@@ -1,6 +1,7 @@
 import math
 import threading
 import json
+import struct
 from pathlib import Path
 import rclpy
 from rclpy.node import Node
@@ -9,7 +10,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, TwistStamped
 from std_msgs.msg import String
 from std_msgs.msg import Float32
-from sensor_msgs.msg import Imu, Range, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image, Imu, Range, PointCloud2
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import zmq
@@ -118,6 +119,11 @@ class LLMRosBridge(Node):
         self.sub_socket = self.zmq_context.socket(zmq.SUB)
         self.sub_socket.bind("tcp://*:5557")
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        self.camera_pub_socket = self.zmq_context.socket(zmq.PUB)
+        # Keep live camera frames on this machine only.
+        self.camera_pub_socket.setsockopt(zmq.SNDHWM, 2)
+        self.camera_pub_socket.bind("tcp://127.0.0.1:5558")
         
         self.pub_lock = threading.Lock()
 
@@ -133,6 +139,24 @@ class LLMRosBridge(Node):
         self.camera_tof_range = 0.0
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Range, '/camera_tof', self.camera_tof_callback, qos)
+        self.create_subscription(
+            Image,
+            '/camera/color/image_raw',
+            self.astra_color_callback,
+            qos,
+        )
+        self.create_subscription(
+            Image,
+            '/camera/depth/image_raw',
+            self.astra_depth_callback,
+            qos,
+        )
+        self.create_subscription(
+            CameraInfo,
+            '/camera/color/camera_info',
+            self.astra_camera_info_callback,
+            qos,
+        )
         self.create_subscription(String, '/yolo/detections', self.yolo_callback, 10)
 
         map_qos = QoSProfile(
@@ -253,6 +277,54 @@ class LLMRosBridge(Node):
 
     def camera_tof_callback(self, msg):
         self.camera_tof_range = msg.range
+
+    @staticmethod
+    def _serialize_ros_image(msg):
+        metadata = json.dumps(
+            {
+                "width": msg.width,
+                "height": msg.height,
+                "step": msg.step,
+                "encoding": msg.encoding,
+                "is_bigendian": msg.is_bigendian,
+                "frame_id": msg.header.frame_id,
+                "stamp_sec": msg.header.stamp.sec,
+                "stamp_nanosec": msg.header.stamp.nanosec,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return struct.pack("!I", len(metadata)) + metadata + bytes(msg.data)
+
+    def _publish_astra_stream(self, topic, payload):
+        """Publish a typed camera payload without blocking ROS callbacks."""
+        try:
+            self.camera_pub_socket.send_multipart(
+                [topic, payload], flags=zmq.NOBLOCK
+            )
+        except zmq.Again:
+            pass
+
+    def astra_color_callback(self, msg):
+        self._publish_astra_stream(
+            b"astra/color", self._serialize_ros_image(msg)
+        )
+
+    def astra_depth_callback(self, msg):
+        self._publish_astra_stream(
+            b"astra/depth", self._serialize_ros_image(msg)
+        )
+
+    def astra_camera_info_callback(self, msg):
+        payload = json.dumps(
+            {
+                "width": msg.width,
+                "height": msg.height,
+                "frame_id": msg.header.frame_id,
+                "k": list(msg.k),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._publish_astra_stream(b"astra/camera_info", payload)
 
     def yolo_callback(self, msg):
         try:
@@ -398,6 +470,7 @@ class LLMRosBridge(Node):
 
         self.rep_socket.close(linger=0)
         self.pub_socket.close(linger=0)
+        self.camera_pub_socket.close(linger=0)
         self.sub_socket.close(linger=0)
 
         self.zmq_context.term()
@@ -481,7 +554,9 @@ class LLMRosBridge(Node):
 
                     pose_in = PoseStamped()
                     pose_in.header.frame_id = str(request.get("frame_id", "base_footprint"))
-                    pose_in.header.stamp = self.get_clock().now().to_msg()
+                    # A zero stamp requests the latest complete TF chain. SLAM's
+                    # map->odom transform can legitimately lag wall time.
+                    pose_in.header.stamp = rclpy.time.Time().to_msg()
                     
                     pose_in.pose.position.x = x
                     pose_in.pose.position.y = y

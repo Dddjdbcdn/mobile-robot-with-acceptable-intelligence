@@ -68,8 +68,9 @@ class CognitionManager:
         goal_executor,
         response_manager,
         semantic_navigation_action,
+        astra_action=None,
         idle_prompt_seconds=60.0,
-        boot_observation_delay=6.0,
+        boot_observation_delay=10.0,
         long_idle_person_seek_seconds=120.0,
         proximity_cooldown=8.0,
     ):
@@ -81,6 +82,7 @@ class CognitionManager:
         self.move_camera_action = move_camera_action
         self.semantic_navigation_action = semantic_navigation_action
         self.goal_executor = goal_executor
+        self.astra_action = astra_action
         self.response_manager = response_manager
 
         self.events = asyncio.Queue()
@@ -136,6 +138,8 @@ class CognitionManager:
         await self.events.put(request)
 
     async def handle_tool_msg(self, message):
+        if self.astra_action is not None:
+            self.astra_action.handle_navigation_event(message)
         self.approach_action.handle_navigation_event(message)
         self.semantic_navigation_action.handle_navigation_event(message)
         self.move_action.handle_moving_event(message)
@@ -287,6 +291,8 @@ class CognitionManager:
                 camera_owner = "track_action"
             elif self.approach_action.active:
                 camera_owner = "approach_action"
+            elif self.astra_action is not None and self.astra_action.active:
+                camera_owner = "astra_approach_action"
 
             if camera_owner is not None:
                 return ActionResult(
@@ -346,12 +352,18 @@ class CognitionManager:
         ):
             await self.semantic_navigation_action.stop("USER_REQUESTED_IDLE")
             stopped.append("navigation")
+        if self.astra_action is not None and self.astra_action.approaching_active:
+            await self.astra_action.stop_approaching("USER_REQUESTED_IDLE")
+            stopped.append("astra_approach")
         if self.approach_action.active:
             await self.approach_action.stop_approaching("USER_REQUESTED_IDLE")
             stopped.append("approach")
         if self.move_action.active:
             await self.move_action.stop_moving("USER_REQUESTED_IDLE")
             stopped.append("movement")
+        if self.astra_action is not None and self.astra_action.tracking_active:
+            await self.astra_action.stop_tracking("USER_REQUESTED_IDLE")
+            stopped.append("astra_tracking")
         if self.track_action.active:
             await self.track_action.stop_tracking("USER_REQUESTED_IDLE")
             stopped.append("tracking")
@@ -380,32 +392,45 @@ class CognitionManager:
         )
 
     async def execute_stop(self, request):
-        action, stop_method_name = {
-            "stop_searching": (
-                self.search_action,
-                "stop_searching",
-            ),
-            "stop_tracking": (
-                self.track_action,
-                "stop_tracking",
-            ),
-            "stop_approaching": (
-                self.approach_action,
-                "stop_approaching",
-            ),
-            "stop_moving": (
-                self.move_action,
-                "stop_moving",
-            ),
-            "stop_goal": (
-                self.goal_executor,
-                "stop",
-            ),
-            "stop_navigation": (
-                self.semantic_navigation_action,
-                "stop",
-            ),
-        }[request.function_name]
+        if (
+            request.function_name == "stop_tracking"
+            and self.astra_action is not None
+            and self.astra_action.tracking_active
+        ):
+            action, stop_method_name = self.astra_action, "stop_tracking"
+        elif (
+            request.function_name == "stop_approaching"
+            and self.astra_action is not None
+            and self.astra_action.approaching_active
+        ):
+            action, stop_method_name = self.astra_action, "stop_approaching"
+        else:
+            action, stop_method_name = {
+                "stop_searching": (
+                    self.search_action,
+                    "stop_searching",
+                ),
+                "stop_tracking": (
+                    self.track_action,
+                    "stop_tracking",
+                ),
+                "stop_approaching": (
+                    self.approach_action,
+                    "stop_approaching",
+                ),
+                "stop_moving": (
+                    self.move_action,
+                    "stop_moving",
+                ),
+                "stop_goal": (
+                    self.goal_executor,
+                    "stop",
+                ),
+                "stop_navigation": (
+                    self.semantic_navigation_action,
+                    "stop",
+                ),
+            }[request.function_name]
         was_active = bool(getattr(action, "active", False))
         if was_active:
             await getattr(action, stop_method_name)()
@@ -530,15 +555,21 @@ class CognitionManager:
         self.action_results.append(result)
         self._last_activity_at = time.monotonic()
 
+        active_tracker = self._active_tracking_action()
         if (
             isinstance(result, ActionResult)
             and result.action_type == "watch_target"
             and result.status == "succeeded"
-            and self.track_action.active
+            and active_tracker is not None
         ):
             async def wait_for_tracking_end():
                 try:
-                    tracking_result = await self.track_action.wait_until_finished()
+                    if active_tracker is self.astra_action:
+                        tracking_result = (
+                            await active_tracker.wait_until_tracking_finished()
+                        )
+                    else:
+                        tracking_result = await active_tracker.wait_until_finished()
                     tracking_event = ActionLifecycleFinished(
                         event.request, result=tracking_result
                     )
@@ -560,7 +591,7 @@ class CognitionManager:
                 isinstance(result, ActionResult)
                 and result.action_type == "watch_target"
                 and result.status == "succeeded"
-                and self.track_action.active
+                and active_tracker is not None
             )
             if person_found:
                 decision_instruction = (
@@ -596,16 +627,82 @@ class CognitionManager:
     def _action_envelope(
         self, event_type, result, decision_instruction=None
     ):
-        return {
+        envelope = {
             "event_type": event_type,
-            "result": self._serialize(result),
-            "decision_state": self._decision_state(),
+            "result": self._compact_result(result),
             "decision_instruction": (
                 decision_instruction
                 if decision_instruction is not None
                 else self._decision_instruction(result)
             ),
         }
+        decision_state = self._decision_state()
+        if (
+            decision_state["active_actions"]
+            or decision_state["settled"]
+            or decision_state["autonomy_active"]
+        ):
+            envelope["decision_state"] = decision_state
+        return envelope
+
+    @classmethod
+    def _compact_result(cls, result):
+        """Keep model context actionable; retain full results only internally."""
+        if not isinstance(result, ActionResult):
+            return cls._serialize(result)
+
+        compact = {
+            "action_type": result.action_type,
+            "status": result.status,
+        }
+        for key, value in (
+            ("target", result.target),
+            ("reason_code", result.reason_code),
+        ):
+            if value is not None:
+                compact[key] = value
+        if result.outcome is not None and (
+            result.status == "succeeded" or result.reason_code is None
+        ):
+            compact["outcome"] = result.outcome
+        if result.retryable:
+            compact["retryable"] = True
+
+        data = result.data if isinstance(result.data, dict) else {}
+        for key in ("goal", "direction", "failed_step"):
+            value = data.get(key)
+            if value is not None:
+                compact[key] = value
+
+        step_result = data.get("step_result")
+        if isinstance(step_result, dict):
+            step_data = step_result.get("data")
+            if isinstance(step_data, dict) and step_data.get("message"):
+                compact["message"] = step_data["message"]
+            step_reason = step_result.get("reason_code")
+            if step_reason and step_reason != result.reason_code:
+                compact["step_reason_code"] = step_reason
+        elif data.get("message"):
+            compact["message"] = data["message"]
+        elif data.get("error"):
+            compact["error"] = data["error"]
+
+        guidance = data.get("continuation_guidance")
+        if isinstance(guidance, dict):
+            retry_answers = guidance.get("retry_answers")
+            compact_guidance = {}
+            if guidance.get("unresolved_action_type"):
+                compact_guidance["action"] = guidance["unresolved_action_type"]
+            if isinstance(retry_answers, dict):
+                compact_guidance["retry"] = retry_answers
+            if guidance.get("out_of_frame_requires_no_retry"):
+                compact_guidance["out_of_frame_stops"] = True
+            if compact_guidance:
+                compact["guidance"] = compact_guidance
+
+        if "verified" in data:
+            compact["verified"] = bool(data["verified"])
+        return compact
 
     def _decision_instruction(self, result):
         if (
@@ -614,8 +711,7 @@ class CognitionManager:
             and result.status == "succeeded"
         ):
             return (
-                "Acknowledge briefly that DJ is settled, then remain silent and do "
-                "not call another tool until the user speaks again."
+                "Briefly acknowledge that DJ is settled, then remain silent."
             )
         if (
             isinstance(result, ActionResult)
@@ -627,12 +723,8 @@ class CognitionManager:
             }
         ):
             return (
-                "The approach could not safely confirm or continue toward the "
-                "target. Explain the visibility, range, or occlusion "
-                "evidence briefly and ask whether DJ should continue carefully or "
-                "whether the user can uncover or reposition the target. Do not claim "
-                "success. Retry approach_target only if the user explicitly asks to "
-                "continue."
+                "Briefly report that approach was not safely confirmed. Ask whether "
+                "to continue carefully or reposition the target; retry only if asked."
             )
         if (
             isinstance(result, ActionResult)
@@ -641,9 +733,8 @@ class CognitionManager:
             and result.data.get("user_confirms_visible") is True
         ):
             return (
-                "The user's visibility confirmation has already been honored "
-                "with one direct detector attempt. Report that detection failed. "
-                "Do not retry, search, rotate, or move unless the user gives new guidance."
+                "Report that direct detection failed. Do not retry or move without "
+                "new user guidance."
             )
         if (
             isinstance(result, ActionResult)
@@ -655,28 +746,15 @@ class CognitionManager:
             target = result.target
             if result.data.get("direction") == "behind":
                 choices = "high, low, elsewhere out of frame, or best effort"
-                behind_rule = (
-                    "The behind turn was already performed, so do not offer or "
-                    "send direction=behind again."
-                )
+                retry_rule = "Do not retry behind or elsewhere out of frame."
             else:
                 choices = (
                     "high, low, behind DJ, elsewhere out of frame, or best effort"
                 )
-                behind_rule = (
-                    f"If the user says behind, immediately retry {action_type} "
-                    f"for {target!r} with direction=behind and effort=center."
-                )
+                retry_rule = "Do not retry if it is elsewhere out of frame."
             return (
-                f"The unresolved user goal remains {action_type} for {target!r}; "
-                "the failed search was only its internal prerequisite. Ask one "
-                f"concise question whether the target is {choices}. "
-                f"{behind_rule} For high, low, or best effort, immediately retry "
-                f"the same {action_type} goal with the corresponding effort. "
-                "Preserve any compatible guidance the user combines in one answer. "
-                "Do not switch to find_target unless that was the failed top-level "
-                "goal, and do not ask for confirmation after a valid answer. If the "
-                "target is elsewhere out of frame, do not retry."
+                f"Ask one short question: is {target!r} {choices}? Retry "
+                f"{action_type} using the matching guidance. {retry_rule}"
             )
         if (
             isinstance(result, ActionResult)
@@ -684,18 +762,19 @@ class CognitionManager:
             and result.status == "succeeded"
         ):
             return (
-                "The target is now found and the location hint has already been "
-                "consumed. Re-evaluate the unresolved user goal. If the user also "
-                "asked DJ to watch or approach this same target, call the matching "
-                "high-level tool without direction or camera_region so it reuses "
-                "the current target view. Do not turn or aim toward the same hint "
-                "again."
+                "The target is found. Continue any requested watch or approach goal "
+                "without repeating the location hint."
             )
         return (
-            "Re-evaluate the unresolved user goal using this result. "
-            "If you have not satisfied the user goal, you must continue choosing action based on action guides. "
-            "Do not repeat the action you just finished"
+            "Continue the unresolved goal if needed; do not repeat the finished action."
         )
+
+    def _active_tracking_action(self):
+        if self.astra_action is not None and self.astra_action.tracking_active:
+            return self.astra_action
+        if self.track_action.active:
+            return self.track_action
+        return None
 
     def _decision_state(self):
         active_actions = []
@@ -703,11 +782,12 @@ class CognitionManager:
             ("search_action", self.search_action, "active"),
             ("track_action", self.track_action, "active"),
             ("approach_action", self.approach_action, "active"),
+            ("astra_approach_action", self.astra_action, "active"),
             ("move_action", self.move_action, "active"),
             ("move_camera", self.move_camera_action, "active"),
             ("navigate_semantic", self.semantic_navigation_action, "active"),
         ):
-            if getattr(action, active_attribute, False):
+            if action is not None and getattr(action, active_attribute, False):
                 active_actions.append({
                     "action_id": getattr(action, "action_id", None),
                     "action_type": action_type,
