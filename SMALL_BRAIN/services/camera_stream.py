@@ -3,6 +3,7 @@ import time
 import struct
 import cv2
 import json
+import copy
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -30,7 +31,8 @@ class CameraStream:
 
     def __init__(self, camera_index=0, capture_width=1280, capture_height=720, 
                  tracking_width=640, tracking_height=360, history_frames=60, fps=30,
-                 astra_endpoint="tcp://127.0.0.1:5558", initial_source="usb"):
+                 astra_endpoint="tcp://127.0.0.1:5558", initial_source="usb",
+                 map_endpoint="tcp://127.0.0.1:5559", map_save_path=None):
         if initial_source not in self.SOURCES:
             raise ValueError(f"Unknown camera source: {initial_source}")
         self.camera_index = camera_index
@@ -40,6 +42,14 @@ class CameraStream:
         self.fps = fps
         self.current_fps = 0.0
         self.astra_endpoint = astra_endpoint
+        self.map_endpoint = map_endpoint
+        self.map_save_path = Path(map_save_path) if map_save_path else (
+            Path(__file__).resolve().parents[1] / "results" / "map" / "latest.jpg"
+        )
+        self.map_thread = None
+        self._map_latest = None
+        self._map_save_override = None
+        self._map_save_lock = threading.Lock()
 
         self.condition = threading.Condition()
         self.stop_event = threading.Event()
@@ -135,6 +145,10 @@ class CameraStream:
             daemon=True,
         )
         self.astra_thread.start()
+        self.map_thread = threading.Thread(
+            target=self._map_receive_loop, name="map-image-receiver", daemon=True
+        )
+        self.map_thread.start()
 
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
@@ -153,6 +167,8 @@ class CameraStream:
             self.thread.join(timeout=2.0)
         if self.astra_thread:
             self.astra_thread.join(timeout=2.0)
+        if self.map_thread:
+            self.map_thread.join(timeout=2.0)
         self._zmq_context.term()
 
     def _record_frame(self, source, frame):
@@ -417,3 +433,46 @@ class CameraStream:
                 lambda: (self.latest and self.latest.sequence > sequence) or self.stop_event.is_set(),
                 timeout=timeout
             )
+
+    def _map_receive_loop(self):
+        socket = self._zmq_context.socket(zmq.SUB)
+        socket.setsockopt(zmq.RCVHWM, 2)
+        socket.setsockopt(zmq.RCVTIMEO, 200)
+        socket.setsockopt(zmq.SUBSCRIBE, b"map/image")
+        socket.connect(self.map_endpoint)
+        last_saved = 0.0
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    parts = socket.recv_multipart()
+                except zmq.Again:
+                    continue
+                try:
+                    if len(parts) != 2 or parts[0] != b"map/image":
+                        raise ValueError("expected map/image topic and payload")
+                    metadata, jpeg = self._split_ros_image_payload(parts[1])
+                    if metadata.get("schema_version") != 1 or not isinstance(metadata.get("candidates"), list):
+                        raise ValueError("unsupported map metadata")
+                    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is None or not jpeg.startswith(bytes.fromhex("ffd8")):
+                        raise ValueError("invalid map JPEG")
+                    now = time.monotonic()
+                    with self.condition:
+                        self._map_latest = dict(received_at=now, jpeg_bytes=jpeg,
+                                                image=frame, metadata=metadata)
+                except (KeyError, TypeError, ValueError, OSError, cv2.error) as error:
+                    print(f"[Invalid map stream or save error: {error}]")
+        finally:
+            socket.close(linger=0)
+
+    def map_snapshot(self, max_age=3.0):
+        """Return a matching image/candidate set, refusing a stopped stream."""
+        with self.condition:
+            if self._map_latest is None:
+                raise RuntimeError("No map image available; check BIG BRAIN map/costmap/pose")
+            age = time.monotonic() - self._map_latest["received_at"]
+            if age > max_age:
+                raise RuntimeError(f"Map image is stale ({age:.1f} seconds)")
+            return {**self._map_latest, "age_seconds": age,
+                    "image": self._map_latest["image"].copy(),
+                    "metadata": copy.deepcopy(self._map_latest["metadata"])}

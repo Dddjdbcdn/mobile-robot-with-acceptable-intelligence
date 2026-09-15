@@ -21,18 +21,8 @@
   },
   {
     "type": "function",
-    "name": "stop_moving",
-    "description": "Stop an explicit blind movement started by move_action.",
-    "parameters": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
     "name": "stop_navigation",
-    "description": "Cancel an active navigate_semantic request.",
+    "description": "Cancel an active navigate_action during vision pose selection or Nav2 movement.",
     "parameters": {
       "type": "object",
       "properties": {},

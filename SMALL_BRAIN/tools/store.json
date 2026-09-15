@@ -1,0 +1,340 @@
+ {
+    "type": "function",
+    "name": "move_action",
+    "description": "Perform one explicit blind relative movement or expressive motion. Use only when the movement itself is the user goal, such as turn around, rotate left, back up, or move forward a specified amount. Do not use it to locate, watch, or approach a target; pass spatial hints to the appropriate target tool instead.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "linear_velocity": {
+          "type": "number",
+          "description": "Forward/backward speed in meters per second (m/s). Range: [-0.5, 0.5]. Positive values move the robot forward, negative values move it backward. Try to keep the linear velocity absolute value above 0.05 m/s to overcome friction"
+        },
+        "distance": {
+          "type": "number",
+          "description": "Distance to travel linearly in meters (m). Range: [0.0,0.5]. The direction (forward or backward) is determined inside the linear velocity property."
+        },
+        "angular_velocity": {
+          "type": "number",
+          "description": "Rotational speed in radians per second (rad/s). Range: [-3.0, 3.0]. Positive values rotate counter-clockwise (left), negative values rotate clockwise (right). Try to keep the angular velocity absolute above value 0.5 rad/s to overcome friction"
+        },
+        "angle": {
+          "type": "number",
+          "description": "Angle to rotate in radians (rad). Range: [0.0, 6.283]. The direction (clockwise or counterclockwise) is determined inside the angular velocity property."
+        }
+      },
+      "required": [
+        "linear_velocity",
+        "distance",
+        "angular_velocity",
+        "angle"
+      ],
+      "additionalProperties": false
+    }
+  },
+
+  {
+    "type": "function",
+    "name": "navigate_semantic",
+    "description": "Navigate with Nav2 to a semantic room position computed from the current occupancy map, or to the midpoint between two remembered objects. Use this for destinations such as the middle of the room, the left wall, a room corner, or between named objects. Do not substitute move_action.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "destination": {
+          "type": "string",
+          "enum": [
+            "center",
+            "nearest_wall",
+            "front_wall",
+            "left_wall",
+            "back_wall",
+            "right_wall",
+            "nearest_corner",
+            "front_left_corner",
+            "back_left_corner",
+            "back_right_corner",
+            "front_right_corner",
+            "between_objects"
+          ],
+          "description": "Room-relative destination. Directions are relative to DJ's body heading when ROS2 most recently estimated the room geometry."
+        },
+        "object_a": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "First remembered object; required only for between_objects."
+        },
+        "object_b": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Second remembered object; required only for between_objects."
+        }
+      },
+      "required": [
+        "destination"
+      ],
+      "additionalProperties": false
+    }
+  },
+
+  [
+  {
+    "type": "function",
+    "name": "navigate_action",
+    "description": "Use for every requested robot-body movement: moving forward/backward, turning, local repositioning, navigating toward a visible place, room-relative destinations, and exploration. The action repeatedly sends fresh map and camera images to OOB vision and executes safe Nav2 waypoints until the complete objective is confirmed reached, progress is blocked, a safety limit is reached, or it is stopped. Call once for the complete movement goal and wait for its terminal event. Use approach_target instead when the final goal is to move near a named person or object. Use stop_navigation to cancel.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The complete movement objective in natural language. Preserve direction, approximate distance, desired final heading, landmarks, avoidance constraints, and the intended scope of exploration. The action retains this objective across its internal waypoint loop. Do not invent coordinates or candidate IDs."
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "see_action",
+    "description": "Answer a one-shot visual question from the current camera frame. Use for what-do-you-see, description, or visual verification requests. This tool does not search, move, aim, or maintain attention.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "A self-contained visual inspection instruction that matches the user's requested output exactly. Keep the requested answer minimal unless the user asks for detail. Do not add unrelated environment description. The query must preserve the user's requested level of detail. By default, request the shortest direct answer that fully satisfies the user. Do not request a general scene description unless the user explicitly asks for one. Elaborate only when the user explicitly asks for details, explanation, description, reasoning, or a full scene analysis."
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "find_target",
+    "description": "Locate and center a target.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
+          "description": "Search stage. Use center if no effort request was made. High scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "watch_target",
+    "description": "Start continuous camera tracking. If succeeded, tracking remains active until stopped.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
+          "description": "Search stage. Use center if no effort request was made. High scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
+        },
+        "user_confirms_visible": {
+          "type": "boolean",
+          "description": "One-shot detector override for a follow-up after a previous search for this same target failed. Set true only when the user then explicitly insists the target is visible in DJ\u2019s current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, or together with direction or camera_region. A failed detector attempt is terminal until new user guidance."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "approach_target",
+    "description": "Locate, track, and move near a target as one complete goal. Use this as the only tool when moving near the target is the user's final intended outcome, even if the request also says to find, follow, track, or lock onto it first; do not call find_target or watch_target as a prerequisite. If the same target was just found or is already being tracked, call this tool directly without stop_tracking and omit any direction or camera_region hint already consumed by that earlier action, so the executor reuses the current target view.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
+          "description": "Search stage. Use center if no effort request was made. High scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
+        },
+        "user_confirms_visible": {
+          "type": "boolean",
+          "description": "One-shot detector override for a follow-up after a previous search for this same target failed. Set true only when the user then explicitly insists the target is visible in DJ\u2019s current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, or together with direction or camera_region. A failed detector attempt is terminal until new user guidance."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "move_camera",
+    "description": "Aim only the camera at an absolute semantic region without rotating or translating the robot body. Use when the user says to look up, down, left, right, center, or toward a corner without naming a target to track. Do not use while a target goal or continuous tracking owns the camera.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "region": {
+          "type": "string",
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right"
+          ],
+          "description": "Absolute camera region requested by the user. Natural phrases such as top-left map to upper_left, straight ahead maps to center, and bottom-right maps to lower_right."
+        }
+      },
+      "required": [
+        "region"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "go_idle",
+    "description": "Put DJ into settled idle mode when the user explicitly asks it to wait, chill, stop talking, go idle, settle down, rest, or stop initiating interactions. This stops active robot behavior, centers the camera, and suppresses autonomous proximity reactions, idle conversation, and person-seeking until the user speaks or gives another command.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  }
+]

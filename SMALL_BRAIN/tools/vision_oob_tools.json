@@ -1,78 +1,106 @@
 [
   {
-  "type": "function",
-  "name": "assess_batch_search",
-  "description": "Assess robot-camera images during a broad scan.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "result": {
-        "type": "string",
-        "description": "Use candidate when an object is visually clear or plausibly resembles the target. Using 'candidate' will proceeds to further verification, so it can be called with moderate uncertainty. If you suspect parts of the object is present in the image, call 'candidate'; not_found means totally absent",
-        "enum": ["candidate","not_found"]
-      },
-      "confidence": {
-        "type": "number",
-        "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
-        "minimum": 0,
-        "maximum": 1
-      },
-      "candidate_image": {
-        "type": "string",
-        "description": "Best image containing the target among given images. Only use none for not_found",
-        "enum": ["image_1","image_2","image_3","none"]
-      },
-      "candidate_position": {
-        "description": "The normalized position of the target within the candidate_image. THIS POINT MUST AT LEAST TOUCH THE OBJECT YOU ARE DETECTING. YOU MUST USE EXACTLY THESE KEYS: x, y. DO NOT USE arrays. Remember, this is the position relative to your chosen candidate image. [0;0] means top left corner. [1:1] means bottom right corner. 0.0<x<0.5 means to the left. 0.0<y<0.5 means to the top. Only use null for not_found",
-        "type": ["object","null"],
-        "properties": {
-          "x": {"type": "number","minimum": 0,"maximum": 1},
-          "y": {"type": "number","minimum": 0,"maximum": 1}
+    "type": "function",
+    "name": "assess_batch_search",
+    "description": "Assess robot-camera images during a broad scan.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "type": "string",
+          "description": "Use candidate when an object is visually clear or plausibly resembles the target. Using 'candidate' will proceeds to further verification, so it can be called with moderate uncertainty. If you suspect parts of the object is present in the image, call 'candidate'; not_found means totally absent",
+          "enum": [
+            "candidate",
+            "not_found"
+          ]
         },
-        "required": ["x","y"],
-        "additionalProperties": false
+        "confidence": {
+          "type": "number",
+          "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "candidate_image": {
+          "type": "string",
+          "description": "Best image containing the target among given images. Only use none for not_found",
+          "enum": [
+            "image_1",
+            "image_2",
+            "image_3",
+            "none"
+          ]
+        },
+        "candidate_position": {
+          "description": "The normalized position of the target within the candidate_image. THIS POINT MUST AT LEAST TOUCH THE OBJECT YOU ARE DETECTING. YOU MUST USE EXACTLY THESE KEYS: x, y. DO NOT USE arrays. Remember, this is the position relative to your chosen candidate image. [0;0] means top left corner. [1:1] means bottom right corner. 0.0<x<0.5 means to the left. 0.0<y<0.5 means to the top. Only use null for not_found",
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "x": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "y": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "x",
+            "y"
+          ],
+          "additionalProperties": false
+        },
+        "evidence": {
+          "type": "string",
+          "description": "Brief visual evidence supporting the result and chosen image."
+        },
+        "scene_summary": {
+          "type": "string",
+          "description": "Brief summary of relevant objects and visibility conditions in the image set."
+        }
       },
-      "evidence": {
-        "type": "string",
-        "description": "Brief visual evidence supporting the result and chosen image."
-      },
-      "scene_summary": {
-        "type": "string",
-        "description": "Brief summary of relevant objects and visibility conditions in the image set."
-      }
-    },
-    "required": [
-      "result",
-      "confidence",
-      "candidate_image",
-      "candidate_position",
-      "evidence",
-      "scene_summary"
-    ],
-    "additionalProperties": false
+      "required": [
+        "result",
+        "confidence",
+        "candidate_image",
+        "candidate_position",
+        "evidence",
+        "scene_summary"
+      ],
+      "additionalProperties": false
     }
   },
   {
-  "type": "function",
-  "name": "assess_frame_search",
-  "description": "Verify whether the target is within the camera frame",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "result": {
-        "type": "string",
-                    "description": "Use candidate when an object is visually clear or plausibly resembles the target. not_found means totally absent",
-        "enum": ["candidate","not_found"]
+    "type": "function",
+    "name": "assess_frame_search",
+    "description": "Verify whether the target is within the camera frame",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "type": "string",
+          "description": "Use candidate when an object is visually clear or plausibly resembles the target. not_found means totally absent",
+          "enum": [
+            "candidate",
+            "not_found"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+          "minimum": 0,
+          "maximum": 1
+        }
       },
-      "confidence": {
-        "type": "number",
-        "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
-        "minimum": 0,
-        "maximum": 1
-      }
-    },
-    "required": ["result","confidence"],
-    "additionalProperties": false
+      "required": [
+        "result",
+        "confidence"
+      ],
+      "additionalProperties": false
     }
   },
   {
@@ -84,7 +112,11 @@
       "properties": {
         "result": {
           "type": "string",
-          "enum": ["reached", "too_far", "uncertain"],
+          "enum": [
+            "reached",
+            "too_far",
+            "uncertain"
+          ],
           "description": "Use reached only when the target is visibly present and clearly near the robot. Use too_far only when the target is identifiable and visibly still too far away. Use uncertain when visibility, perspective, or occlusion prevents a reliable judgment."
         },
         "confidence": {
@@ -99,7 +131,12 @@
         },
         "occlusion": {
           "type": "string",
-          "enum": ["clear", "partial", "heavy", "not_visible"],
+          "enum": [
+            "clear",
+            "partial",
+            "heavy",
+            "not_visible"
+          ],
           "description": "How much the target is occluded."
         },
         "evidence": {
@@ -107,7 +144,49 @@
           "description": "Brief visual evidence for the distance and occlusion judgment."
         }
       },
-      "required": ["result", "confidence", "target_visible", "occlusion", "evidence"],
+      "required": [
+        "result",
+        "confidence",
+        "target_visible",
+        "occlusion",
+        "evidence"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "select_navigation_pose",
+    "description": "Assess overall navigation progress from fresh map and camera evidence, then either choose one safe local pose or end with a reason.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": [
+            "move",
+            "goal_reached",
+            "blocked"
+          ],
+          "description": "move selects another local waypoint; goal_reached confirms the complete query is satisfied; blocked means no listed pose can be chosen, including when evidence is insufficient."
+        },
+        "pose_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Exact candidate ID for decision=move. Numeric IDs are local translation poses, F-prefixed IDs are frontier goals, and R-prefixed IDs rotate in place. Use only an ID listed for the current snapshot. Use null for every terminal decision."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Brief evidence for the choice, or why no pose is suitable."
+        }
+      },
+      "required": [
+        "decision",
+        "pose_id",
+        "reason"
+      ],
       "additionalProperties": false
     }
   }

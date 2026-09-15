@@ -59,8 +59,8 @@ def build_system_prompt(identity, memory, action_guide):
     sections.append("\n=== HARD RULES (NEVER BREAK THESE) ===")
     sections.append(_format_section("Rules", identity["rules"]))
 
-    sections.append("\n=== HOW TO PERFORM ACTIONS ===")
-    sections.append(_format_section("Action_Guide", action_guide))
+    # sections.append("\n=== HOW TO PERFORM ACTIONS ===")
+    # sections.append(_format_section("Action_Guide", action_guide))
 
     has_memory = any(v for v in memory.values() if v)
     if has_memory:

@@ -27,7 +27,7 @@ from actions.see_action import SeeAction
 from actions.track_action import TrackAction
 from actions.move_action import MoveAction
 from actions.move_camera_action import MoveCameraAction
-from actions.navigate_semantic_action import NavigateSemanticAction
+from actions.navigate_action import NavigateAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream
@@ -73,7 +73,7 @@ if not OPENAI_API_KEY:
     print("Error: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
 
-MODEL = "gpt-realtime-2.1-mini"
+MODEL = "gpt-realtime-2.1"
 URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
 DEBUG_MODE = False
 
@@ -383,6 +383,8 @@ async def main():
             history_frames=60,
             fps=30,
             astra_endpoint="tcp://127.0.0.1:5558",
+            map_endpoint=os.environ.get("MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"),
+            map_save_path=os.environ.get("MAP_SNAPSHOT_PATH"),
             initial_source=os.environ.get("CAMERA_SOURCE", "usb").lower(),
         )
     camera.start()
@@ -475,10 +477,7 @@ async def main():
             move_camera_action = MoveCameraAction(
                 send_robot_command=send_robot_command
             )
-            semantic_navigation_action = NavigateSemanticAction(
-                send_robot_command=send_robot_command,
-                semantic_memory=semantic_memory,
-            )
+            navigate_action = NavigateAction(ws, camera, send_robot_command)
             goal_executor = GoalExecutor(
                 move_action=move_action,
                 search_action=search_action,
@@ -496,13 +495,15 @@ async def main():
                 track_action=track_action,
                 move_action=move_action,
                 move_camera_action=move_camera_action,
-                semantic_navigation_action=semantic_navigation_action,
+                navigate_action=navigate_action,
                 goal_executor=goal_executor,
                 response_manager=response_manager,
                 astra_action=astra_action,
             )
 
             async def stop_actions_for_source_change(previous_source, new_source):
+                if navigate_action.active:
+                    await navigate_action.stop("CAMERA_SOURCE_CHANGED")
                 if goal_executor.active:
                     await goal_executor.stop("CAMERA_SOURCE_CHANGED")
                 if previous_source == "usb":
@@ -586,6 +587,8 @@ async def main():
     except Exception as e:
         print(f"Error: {e}")
     finally:
+        if cognitive_manager is not None:
+            await cognitive_manager.shutdown()
         print("\nCleaning up audio hardware...")
         app.stop()
         camera.stop()
@@ -593,8 +596,6 @@ async def main():
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await yolo.close()
-        if cognitive_manager is not None:
-            await cognitive_manager.shutdown()
 
 if __name__ == "__main__":
     try:

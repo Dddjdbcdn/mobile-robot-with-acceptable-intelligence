@@ -47,12 +47,12 @@ class CognitionManager:
         "assess_frame_search",
         "assess_batch_search",
         "assess_approach_verification",
+        "select_navigation_pose",
     }
     STOP_TOOLS = {
         "stop_searching",
         "stop_tracking",
         "stop_approaching",
-        "stop_moving",
         "stop_goal",
         "stop_navigation",
     }
@@ -67,12 +67,12 @@ class CognitionManager:
         move_camera_action,
         goal_executor,
         response_manager,
-        semantic_navigation_action,
         astra_action=None,
-        idle_prompt_seconds=60.0,
-        boot_observation_delay=10.0,
-        long_idle_person_seek_seconds=120.0,
+        idle_prompt_seconds=6000.0,
+        boot_observation_delay=1000.0,
+        long_idle_person_seek_seconds=12000.0,
         proximity_cooldown=8.0,
+        navigate_action=None,
     ):
         self.approach_action = approach_action
         self.search_action = search_action
@@ -80,7 +80,7 @@ class CognitionManager:
         self.track_action = track_action
         self.move_action = move_action
         self.move_camera_action = move_camera_action
-        self.semantic_navigation_action = semantic_navigation_action
+        self.navigate_action = navigate_action
         self.goal_executor = goal_executor
         self.astra_action = astra_action
         self.response_manager = response_manager
@@ -141,7 +141,8 @@ class CognitionManager:
         if self.astra_action is not None:
             self.astra_action.handle_navigation_event(message)
         self.approach_action.handle_navigation_event(message)
-        self.semantic_navigation_action.handle_navigation_event(message)
+        if self.navigate_action is not None:
+            self.navigate_action.handle_navigation_event(message)
         self.move_action.handle_moving_event(message)
 
     async def publish_world_state(self, payload):
@@ -169,6 +170,8 @@ class CognitionManager:
             task.cancel()
 
     async def shutdown(self):
+        if self.navigate_action is not None and self.navigate_action.active:
+            await self.navigate_action.stop("SHUTDOWN")
         autonomy_task = self._autonomy_task
         if autonomy_task is not None and not autonomy_task.done():
             autonomy_task.cancel()
@@ -247,6 +250,23 @@ class CognitionManager:
         if name == "go_idle":
             return await self._enter_idle_mode(request.action_id)
 
+        # Navigation owns motion and the camera throughout selection and travel.
+        motion_tools = {"navigate_action", "move_camera", "find_target",
+                        "watch_target", "approach_target"}
+        if (self.navigate_action is not None and self.navigate_action.active
+                and name in motion_tools):
+            return ActionResult(request.action_id, name, "failed",
+                                reason_code="NAVIGATION_BUSY", retryable=True)
+
+        if name == "navigate_action":
+            if self.navigate_action is None:
+                return ActionResult(request.action_id, name, "failed",
+                                    reason_code="NAVIGATION_UNAVAILABLE")
+            if self._decision_state()["active_actions"]:
+                return ActionResult(request.action_id, name, "failed",
+                                    reason_code="ROBOT_BUSY", retryable=True)
+            return await self.navigate_action.start(args.get("query"), request.action_id)
+
         semantic_goals = {
             "find_target": "search",
             "watch_target": "track",
@@ -262,22 +282,6 @@ class CognitionManager:
                     "user_confirms_visible", False
                 ),
                 effort=args.get("effort", "center"),
-                action_id=request.action_id,
-            )
-
-        if name == "navigate_semantic":
-            if self.semantic_navigation_action is None:
-                return ActionResult(
-                    action_id=request.action_id,
-                    action_type=name,
-                    status="failed",
-                    outcome="unsupported_action",
-                    reason_code="SEMANTIC_NAVIGATION_UNAVAILABLE",
-                )
-            return await self.semantic_navigation_action.start(
-                destination=args.get("destination"),
-                object_a=args.get("object_a"),
-                object_b=args.get("object_b"),
                 action_id=request.action_id,
             )
 
@@ -310,17 +314,10 @@ class CognitionManager:
                 region=args.get("region"),
                 action_id=request.action_id,
             )
-
         if name == "see_action":
             return await self.see_action.see(
                 query=args.get("query"),
                 action_id=request.action_id,
-            )
-
-        if name == "move_action":
-            return await self.move_action.start_moving(
-                action_id=request.action_id,
-                **args,
             )
 
         return ActionResult(
@@ -343,15 +340,12 @@ class CognitionManager:
             await asyncio.gather(autonomy_task, return_exceptions=True)
 
         stopped = []
+        if self.navigate_action is not None and self.navigate_action.active:
+            await self.navigate_action.stop("USER_REQUESTED_IDLE")
+            stopped.append("visual_navigation")
         if self.goal_executor.active:
             await self.goal_executor.stop("USER_REQUESTED_IDLE")
             stopped.append("goal")
-        if (
-            self.semantic_navigation_action is not None
-            and self.semantic_navigation_action.active
-        ):
-            await self.semantic_navigation_action.stop("USER_REQUESTED_IDLE")
-            stopped.append("navigation")
         if self.astra_action is not None and self.astra_action.approaching_active:
             await self.astra_action.stop_approaching("USER_REQUESTED_IDLE")
             stopped.append("astra_approach")
@@ -392,7 +386,10 @@ class CognitionManager:
         )
 
     async def execute_stop(self, request):
-        if (
+        if (request.function_name == "stop_navigation"
+                and self.navigate_action is not None and self.navigate_action.active):
+            action, stop_method_name = self.navigate_action, "stop"
+        elif (
             request.function_name == "stop_tracking"
             and self.astra_action is not None
             and self.astra_action.tracking_active
@@ -418,22 +415,23 @@ class CognitionManager:
                     self.approach_action,
                     "stop_approaching",
                 ),
-                "stop_moving": (
-                    self.move_action,
-                    "stop_moving",
-                ),
                 "stop_goal": (
                     self.goal_executor,
                     "stop",
                 ),
                 "stop_navigation": (
-                    self.semantic_navigation_action,
+                    self.navigate_action,
                     "stop",
                 ),
             }[request.function_name]
         was_active = bool(getattr(action, "active", False))
         if was_active:
-            await getattr(action, stop_method_name)()
+            stop_result = await getattr(action, stop_method_name)()
+            if isinstance(stop_result, ActionResult) and stop_result.status == "failed":
+                await self.response_manager.send_function_output(
+                    request.call_id, self._action_envelope("command_result", stop_result)
+                )
+                return
 
         await self.response_manager.send_function_output(
             request.call_id,
@@ -450,6 +448,12 @@ class CognitionManager:
             await self.response_manager.create_voice_response()
 
     async def oob_assessment(self, request):
+        if request.function_name == "select_navigation_pose":
+            if self.navigate_action is not None:
+                await self.navigate_action.select_navigation_pose(
+                    request.arguments, request.response_metadata
+                )
+            return
         if request.function_name == "assess_frame_search":
             assessment = self.search_action.assess_frame_search(
                 request.arguments,
@@ -502,18 +506,23 @@ class CognitionManager:
 
         if result.status == "running":
             action = {
-                "move_action": self.move_action,
-                "navigate_semantic": self.semantic_navigation_action,
+                "navigate_action": self.navigate_action,
                 "find_target": self.goal_executor,
                 "watch_target": self.goal_executor,
                 "approach_target": self.goal_executor,
             }.get(event.request.function_name)
 
+            # Capture this run's future before another navigation can start.
+            completion = (action.completion_future
+                          if action is self.navigate_action and action is not None else None)
+
             async def wait_for_completion(action):
                 try:
+                    result = (await asyncio.shield(completion) if completion is not None
+                              else await action.wait_until_finished())
                     lifecycle_event = ActionLifecycleFinished(
                         event.request,
-                        result=await action.wait_until_finished(),
+                        result=result,
                     )
                 except BaseException as error:
                     lifecycle_event = ActionLifecycleFinished(
@@ -758,6 +767,20 @@ class CognitionManager:
             )
         if (
             isinstance(result, ActionResult)
+            and result.action_type == "navigate_action"
+        ):
+            if result.status == "succeeded":
+                return (
+                    "Navigation finished only after fresh map/camera assessment confirmed the "
+                    "complete movement objective. Report the completed result briefly. Do not call "
+                    "navigate_action again unless the user gives a new movement goal."
+                )
+            return (
+                "Report the navigation reason briefly. Do not substitute blind motion. Retry only "
+                "if new sensor evidence or user guidance materially changes the situation."
+            )
+        if (
+            isinstance(result, ActionResult)
             and result.action_type == "find_target"
             and result.status == "succeeded"
         ):
@@ -783,9 +806,9 @@ class CognitionManager:
             ("track_action", self.track_action, "active"),
             ("approach_action", self.approach_action, "active"),
             ("astra_approach_action", self.astra_action, "active"),
-            ("move_action", self.move_action, "active"),
+            ("move_action_internal", self.move_action, "active"),
             ("move_camera", self.move_camera_action, "active"),
-            ("navigate_semantic", self.semantic_navigation_action, "active"),
+            ("navigate_action", self.navigate_action, "active"),
         ):
             if action is not None and getattr(action, active_attribute, False):
                 active_actions.append({

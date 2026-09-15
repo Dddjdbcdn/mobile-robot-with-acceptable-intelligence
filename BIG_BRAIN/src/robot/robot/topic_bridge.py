@@ -23,7 +23,7 @@ class Stm32SensorBridge(Node):
         )
         self.imu_publisher = self.create_publisher(Imu, '/imu', qos)
         
-        # --- ULTRASONIC SETUP ---
+        # --- SIDE RANGE SENSOR SETUP ---
         self.ultrasonic_subscription = self.create_subscription(
             Point32,
             'stm32/ultrasonic_msg',
@@ -126,9 +126,25 @@ class Stm32SensorBridge(Node):
     # ULTRASONIC FUNCTIONS
     # ==========================================
     def listener_callback(self, msg):
-        self.publish_ultrasonic_range(self.pub_left, msg.x, 'ultrasonic_left_link')
+        self.publish_vl53l1x_range(self.pub_left, msg.x, 'ultrasonic_left_link')
         self.publish_tof_range(self.pub_center, msg.y, 'camera_tof_link')
         self.publish_ultrasonic_range(self.pub_right, msg.z, 'ultrasonic_right_link')
+
+    def publish_vl53l1x_range(self, publisher, distance, frame_id):
+        range_msg = Range()
+        range_msg.header.stamp = self.get_clock().now().to_msg()
+        range_msg.header.frame_id = frame_id
+        range_msg.radiation_type = Range.INFRARED
+        range_msg.field_of_view = math.radians(27.0)
+        range_msg.min_range = 0.01
+        range_msg.max_range = 0.3
+
+        if distance < 0.0 or distance > range_msg.max_range:
+            range_msg.range = range_msg.max_range
+        else:
+            range_msg.range = float(distance)
+
+        publisher.publish(range_msg)
 
     def publish_ultrasonic_range(self, publisher, distance, frame_id):
         range_msg = Range()

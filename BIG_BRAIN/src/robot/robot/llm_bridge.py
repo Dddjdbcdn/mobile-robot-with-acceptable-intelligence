@@ -21,6 +21,7 @@ import time
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from robot.room_geometry import RoomGeometryEstimator
+from robot.map_image_stream import MapImageStream
 
 class CameraServo():
     def __init__(self, pan_pub, tilt_pub):
@@ -134,6 +135,7 @@ class LLMRosBridge(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
         self.servo = CameraServo(self.servo_pan_pub,self.servo_tilt_pub)
 
         self.camera_tof_range = 0.0
@@ -471,6 +473,7 @@ class LLMRosBridge(Node):
         self.rep_socket.close(linger=0)
         self.pub_socket.close(linger=0)
         self.camera_pub_socket.close(linger=0)
+        self.map_image_stream.close()
         self.sub_socket.close(linger=0)
 
         self.zmq_context.term()
