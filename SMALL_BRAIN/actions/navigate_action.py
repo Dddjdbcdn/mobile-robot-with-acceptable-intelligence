@@ -3,16 +3,71 @@ import asyncio
 import base64
 import copy
 import json
-import math
 import os
 from pathlib import Path
 import time
+import traceback
 import uuid
 
-import numpy as np
 import cv2
 
 from actions.action_result import ActionResult
+
+
+FIND_OBJECT_QUERY = (
+    "Find {target}. Select the next {mode} search waypoint using only visible "
+    "contextual evidence, camera coverage, and unvisited map space."
+)
+
+MAP_GUIDANCE = """GENERAL MAP GUIDANCE
+Image 1 is the occupancy and camera-coverage map. Map +X points right and +Y
+points up. Black cells are occupied, light cells are known traversable space,
+and gray cells are unknown or unavailable. Light-blue tint means one camera
+observation; pink tint means repeated observations; untinted traversable space
+has not been viewed.
+
+The red circle and arrow are the robot pose and heading. Yellow S is the start
+of this search and the magenta line is its traveled trace. Blue labeled circles
+are selectable local poses; green F diamonds are selectable frontiers between
+known free and unknown space. A marker's tick shows the camera heading after
+arrival. For a clue observation, the orange cone outlines the reliable
+close-range map region associated with Image 2; its direction continues beyond
+the drawn range.
+
+Choose the listed pose whose position and final heading best satisfy the query.
+Use visual evidence, the observation cone, coverage, frontiers, distance, and
+the existing trace together. Prefer meaningful progress over revisiting covered
+space or moving only to reassess. Choose the best position without worrying about obstacles.
+Nav2 handles path planning and obstacle avoidance.
+Only IDs in valid_candidate_ids may be selected. For move, return
+exactly one listed ID; for a terminal decision, return pose_id=null."""
+
+MODE_GUIDANCE = {
+    "goal": """MODE: goal
+Image 2 is the current camera view. Choose between the local poses and
+frontiers to best complete the user's navigation query. R+90, R-90, and R+180
+rotate in place; use them only when looking in another direction is itself the
+best next step. Return goal_reached when the complete semantic goal is already
+satisfied, or blocked when no listed pose can help.""",
+    "context": """MODE: context
+Image 2 is the clue frame selected by search. The orange outline shows the
+reliable close-range portion of that observation; its angular direction
+continues beyond the outline. Numbered C poses investigate the clue nearby.
+CF is the furthest reachable pose on the observation's center ray before a
+blockage. F-prefixed poses are frontiers inside the observation's angular span
+and may be farther than the reliable camera range.
+
+Use Image 2 and contextual_clue to choose the candidate that best follows the
+evidence. Prefer a meaningful translation toward the clue. Choose CF when the
+clue supports continuing straight and a long move is useful. Choose an aligned
+frontier when the clue suggests entering unvisited space, such as leaving the
+current room to continue the search. Do not choose CF or a frontier merely
+because it is farther away. Choose CB only to back up for a clearer or wider
+view when moving forward would not help.
+
+Never return goal_reached because target verification happens after arrival.
+Return blocked only when no listed pose can investigate the clue.""",
+}
 
 
 class NavigationError(RuntimeError):
@@ -23,26 +78,27 @@ class NavigationError(RuntimeError):
 
 class NavigateAction:
     VISION_TIMEOUT = 15.0
+    MAP_OVERLAY_TIMEOUT = 8.0
     NAVIGATION_TIMEOUT = 90.0
     CAMERA_MAX_AGE = 2.0
     JPEG_QUALITY = 75
-    ZOOM_IMAGE_SIZE = 768
-    ZOOM_MARGIN_M = 0.25
-    HISTORY_COLOR = (180, 0, 180)  # BGR magenta, distinct from candidates and robot.
-    START_COLOR = (255, 255, 0)          # BGR cyan, older session starts.
-    CURRENT_START_COLOR = (0, 235, 255)  # BGR yellow, active call's start.
-    POSITION_TOLERANCE = 0.05  # Meters; small localization updates are allowed.
-    YAW_TOLERANCE = 0.15      # Radians.
     MAX_STEPS = 20
     MAX_DURATION = 300.0
 
-    def __init__(self, ws, camera, send_robot_command, debug_dir=None):
+    def __init__(
+        self, ws, camera, send_robot_command, debug_dir=None,
+        request_map_snapshot=None,
+    ):
         self.ws = ws
         self.camera = camera
         self.send_robot_command = send_robot_command
+        self.request_map_snapshot = request_map_snapshot
         path = Path(__file__).resolve().parents[1] / 'tools' / 'vision_oob_tools.json'
-        self.selection_tool = next(t for t in json.loads(path.read_text())
-                                   if t['name'] == 'select_navigation_pose')
+        tool_definitions = json.loads(path.read_text())
+        self.selection_tool_template = next(
+            tool for tool in tool_definitions
+            if tool['name'] == 'select_navigation_pose'
+        )
         configured_debug_dir = debug_dir or os.environ.get('NAVIGATION_DEBUG_DIR')
         self.debug_dir = Path(configured_debug_dir) if configured_debug_dir else (
             Path(__file__).resolve().parents[1] / 'results' / 'navigation'
@@ -53,29 +109,55 @@ class NavigateAction:
         self.completion_future = None
         self._worker = self._selection_future = self._navigation_future = None
         self._request_id = self._snapshot_id = None
-        self._pose_history = []
-        self._initial_pose = None
-        self._session_start_poses = []
-        self._action_number = None
+        self._overlay_action_id = None
+        self._overlay_revision = 0
         self._candidates = {}
         self._stop_requested = self._command_sent = False
         self._command_lock = asyncio.Lock()
         self._stop_lock = asyncio.Lock()
         self._result_data = {}
+        self._mode = 'goal'
+        self._observation = None
+        self._max_steps = self.MAX_STEPS
+        self._stop_after_first_move = False
 
-    async def start(self, query, action_id):
+    async def start(
+        self,
+        query,
+        action_id,
+        *,
+        mode='goal',
+        observation=None,
+        max_steps=None,
+        stop_after_first_move=False,
+        overlay_action_id=None,
+        overlay_revision=0,
+    ):
         if self.active:
             return ActionResult(action_id, 'navigate_action', 'already_running', target=query,
                                 reason_code='NAVIGATION_BUSY', retryable=True)
         if not isinstance(query, str) or not query.strip():
             return ActionResult(action_id, 'navigate_action', 'failed',
                                 reason_code='NAVIGATION_QUERY_REQUIRED')
+        if mode not in {'goal', 'context', 'exploration'}:
+            return ActionResult(action_id, 'navigate_action', 'failed',
+                                reason_code='UNKNOWN_NAVIGATION_MODE')
         self.active = True
         self.action_id, self.target = action_id, query.strip()
-        self._pose_history = []
-        self._initial_pose = None
-        self._action_number = None
         self._result_data = {}
+        self._mode = mode
+        self._observation = (
+            dict(observation)
+            if isinstance(observation, dict)
+            and isinstance(observation.get('jpeg_bytes'), (bytes, bytearray))
+            else None
+        )
+        self._overlay_action_id = overlay_action_id
+        self._overlay_revision = int(overlay_revision or 0)
+        self._max_steps = max(
+            1, min(self.MAX_STEPS, int(max_steps or self.MAX_STEPS))
+        )
+        self._stop_after_first_move = stop_after_first_move is True
         self.stage = 'selecting'
         self._stop_requested = self._command_sent = False
         self.completion_future = asyncio.get_running_loop().create_future()
@@ -83,13 +165,35 @@ class NavigateAction:
         return ActionResult(action_id, 'navigate_action', 'running', target=self.target,
                             outcome='selecting_pose')
 
+    async def start_find_object_step(
+        self,
+        *,
+        target,
+        action_id,
+        mode,
+        observation,
+        overlay_action_id,
+        overlay_revision,
+    ):
+        """Select and execute exactly one waypoint for the find-object loop."""
+        return await self.start(
+            query=FIND_OBJECT_QUERY.format(target=target, mode=mode),
+            action_id=action_id,
+            mode=mode,
+            observation=observation,
+            max_steps=1,
+            stop_after_first_move=True,
+            overlay_action_id=overlay_action_id,
+            overlay_revision=overlay_revision,
+        )
+
     async def _run(self):
         try:
             started_at = time.monotonic()
             completed_steps = []
             self._result_data['steps'] = completed_steps
 
-            for step_number in range(1, self.MAX_STEPS + 1):
+            for step_number in range(1, self._max_steps + 1):
                 if time.monotonic() - started_at > self.MAX_DURATION:
                     raise NavigationError(
                         'NAVIGATION_DURATION_LIMIT',
@@ -98,14 +202,13 @@ class NavigateAction:
 
                 self.stage = 'selecting'
                 self._command_sent = False
-                snapshot, frame, jpeg = await self._capture()
-                self._remember_pose(snapshot['metadata']['robot_pose'], step_number)
-                if self._initial_pose is None:
-                    self._initial_pose = copy.deepcopy(self._pose_history[0])
-                    self._action_number = len(self._session_start_poses) + 1
-                    self._session_start_poses.append(copy.deepcopy(self._initial_pose))
-                selection = await self._select_pose(
-                    snapshot, frame, jpeg, step_number, completed_steps
+                snapshot, camera_jpeg = await self._capture()
+                selection = (
+                    self._deterministic_selection(snapshot)
+                    if self._mode == 'exploration'
+                    else await self._select_pose(
+                        snapshot, camera_jpeg, step_number
+                    )
                 )
                 decision = selection['decision']
                 self._result_data.update(
@@ -115,14 +218,13 @@ class NavigateAction:
                 )
 
                 if decision == 'goal_reached':
-                    self._save_goal_reached_map(snapshot, step_number)
+                    self._save_goal_reached_map(snapshot)
                     self._finish('succeeded', 'goal_reached')
                     return
                 if decision == 'blocked':
                     raise NavigationError('NAVIGATION_BLOCKED', selection['reason'])
-                # IDs are resolved against the exact snapshot shown to vision.
+                # Resolve the ID against the exact snapshot shown to vision.
                 destination = dict(self._candidates[selection['pose_id']])
-                self._revalidate(snapshot, frame, destination)
                 self._navigation_future = asyncio.get_running_loop().create_future()
                 async with self._command_lock:
                     if self._stop_requested:
@@ -157,6 +259,10 @@ class NavigateAction:
                     'robot_status': event.get('status'),
                 })
                 self._result_data['step_count'] = len(completed_steps)
+                self._result_data['destination'] = dict(destination)
+                if self._stop_after_first_move:
+                    self._finish('succeeded', 'waypoint_reached')
+                    return
 
             raise NavigationError(
                 'NAVIGATION_STEP_LIMIT',
@@ -167,27 +273,83 @@ class NavigateAction:
         except Exception as error:
             if self._stop_requested:
                 return
+            error_type = type(error).__name__
+            error_message = str(error) or repr(error)
+            print(
+                "\n[NavigateAction error] "
+                f"action_id={self.action_id} stage={self.stage} "
+                f"{error_type}: {error_message}"
+            )
+            traceback.print_exc()
             if self._command_sent:
                 await self._stop_motion()
             if not self._stop_requested:
-                self._result_data['error'] = str(error)
+                self._result_data['error_type'] = error_type
+                self._result_data['error'] = error_message
+                self._result_data['error_stage'] = self.stage
                 self._finish('failed', 'navigation_failed',
                              getattr(error, 'code', 'NAVIGATION_ERROR'))
 
     async def _capture(self):
-        snapshot = await asyncio.to_thread(self.camera.map_snapshot)
+        deadline = asyncio.get_running_loop().time() + self.MAP_OVERLAY_TIMEOUT
+        map_request_id = None
+        request_map_snapshot = getattr(self, 'request_map_snapshot', None)
+        if self._overlay_action_id is None and request_map_snapshot is not None:
+            map_request_id = uuid.uuid4().hex
+            await request_map_snapshot({
+                'schema_version': 1,
+                'operation': 'snapshot',
+                'action_id': self.action_id,
+                'request_id': map_request_id,
+            })
+        while True:
+            try:
+                snapshot = await asyncio.to_thread(self.camera.map_snapshot)
+            except RuntimeError as error:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise NavigationError(
+                        'MAP_STREAM_UNAVAILABLE', str(error)
+                    ) from error
+                await asyncio.sleep(0.1)
+                continue
+            overlay = (snapshot.get('metadata') or {}).get('search_overlay')
+            matches = (
+                (
+                    self._overlay_action_id is None
+                    and (
+                        map_request_id is None
+                        or str((snapshot.get('metadata') or {}).get(
+                            'snapshot_request_id'
+                        )) == map_request_id
+                    )
+                )
+                or (
+                    isinstance(overlay, dict)
+                    and str(overlay.get('action_id')) == str(self._overlay_action_id)
+                    and int(overlay.get('revision', 0)) >= self._overlay_revision
+                )
+            )
+            if matches:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise NavigationError(
+                    'MAP_OVERLAY_TIMEOUT',
+                    'Map stream did not render the requested find overlay revision',
+                )
+            await asyncio.sleep(0.05)
         metadata = snapshot['metadata']
         self._snapshot_id = metadata['snapshot_id']
-        self._candidates = {}
-        for candidate in metadata['candidates']:
-            if (not isinstance(candidate.get('id'), str)
-                    or candidate.get('frame_id') != metadata['frame_id']
-                    or not all(math.isfinite(float(candidate[k])) for k in ('x', 'y', 'yaw'))
-                    or candidate['id'] in self._candidates):
-                raise NavigationError('INVALID_MAP_CANDIDATES', 'Invalid candidate coordinates, ID or frame')
-            self._candidates[candidate['id']] = dict(candidate)
+        self._candidates = {
+            candidate['id']: dict(candidate)
+            for candidate in metadata['candidates']
+        }
         if not self._candidates:
             raise NavigationError('NO_NAVIGATION_CANDIDATES', 'No reachable map candidates')
+
+        # Exploration is map-ranked, and context already supplies its clue frame.
+        if self._mode != 'goal':
+            return snapshot, None
+
         frame = self.camera.snapshot()
         if time.monotonic() - frame.captured_at > self.CAMERA_MAX_AGE:
             raise NavigationError('STALE_CAMERA', 'Current camera frame is stale')
@@ -197,21 +359,38 @@ class NavigateAction:
         )
         if not ok:
             raise NavigationError('CAMERA_ENCODING_FAILED', 'Could not encode camera image')
-        return snapshot, frame, jpeg.tobytes()
+        return snapshot, jpeg.tobytes()
 
-    async def _select_pose(self, snapshot, frame, camera_jpeg,
-                           step_number, completed_steps):
+    def _deterministic_selection(self, snapshot):
+        metadata = snapshot.get('metadata') or {}
+        pose_id = metadata.get('selected_pose_id')
+        if not isinstance(pose_id, str) or pose_id not in self._candidates:
+            raise NavigationError(
+                'INVALID_DETERMINISTIC_SELECTION',
+                'Map planner did not provide one valid selected pose',
+            )
+        candidate = self._candidates[pose_id]
+        return {
+            'decision': 'move',
+            'pose_id': pose_id,
+            'reason': str(
+                candidate.get('selection_reason')
+                or 'map planner deterministic ranking'
+            ),
+            'ranking_score': candidate.get('ranking_score'),
+            'source': 'map_planner',
+        }
+
+    async def _select_pose(self, snapshot, camera_jpeg, step_number):
         self._request_id = uuid.uuid4().hex
         self._selection_future = asyncio.get_running_loop().create_future()
-        tool = copy.deepcopy(self.selection_tool)
-        tool['parameters']['properties']['pose_id']['enum'] = [*self._candidates, None]
-        map_jpeg = self._map_jpeg_with_history(snapshot, step_number)
+        tool = self._build_selection_tool()
+        map_jpeg = snapshot['jpeg_bytes']
 
-        map_metadata = snapshot['metadata']
         context = {
             'query': self.target,
+            'mode': self._mode,
             'step': step_number,
-            'valid_candidate_ids': list(self._candidates),
             'candidates': {
                 pose_id: {
                     key: candidate.get(key)
@@ -220,42 +399,41 @@ class NavigateAction:
                 }
                 for pose_id, candidate in self._candidates.items()
             },
+            'observation': (
+                {
+                    'contextual_clue': self._observation.get('contextual_clue'),
+                    'clue_confidence': self._observation.get('clue_confidence'),
+                }
+                if self._observation is not None else None
+            ),
         }
         prompt = (
-            'Choose the next waypoint for the query using the fresh map and camera. '
-            'Image 1 is the full map, and image 2 is the front camera. Map +X is right and +Y is up. '
-            'Large green diamond F are frontier goals across the full map and blue numbered-circle are nearby poses. The short colored tick on each '
-            'marker shows its final heading. Each green F ID is the maximum-information cell '
-            'from one connected frontier group; blue numeric IDs are local translation candidates. '
-            'Red is the current robot pose. Cyan S-number markers are older navigation-call starts from this session. '
-            'The yellow S-number marker is the starting pose for this current navigation call and goal. '
-            'The magenta trail shows movement during only the current navigation call. '
-            'valid_candidate_ids is the complete set of IDs allowed for this snapshot; '
-            'candidates describes each ID and its kind and distance. '
-            'Numeric and F IDs move and face the travel/frontier direction; do not rotate first. '
-            'For exploration or when the semantic direction is unknown, prefer the F goal '
-            'R IDs rotate in place: R+90 turns left 90°, R-90 turns right 90°, '
-            'and R+180 turns around. Use R only for a requested turn or when the '
-            'goal direction cannot be determined without looking elsewhere. '
-            'Pick the best location that makes most progress towards the goal without worrying about obstacles. Nav2 handles path planning and obstacle avoidance. '
-            'Do not shorten a move just to reassess or avoid a camera obstacle; '
-            'Use the camera for assess meaningful frontier, semantic direction, visibility, and arrival evidence. '
-            'If the map has a frontier but the camera vision shows a dead end, you should not pick that frontier. '
-            "Assess completion against the original query and the current navigation call's visible S-number marker, not merely "
-            'against the current loop position. Do not keep moving after the semantic goal is '
-            'reasonably satisfied. Return goal_reached when the complete goal is satisfied, including when the robot is '
-            'reasonably within an approximate semantic goal region. Return blocked only when no '
-            'listed pose can safely help. For move, select exactly one listed ID; otherwise use null. \n'
+            MAP_GUIDANCE
+            + '\n\n'
+            + MODE_GUIDANCE[self._mode]
+            + '\n\nLIVE CONTEXT\n'
             + json.dumps(context, allow_nan=False)
         )
+        vision_jpeg = (
+            camera_jpeg
+            if self._mode == 'goal'
+            else bytes(self._observation['jpeg_bytes'])
+        )
         self._save_debug_inputs(
-            map_jpeg, camera_jpeg, map_metadata, context,
+            map_jpeg, vision_jpeg, snapshot['metadata'], context, prompt, tool,
             step_number, self._request_id,
         )
         content = [{'type': 'input_text', 'text': prompt}]
-        content.extend({'type': 'input_image', 'image_url': 'data:image/jpeg;base64,'
-                        + base64.b64encode(jpeg).decode('ascii')}
-                       for jpeg in (map_jpeg, camera_jpeg))
+        content.append({
+            'type': 'input_image',
+            'image_url': 'data:image/jpeg;base64,'
+            + base64.b64encode(map_jpeg).decode('ascii'),
+        })
+        content.append({
+            'type': 'input_image',
+            'image_url': 'data:image/jpeg;base64,'
+            + base64.b64encode(vision_jpeg).decode('ascii'),
+        })
         try:
             await self.ws.send(json.dumps({
                 'event_id': f'navigate_vision_{self._request_id}', 'type': 'response.create',
@@ -277,6 +455,16 @@ class NavigateAction:
             self._request_id = None
             self._selection_future = None
 
+    def _build_selection_tool(self):
+        """Limit the model's pose choices to candidates in the current snapshot."""
+        tool = copy.deepcopy(self.selection_tool_template)
+        valid_pose_ids = list(self._candidates)
+        valid_pose_ids.append(None)
+
+        pose_id_parameter = tool['parameters']['properties']['pose_id']
+        pose_id_parameter['enum'] = valid_pose_ids
+        return tool
+
     async def select_navigation_pose(self, args, response_metadata):
         """Ignore unrelated, late, duplicate, or cancelled OOB responses."""
         if (not self.active or self._stop_requested
@@ -290,6 +478,16 @@ class NavigateAction:
             return
         decision = args.get('decision')
         pose_id = args.get('pose_id')
+        if self._mode != 'goal' and decision == 'goal_reached':
+            decision = 'blocked'
+            pose_id = None
+            args = {
+                **args,
+                'reason': (
+                    'Search target claims are verified by the detector/search action; '
+                    + str(args.get('reason') or 'no navigation waypoint selected')
+                ),
+            }
         if decision not in {'move', 'goal_reached', 'blocked'}:
             future.set_exception(NavigationError(
                 'INVALID_NAVIGATION_DECISION', 'Vision returned an unknown decision'
@@ -312,22 +510,6 @@ class NavigateAction:
         })
 
 
-    def _remember_pose(self, pose, before_step):
-        """Record one actual pre-move pose for this navigate_action only."""
-        try:
-            recorded = {
-                'before_step': int(before_step),
-                'x': float(pose['x']),
-                'y': float(pose['y']),
-                'yaw': float(pose['yaw']),
-                'frame_id': str(pose['frame_id']),
-            }
-        except (KeyError, TypeError, ValueError):
-            return
-        if not all(math.isfinite(recorded[key]) for key in ('x', 'y', 'yaw')):
-            return
-        self._pose_history.append(recorded)
-
     @staticmethod
     def _atomic_write(path, data):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,21 +518,22 @@ class NavigateAction:
         temporary.replace(path)
 
     def _save_debug_inputs(self, map_jpeg, vision_jpeg, map_metadata, context,
-                           step_number, request_id):
-        """Persist the exact images and structured context sent to vision."""
+                           prompt, tool, step_number, request_id):
+        """Persist the exact text, tool, and image order sent to vision."""
         manifest = {
             'action_id': self.action_id,
             'request_id': request_id,
             'snapshot_id': self._snapshot_id,
             'step': step_number,
-            'map_file': 'latest_map.jpg',
-            'vision_file': 'latest_vision.jpg',
+            'input_images': ['latest_map.jpg', 'latest_vision.jpg'],
+            'prompt': prompt,
+            'tool': tool,
             'map_metadata': map_metadata,
             'selection_context': context,
         }
         try:
-            self._atomic_write(self.debug_dir / manifest['map_file'], map_jpeg)
-            self._atomic_write(self.debug_dir / manifest['vision_file'], vision_jpeg)
+            self._atomic_write(self.debug_dir / 'latest_map.jpg', map_jpeg)
+            self._atomic_write(self.debug_dir / 'latest_vision.jpg', vision_jpeg)
             self._atomic_write(
                 self.debug_dir / 'latest_request.json',
                 json.dumps(manifest, indent=2, allow_nan=False).encode('utf-8'),
@@ -361,98 +544,14 @@ class NavigateAction:
             # Debug output must never prevent the robot from navigating.
             self._result_data['debug_save_error'] = str(error)
 
-    def _map_jpeg_with_history(self, snapshot, step_number, show_last_label=False):
-        """Overlay the action start and each loop start without mutating the map stream."""
-        if not self._pose_history:
-            return snapshot['jpeg_bytes']
-        image = snapshot.get('image')
-        metadata = snapshot.get('metadata') or {}
-        bounds = metadata.get('image_world_bounds') or {}
-        if image is None or not all(key in bounds for key in ('xmin', 'xmax', 'ymin', 'ymax')):
-            return snapshot['jpeg_bytes']
-        xmin, xmax = float(bounds['xmin']), float(bounds['xmax'])
-        ymin, ymax = float(bounds['ymin']), float(bounds['ymax'])
-        if xmax <= xmin or ymax <= ymin:
-            return snapshot['jpeg_bytes']
-
-        overlay = image.copy()
-        height, width = overlay.shape[:2]
-
-        def pixel(pose):
-            try:
-                col = round((float(pose['x']) - xmin) * (width - 1) / (xmax - xmin))
-                row = round((ymax - float(pose['y'])) * (height - 1) / (ymax - ymin))
-            except (KeyError, TypeError, ValueError):
-                return None
-            return (col, row) if 0 <= col < width and 0 <= row < height else None
-
-        trail = self._pose_history
-        trail_pixels = [point for point in (pixel(pose) for pose in trail) if point is not None]
-        for start, end in zip(trail_pixels, trail_pixels[1:]):
-            cv2.line(overlay, start, end, self.HISTORY_COLOR, 2, cv2.LINE_AA)
-        for pose in self._pose_history:
-            point = pixel(pose)
-            if point is None:
-                continue
-            color, radius = self.HISTORY_COLOR, 6
-            cv2.circle(overlay, point, radius, (20, 20, 20), 7, cv2.LINE_AA)
-            cv2.circle(overlay, point, radius, (255, 255, 255), 4, cv2.LINE_AA)
-            cv2.circle(overlay, point, radius, color, 2, cv2.LINE_AA)
-            cv2.circle(overlay, point, 4, color, -1, cv2.LINE_AA)
-
-        for action_number, saved_start in enumerate(self._session_start_poses, 1):
-            start_point = pixel(saved_start)
-            if start_point is None:
-                continue
-            radius = 18
-            cv2.circle(overlay, start_point, radius, (20, 20, 20), 7, cv2.LINE_AA)
-            cv2.circle(overlay, start_point, radius, (255, 255, 255), 4, cv2.LINE_AA)
-            color = (self.CURRENT_START_COLOR
-                     if action_number == self._action_number else self.START_COLOR)
-            cv2.circle(overlay, start_point, radius, color, 2, cv2.LINE_AA)
-            text_origin = (start_point[0] + radius + 3, start_point[1] + 4)
-            label = f'S{action_number}'
-            cv2.putText(overlay, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (20, 20, 20), 5, cv2.LINE_AA)
-            cv2.putText(overlay, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 2, cv2.LINE_AA)
-
-        if show_last_label and self._pose_history:
-            last_point = pixel(self._pose_history[-1])
-            if last_point is not None:
-                radius = 14
-                cv2.circle(overlay, last_point, radius, (20, 20, 20), 7, cv2.LINE_AA)
-                cv2.circle(overlay, last_point, radius, (255, 255, 255), 4, cv2.LINE_AA)
-                cv2.circle(overlay, last_point, radius, self.HISTORY_COLOR, 2, cv2.LINE_AA)
-                label = f"L{self._action_number}"
-                text_origin = (last_point[0] + radius + 3, last_point[1] + 18)
-                cv2.putText(overlay, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (20, 20, 20), 5, cv2.LINE_AA)
-                cv2.putText(overlay, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, self.HISTORY_COLOR, 2, cv2.LINE_AA)
-
-        ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        return encoded.tobytes() if ok else snapshot["jpeg_bytes"]
-
-    def _save_goal_reached_map(self, snapshot, step_number):
-        """Add L<n> only to the local terminal debug map, never to an AI input."""
+    def _save_goal_reached_map(self, snapshot):
+        """Save the map-stream image exactly as navigation received it."""
         try:
-            terminal_map = self._map_jpeg_with_history(
-                snapshot, step_number, show_last_label=True
+            self._atomic_write(
+                self.debug_dir / 'latest_map.jpg', snapshot['jpeg_bytes']
             )
-            self._atomic_write(self.debug_dir / "latest_map.jpg", terminal_map)
-            self._result_data["terminal_map_label"] = f"L{self._action_number}"
         except OSError as error:
-            self._result_data["debug_save_error"] = str(error)
-
-    def _revalidate(self, original, frame, destination):
-        pass # skip revalidating for now
-
-    def _same_pose(self, first, second):
-        distance = math.hypot(first['x'] - second['x'], first['y'] - second['y'])
-        delta = first['yaw'] - second['yaw']
-        return (distance <= self.POSITION_TOLERANCE
-                and abs(math.atan2(math.sin(delta), math.cos(delta))) <= self.YAW_TOLERANCE)
+            self._result_data['debug_save_error'] = str(error)
 
     def handle_navigation_event(self, payload):
         if (not self.active or self._stop_requested

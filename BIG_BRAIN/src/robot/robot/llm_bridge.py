@@ -21,7 +21,7 @@ import time
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from robot.room_geometry import RoomGeometryEstimator
-from robot.map_image_stream import MapImageStream
+from robot.map_stream import MapImageStream
 
 class CameraServo():
     def __init__(self, pan_pub, tilt_pub):
@@ -54,8 +54,8 @@ class CameraServo():
         if abs(self.delta_tilt_angle) < self.deadband_degrees:
             self.delta_tilt_angle = 0.0
 
-        step_pan = min(self.delta_pan_angle, self.max_delta_angle) if self.delta_pan_angle > 0 else max(self.delta_pan_angle, -self.max_delta_angle)
-        step_tilt = min(self.delta_tilt_angle, self.max_delta_angle) if self.delta_tilt_angle > 0 else max(self.delta_tilt_angle, -self.max_delta_angle)
+        step_pan = self.delta_pan_angle
+        step_tilt = self.delta_tilt_angle
 
         if tracking:
             step_pan = self.delta_pan_angle * self.Kp
@@ -92,14 +92,8 @@ class CameraServo():
         self.servo_tilt_pub.publish(tilt_msg)
         self.servo_pan_pub.publish(pan_msg)
 
-        if not tracking and (step_pan != self.delta_pan_angle or step_tilt != self.delta_tilt_angle):
-            self.delta_pan_angle = self.delta_pan_angle - step_pan
-            self.delta_tilt_angle = self.delta_tilt_angle - step_tilt
-            time.sleep(0.5)
-            self.publish_servo_command()
-        else:
-            self.delta_pan_angle = 0.0
-            self.delta_tilt_angle = 0.0
+        self.delta_pan_angle = 0.0
+        self.delta_tilt_angle = 0.0
 
         return remaining_pan_angle
         
@@ -135,8 +129,8 @@ class LLMRosBridge(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
         self.servo = CameraServo(self.servo_pan_pub,self.servo_tilt_pub)
+        self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
 
         self.camera_tof_range = 0.0
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)

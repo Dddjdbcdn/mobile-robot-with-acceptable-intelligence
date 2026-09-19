@@ -13,6 +13,7 @@ import uuid
 from utilities.database_functions import load_json
 
 from cognition.state import robot_state
+from actions.track_action import dj_yolo_classes, normalize_object_target
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
@@ -31,8 +32,8 @@ CAMERA_SETTLE_SECONDS = 0.8
 
 PAN_POSITION_ANGLE = {
     "center": 95.0,
-    "leftmost": 160.0,
-    "rightmost": 30.0,
+    "leftmost": 155.0,
+    "rightmost": 35.0,
 }
 
 TILT_POSITION_ANGLE = {
@@ -42,6 +43,7 @@ TILT_POSITION_ANGLE = {
 }
 
 PAN_SWEEP_ORDER = ("leftmost", "center", "rightmost")
+SIDE_SWEEP_ORDER = ("leftmost", "rightmost")
 SWEEP_TILT_ORDER = ("center", "upmost", "downmost")
 SEARCH_EFFORT_ROWS = {
     "center": ("center",),
@@ -53,15 +55,22 @@ SEARCH_EFFORT_ROWS = {
 from actions.action_result import ActionResult
 
 class SearchAction:
-    def __init__(self, ws, send_robot_command, camera):
+    def __init__(self, ws, send_robot_command, camera, yolo=None):
         self.ws = ws
         self.send_robot_command = send_robot_command
         self.camera = camera
+        self.yolo = yolo
         self.search_task = None
         self.action_id = None
 
         self.completion_future = None
         self.last_found_target = None
+        # A contextual candidate keeps only its selected frame, not the full sweep.
+        self.last_observation_frame: dict[str, Any] | None = None
+        self.last_coverage_frames: list[dict[str, Any]] = []
+        self.last_contextual_clue: dict[str, Any] | None = None
+        self.last_detection_source: str | None = None
+        self._yolo_owner = None
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -73,14 +82,31 @@ class SearchAction:
         self.effort = "center"
         self.initial_view_only = False
         self.sweep_tilt_order = SEARCH_EFFORT_ROWS[self.effort]
+        self.sweep_pan_positions = SIDE_SWEEP_ORDER
         self.sweep_index = 0
         self.pan_angle = PAN_POSITION_ANGLE["center"]
         self.tilt_angle = TILT_POSITION_ANGLE["center"]
         self.current_batch_frames = []
+        self.current_initial_frame = None
+        self.captured_frames = []
         self.current_candidate = None
         self.first_frame_result = None
         self.batch_results = []
         self.pending_request_id = None
+
+    @staticmethod
+    def _robot_pose_at_capture() -> dict[str, Any] | None:
+        """Copy the map pose that belongs to a camera observation."""
+        pose = robot_state.get("pose") or {}
+        try:
+            return {
+                "x": float(pose["x"]),
+                "y": float(pose["y"]),
+                "yaw": float(pose["yaw"]),
+                "frame_id": str(pose.get("frame_id") or "map"),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def target_to_servo_angles(self, center_x: float, center_y: float, base_pan_angle: float, base_tilt_angle: float) -> tuple[float, float]:
         image_x_error = center_x - 0.5
@@ -122,9 +148,14 @@ class SearchAction:
         tilt_position = self.sweep_tilt_order[sweep_index]
         frames: list[dict[str, Any]] = []
 
-        CURRENT_ORDER = PAN_SWEEP_ORDER if tilt_position != "upmost" else ("rightmost", "center", "leftmost")
+        if tilt_position == "center" and self.current_initial_frame is not None:
+            current_order = self.sweep_pan_positions
+        elif tilt_position == "upmost":
+            current_order = ("rightmost", "center", "leftmost")
+        else:
+            current_order = PAN_SWEEP_ORDER
 
-        for image_number, pan_position in enumerate(CURRENT_ORDER, start=1):
+        for image_number, pan_position in enumerate(current_order, start=1):
             await self.move_camera_angles(
                 PAN_POSITION_ANGLE[pan_position],
                 TILT_POSITION_ANGLE[tilt_position]
@@ -141,10 +172,46 @@ class SearchAction:
                 "pan_angle": float(self.pan_angle),
                 "tilt_angle": float(self.tilt_angle),
                 "jpeg_bytes": jpeg_bytes,
+                "robot_pose": self._robot_pose_at_capture(),
             })
+            self.captured_frames.append(frames[-1])
 
-        self.current_batch_frames = frames
-        await self.request_batch_assessment(frames)
+            yolo_candidate = self._best_yolo_candidate()
+            if yolo_candidate is not None:
+                self.current_batch_frames = frames
+                self.current_candidate = {
+                    "assessment": {
+                        "result": "found",
+                        "target_position": yolo_candidate["position"],
+                        "contextual_clue": None,
+                    },
+                    "frame": frames[-1],
+                    "sweep_index": sweep_index,
+                }
+                self.last_detection_source = "yolo"
+                await self.move_to_found_target()
+                await self.complete_searching("succeeded", "found")
+                return
+
+        self.current_batch_frames = self._comparison_frames(frames, tilt_position)
+        await self.request_batch_assessment(self.current_batch_frames)
+
+    def _comparison_frames(self, sweep_frames, tilt_position):
+        """Combine the already-assessed center with newly captured side views."""
+        frames = [dict(frame) for frame in sweep_frames]
+        if tilt_position == "center" and self.current_initial_frame is not None:
+            center = dict(self.current_initial_frame)
+            center["pan_position"] = "center"
+            center["tilt_position"] = "center"
+            by_pan = {frame.get("pan_position"): frame for frame in frames}
+            frames = [
+                frame for frame in (
+                    by_pan.get("leftmost"), center, by_pan.get("rightmost")
+                ) if frame is not None
+            ]
+        for index, frame in enumerate(frames, start=1):
+            frame["image_id"] = f"image_{index}"
+        return frames
 
     async def request_frame_assessment(self):
         request_id = uuid.uuid4().hex
@@ -155,14 +222,44 @@ class SearchAction:
             tracking_bgr=True,
             save_path=f"results/search_results/first_search_frame.jpg",
         )
+        self.current_initial_frame = {
+            "image_id": "image_1",
+            "pan_position": "current",
+            "tilt_position": "current",
+            "pan_angle": float(self.pan_angle),
+            "tilt_angle": float(self.tilt_angle),
+            "jpeg_bytes": jpeg_bytes,
+            "robot_pose": self._robot_pose_at_capture(),
+        }
+        self.captured_frames.append(self.current_initial_frame)
+
+        yolo_candidate = self._best_yolo_candidate()
+        if yolo_candidate is not None:
+            self.current_candidate = {
+                "assessment": {
+                    "result": "found",
+                    "target_position": yolo_candidate["position"],
+                    "contextual_clue": None,
+                },
+                "frame": self.current_initial_frame,
+                "sweep_index": -1,
+            }
+            self.last_detection_source = "yolo"
+            await self.move_to_found_target()
+            await self.complete_searching("succeeded", "found")
+            return
 
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
                 "text": (
                     f"Search for this object: {self.target}\n\n"
-                    "Use candidate when an object is visually clear or plausibly resembles the target.\n"
-                    "Use not_found when the target is not visible.\n"
+                    "Use found only when the requested target is definitively visible.\n"
+                    "Use candidate only when the target is absent but one specific "
+                    "visible contextual clue justifies moving somewhere to investigate.\n"
+                    "Use not_found when neither the target nor a useful clue is visible.\n"
+                    "Only candidate needs confidence and contextual_clue. "
+                    "Only found needs target_position.\n"
                     "Always call assess_frame_search exactly once."
                 ),
             },
@@ -190,31 +287,90 @@ class SearchAction:
         }
         await self.ws.send(json.dumps(event))
 
+    async def _start_frame_assessment(self, yolo_sequence):
+        if (
+            yolo_sequence is not None
+            and hasattr(self.yolo, "wait_for_inference_after")
+        ):
+            await self.yolo.wait_for_inference_after(yolo_sequence)
+        if self.active:
+            await self.request_frame_assessment()
+
+    def _best_yolo_candidate(self):
+        """Return the best current YOLO match before spending an LLM call."""
+        if self.yolo is None:
+            return None
+        normalized_target = normalize_object_target(self.target)
+        if normalized_target not in dj_yolo_classes:
+            return None
+        detections = [
+            detection for detection in list(self.yolo.detections)
+            if detection.get("class") == normalized_target
+        ]
+        if not detections:
+            return None
+        detection = max(
+            detections, key=lambda item: float(item.get("confidence") or 0.0)
+        )
+        confidence = float(detection.get("confidence") or 0.0)
+        if confidence < CANDIDATE_CONFIDENCE_THRESHOLD:
+            return None
+        bbox = detection.get("bbox") or {}
+        try:
+            width, height = self.camera.tracking_size
+            x = (float(bbox["x1"]) + float(bbox["x2"])) / (2.0 * width)
+            y = (float(bbox["y1"]) + float(bbox["y2"])) / (2.0 * height)
+            position = get_valid_position({"x": x, "y": y})
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if position is None:
+            return None
+        return {
+            "position": position,
+            "confidence": confidence,
+        }
+
     async def request_batch_assessment(self, frames):
         request_id = uuid.uuid4().hex
         self.pending_request_id = request_id
 
         tilt_position = self.sweep_tilt_order[int(self.sweep_index)]
 
-        images_order = "image_1: leftmost, image_2: center, image_3: rightmost"
-
-        if tilt_position == "upmost":
-            images_order = "image_1: rightmost, image_2: center, image_3: leftmost"
-
+        images_order = ", ".join(
+            f"{frame['image_id']}: {frame['pan_position']}"
+            for frame in frames
+        )
+        initial_assessment = (
+            (self.first_frame_result or {}).get("assessment") or {}
+        )
+        prior_candidate = ""
+        if initial_assessment.get("result") == "candidate":
+            prior_candidate = (
+                "\nThe reused center frame was previously a candidate: "
+                f"confidence={initial_assessment.get('confidence')}; "
+                f"clue={initial_assessment.get('contextual_clue')}. "
+                "Compare it with any side clues and select the best one.\n"
+            )
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
                 "text": (
                     f"Search for this object: {self.target}\n\n"
-                    "These three images form one horizontal camera sweep.\n"
+                    "These images together cover the available horizontal search view. "
+                    "The center image was assessed first and is reused here; the other "
+                    "images are only the left/right directions whose 60-degree, 2-meter "
+                    "fans were at least 50% uncovered. Rank all supplied images together.\n"
                     f"Current tilt: {tilt_position}\n"
                     f"{images_order}\n"
-                    "Examine all three images.\n"
-                    "Use candidate when an object is visually clear or plausibly resembles the target.\n"
-                    "Use not_found when the target is not visible.\n"
-                    "For candidate, return the best image and a normalized "
-                    "center position of the target. For other results, return "
-                    "candidate_image=none and candidate_position=null.\n"
+                    f"{prior_candidate}"
+                    "Examine every supplied image. Use found only when the requested "
+                    "target is definitively visible; provide its image and target_position.\n"
+                    "Use candidate only when the target is absent but one specific "
+                    "visible contextual clue is the best available place to investigate; "
+                    "provide its image, confidence, and contextual_clue.\n"
+                    "Use not_found when neither the target nor a useful clue is visible.\n"
+                    "Only candidate needs confidence. Use null contextual_clue for "
+                    "found/not_found and null target_position for candidate/not_found.\n"
                     "Always call assess_batch_search exactly once."
                 ),
             }
@@ -268,16 +424,39 @@ class SearchAction:
         }
 
         result = args.get("result")
-        confidence = float(args.get("confidence", 0.0))
+        if result == "found":
+            target_position = get_valid_position(args.get("target_position"))
+            if target_position is not None:
+                self.current_candidate = {
+                    "assessment": {
+                        **args,
+                        "target_position": target_position,
+                    },
+                    "frame": self.current_initial_frame,
+                    "sweep_index": -1,
+                }
+                await self.move_to_found_target()
+                await self.complete_searching("succeeded", "found")
+                return
 
-        if result == "candidate" and confidence >= CANDIDATE_CONFIDENCE_THRESHOLD:
-            await self.complete_searching(
-                status="succeeded",
-                outcome="found"
-            )
+        if result == "candidate" and self._contextual_clue_is_valid(args):
+            self.current_candidate = {
+                "assessment": args,
+                "frame": self.current_initial_frame,
+                "sweep_index": -1,
+            }
+            if self.sweep_pan_positions:
+                await self.capture_sweep_batch()
+            else:
+                await self.move_to_candidate_frame()
+                await self.complete_searching(
+                    status="failed",
+                    outcome="contextual_clue",
+                    reason_code="SEARCH_CONTEXTUAL_CLUE",
+                )
             return
 
-        if self.initial_view_only:
+        if not self.sweep_pan_positions:
             await self.complete_searching(
                 status="failed",
                 outcome="not_found",
@@ -306,76 +485,100 @@ class SearchAction:
         self.batch_results.append(batch_result)
 
         result = args.get("result")
-        confidence = float(args.get("confidence", 0.0))
+        frame_validated = get_valid_frame(
+            args.get("candidate_image"), self.current_batch_frames
+        )
 
-        if result == "candidate" and confidence >= CANDIDATE_CONFIDENCE_THRESHOLD:
-            position_validated = get_valid_position(args.get("candidate_position"))
-            frame_validated = get_valid_frame(args.get("candidate_image"), self.current_batch_frames)
-
-            if position_validated is not None and frame_validated is not None:
-                candidate_position = position_validated
-                candidate_frame = frame_validated
+        if result == "found":
+            target_position = get_valid_position(args.get("target_position"))
+            if target_position is not None and frame_validated is not None:
 
                 save_candidate_debug_image(
-                    jpeg_bytes=candidate_frame["jpeg_bytes"],
-                    candidate_position=candidate_position,
+                    jpeg_bytes=frame_validated["jpeg_bytes"],
+                    candidate_position=target_position,
                     save_path=(REPO_ROOT / "results" / "search_results" / "candidate.jpg"),
                 )
 
                 self.current_candidate = {
                     "assessment": {
                         **args,
-                        "candidate_position": candidate_position,
+                        "target_position": target_position,
                     },
-                    "frame": candidate_frame,
+                    "frame": frame_validated,
                     "sweep_index": int(self.sweep_index),
                 }
 
-                await self.move_to_candidate()
-                await self.complete_searching(
-                    status="succeeded",
-                    outcome="found"
-                )
+                await self.move_to_found_target()
+                await self.complete_searching("succeeded", "found")
                 return
+
+        if (
+            result == "candidate"
+            and frame_validated is not None
+            and self._contextual_clue_is_valid(args)
+        ):
+            self.current_candidate = {
+                "assessment": args,
+                "frame": frame_validated,
+                "sweep_index": int(self.sweep_index),
+            }
+            await self.move_to_candidate_frame()
+            await self.complete_searching(
+                status="failed",
+                outcome="contextual_clue",
+                reason_code="SEARCH_CONTEXTUAL_CLUE",
+            )
+            return
 
         self.sweep_index += 1
         if self.sweep_index < len(self.sweep_tilt_order):
             await self.capture_sweep_batch()
             return
-        else:
-            await self.move_camera_angles(PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"])
-            await self.complete_searching(
-                status="failed",
-                outcome=(
-                    "search_guidance_required"
-                    if self.effort == "center"
-                    else "not_found"
-                ),
-                reason_code=(
-                    "SEARCH_GUIDANCE_REQUIRED"
-                    if self.effort == "center"
-                    else "TARGET_NOT_VISIBLE"
-                ),
-            )
+        await self.move_camera_angles(
+            PAN_POSITION_ANGLE["center"], TILT_POSITION_ANGLE["center"]
+        )
+        await self.complete_searching(
+            status="failed", outcome="not_found", reason_code="TARGET_NOT_VISIBLE"
+        )
         return
 
-    async def move_to_candidate(self) -> None:
+    @staticmethod
+    def _contextual_clue_is_valid(args) -> bool:
+        clue = args.get("contextual_clue")
+        try:
+            confidence = float(args.get("confidence"))
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(clue, str)
+            and bool(clue.strip())
+            and confidence >= CANDIDATE_CONFIDENCE_THRESHOLD
+        )
+
+    async def move_to_found_target(self) -> None:
         candidate = self.current_candidate
         if not isinstance(candidate, dict):
-            raise RuntimeError("Verification requested without a candidate")
+            raise RuntimeError("Target aiming requested without a found target")
 
-        candidate_x_position = candidate["assessment"].get("candidate_position").get("x")
-        candidate_y_position = candidate["assessment"].get("candidate_position").get("y")
+        target_position = candidate["assessment"]["target_position"]
         candidate_frame = candidate.get("frame")
 
         target_pan, target_tilt = self.target_to_servo_angles(
-            candidate_x_position,
-            candidate_y_position,
+            target_position["x"],
+            target_position["y"],
             base_pan_angle=float(candidate_frame["pan_angle"]),
             base_tilt_angle=float(candidate_frame["tilt_angle"]),
         )
 
         await self.move_camera_angles(target_pan, target_tilt)
+
+    async def move_to_candidate_frame(self) -> None:
+        """Aim at the clue frame without treating the clue as the target."""
+        frame = self.current_candidate["frame"]
+        await self.move_camera_angles(
+            float(frame["pan_angle"]),
+            float(frame["tilt_angle"]),
+        )
 
     async def start_searching(
         self,
@@ -383,6 +586,7 @@ class SearchAction:
         action_id,
         effort="center",
         initial_view_only=False,
+        sweep_directions=None,
     ):
         if self.active:
             return ActionResult(
@@ -421,6 +625,10 @@ class SearchAction:
             )
 
         self.reset_state()
+        self.last_observation_frame = None
+        self.last_coverage_frames = []
+        self.last_contextual_clue = None
+        self.last_detection_source = None
         self.active = True
         self.action_id = action_id
         self.search_id = action_id
@@ -428,12 +636,37 @@ class SearchAction:
         self.effort = normalized_effort
         self.initial_view_only = initial_view_only is True
         self.sweep_tilt_order = SEARCH_EFFORT_ROWS[normalized_effort]
+        if self.initial_view_only:
+            self.sweep_pan_positions = ()
+        elif sweep_directions is None:
+            self.sweep_pan_positions = SIDE_SWEEP_ORDER
+        else:
+            direction_to_pan = {
+                "left": "leftmost",
+                "right": "rightmost",
+            }
+            self.sweep_pan_positions = tuple(
+                direction_to_pan[direction] for direction in sweep_directions
+                if direction in direction_to_pan
+            )
         self.pan_angle = robot_state["camera"]["pan_angle"]
         self.tilt_angle = robot_state["camera"]["tilt_angle"]
 
+        yolo_sequence = None
+        yolo_target = normalize_object_target(normalized_target)
+        if (
+            self.yolo is not None
+            and yolo_target in dj_yolo_classes
+            and hasattr(self.yolo, "activate")
+        ):
+            self._yolo_owner = f"search:{action_id}"
+            yolo_sequence = self.yolo.activate(self._yolo_owner, "dj")
+
         clear_images_folder()
         self.completion_future = asyncio.get_running_loop().create_future()
-        self.search_task = asyncio.create_task(self.request_frame_assessment())
+        self.search_task = asyncio.create_task(
+            self._start_frame_assessment(yolo_sequence)
+        )
 
         return ActionResult(
             action_id=action_id,
@@ -487,6 +720,23 @@ class SearchAction:
         searched_rows = len(scan_results)
         coverage = min(1.0, searched_rows / max(1, len(configured_rows)))
 
+        clue = None
+        clue_frame = None
+        if (
+            outcome == "contextual_clue"
+            and isinstance(self.current_candidate, dict)
+        ):
+            assessment = self.current_candidate.get("assessment") or {}
+            frame = self.current_candidate.get("frame")
+            if isinstance(frame, dict):
+                clue = {
+                    "text": str(assessment.get("contextual_clue") or "").strip(),
+                    "confidence": float(assessment.get("confidence") or 0.0),
+                }
+                clue_frame = dict(frame)
+                clue_frame["contextual_clue"] = clue["text"]
+                clue_frame["clue_confidence"] = clue["confidence"]
+
         data = {
             "initial_frame_assessment": first_frame_result,
             "scan_results": scan_results,
@@ -497,19 +747,9 @@ class SearchAction:
             "final_camera_pose": final_camera_pose,
             "effort": effort,
             "initial_view_only": initial_view_only,
+            "detection_source": self.last_detection_source or "vision_assessment",
+            "contextual_clue": clue,
         }
-        if reason_code == "SEARCH_GUIDANCE_REQUIRED":
-            data["user_guidance"] = {
-                "question": (
-                    f"I couldn't find {target} at center height. "
-                    "Is it high, low, behind DJ, somewhere else out of frame, "
-                    "or should I try my best?"
-                ),
-                "effort_options": ["high", "low", "best_effort"],
-                "direction_options": ["behind"],
-                "behind_requires_retry": True,
-                "not_in_frame_requires_no_retry": True,
-            }
 
         action_result = ActionResult(
             action_id=action_id,
@@ -527,7 +767,31 @@ class SearchAction:
         )
 
         completion_future = self.completion_future
+
+        allowed_frame_keys = {
+            "image_id", "pan_position", "tilt_position", "pan_angle",
+            "tilt_angle", "jpeg_bytes", "robot_pose", "contextual_clue",
+            "clue_confidence",
+        }
+        self.last_coverage_frames = [
+            {
+                key: value for key, value in frame.items()
+                if key in allowed_frame_keys
+            }
+            for frame in self.captured_frames
+        ]
+        self.last_observation_frame = (
+            {
+                key: value for key, value in clue_frame.items()
+                if key in allowed_frame_keys
+            }
+            if clue_frame is not None else None
+        )
+        self.last_contextual_clue = clue
         self.last_found_target = self.target if status == "succeeded" else None
+        if self._yolo_owner is not None:
+            self.yolo.deactivate(self._yolo_owner)
+            self._yolo_owner = None
         self.reset_state()
 
         if completion_future is not None and not completion_future.done():

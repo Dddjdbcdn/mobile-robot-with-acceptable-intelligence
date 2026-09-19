@@ -338,3 +338,85 @@
     }
   }
 ]
+
+{
+    "type": "function",
+    "name": "navigate_action",
+    "description": "Use for every requested robot-body movement: moving forward/backward, turning, local repositioning, navigating toward a visible place, room-relative destinations, and exploration. Call once for the complete movement goal and wait for its terminal event. Use approach_target instead when the final goal is to move near a named person or object. Use stop_navigation to cancel.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The user's movement goal in natural language. Include only details the user requested; do not add default stopping distances, headings, or obstacle-avoidance instructions. Nav2 handles collision avoidance. Never invent coordinates or candidate IDs."
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "approach_target",
+    "description": "Locate, track, and move near a target as one complete goal. Use this as the only tool when moving near the target is the user's final intended outcome, even if the request also says to find, follow, track, or lock onto it first;",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The specific person, body part, or object concerned by the request."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "center",
+            "high",
+            "low",
+            "best_effort"
+          ],
+          "description": "Search stage. Use center if no effort request was made. High scans only the upper row, low scans only the lower row, and best_effort scans both remaining rows."
+        },
+        "direction": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "behind",
+            null
+          ],
+          "description": "Body-direction hint. The only valid non-null value is behind. Never put left, right, up, down, center, or a corner here; those are camera regions. For a target on the right, omit direction and set camera_region to right."
+        },
+        "user_confirms_visible": {
+          "type": "boolean",
+          "description": "One-shot detector override for a follow-up after a previous search for this same target failed. Set true only when the user then explicitly insists the target is visible in DJ\u2019s current unchanged camera view. Never set it on an initial request, from a direction or region hint such as behind, or together with direction or camera_region. A failed detector attempt is terminal until new user guidance."
+        },
+        "camera_region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "upper_left",
+            "up",
+            "upper_right",
+            "left",
+            "center",
+            "right",
+            "lower_left",
+            "down",
+            "lower_right",
+            null
+          ],
+          "description": "Optional initial camera aim only when the user explicitly gives a target-location hint. Use this field for left, right, up, down, center, and corners; never put those values in direction. Never set center as a default. For a left or right edge hint, the executor checks that guided view once and, on a miss, centers camera pan while preserving height, immediately rotates the body toward that side, and checks the new forward view once without a horizontal sweep."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

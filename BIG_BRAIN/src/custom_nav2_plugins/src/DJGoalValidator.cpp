@@ -46,7 +46,7 @@ public:
 
     const auto goal_cost = sampleCost(global_cost_client, goal, true);
 
-    if (!goal_cost.success || goal_cost.cost == 254.0) { 
+    if (!goal_cost.success || goal_cost.cost == 253.0 || goal_cost.cost == 254.0) { 
 
       ++failure_count;
       RCLCPP_WARN(node->get_logger(), "[DJGoalValidator]: 🥊 Goal is inside obstacle with cost %f! Failure count: %d",goal_cost.cost, failure_count);
@@ -155,7 +155,7 @@ private:
         candidate.world_pose.header.stamp = node->now();
 
         auto candidate_cost = sampleCost(global_cost_client,candidate.world_pose,true);
-        if (!candidate_cost.success || candidate_cost.cost >= 254.0) candidate.is_valid = false;
+        if (!candidate_cost.success || candidate_cost.cost >= 253.0) candidate.is_valid = false;
 
         candidates.push_back(candidate);
       }

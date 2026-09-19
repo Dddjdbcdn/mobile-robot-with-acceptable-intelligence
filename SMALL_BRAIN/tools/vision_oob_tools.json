@@ -2,27 +2,28 @@
   {
     "type": "function",
     "name": "assess_batch_search",
-    "description": "Assess robot-camera images during a broad scan.",
+    "description": "Find the target or select one visually grounded contextual clue from a camera sweep.",
     "parameters": {
       "type": "object",
       "properties": {
         "result": {
           "type": "string",
-          "description": "Use candidate when an object is visually clear or plausibly resembles the target. Using 'candidate' will proceeds to further verification, so it can be called with moderate uncertainty. If you suspect parts of the object is present in the image, call 'candidate'; not_found means totally absent",
+          "description": "found means the requested target is definitively visible; candidate means the target is absent but one specific contextual clue justifies investigating a place; not_found means neither the target nor any useful contextual clue is visible.",
           "enum": [
+            "found",
             "candidate",
             "not_found"
           ]
         },
         "confidence": {
           "type": "number",
-          "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+          "description": "Required only for candidate: confidence that the contextual clue is worth investigating.",
           "minimum": 0,
           "maximum": 1
         },
         "candidate_image": {
           "type": "string",
-          "description": "Best image containing the target among given images. Only use none for not_found",
+          "description": "For found, the image containing the target. For candidate, the image containing the contextual clue. Use none for not_found.",
           "enum": [
             "image_1",
             "image_2",
@@ -30,8 +31,8 @@
             "none"
           ]
         },
-        "candidate_position": {
-          "description": "The normalized position of the target within the candidate_image. THIS POINT MUST AT LEAST TOUCH THE OBJECT YOU ARE DETECTING. YOU MUST USE EXACTLY THESE KEYS: x, y. DO NOT USE arrays. Remember, this is the position relative to your chosen candidate image. [0;0] means top left corner. [1:1] means bottom right corner. 0.0<x<0.5 means to the left. 0.0<y<0.5 means to the top. Only use null for not_found",
+        "target_position": {
+          "description": "For found only, a normalized point touching the target in candidate_image, using exactly x and y. Use null for candidate and not_found.",
           "type": [
             "object",
             "null"
@@ -54,22 +55,16 @@
           ],
           "additionalProperties": false
         },
-        "evidence": {
-          "type": "string",
-          "description": "Brief visual evidence supporting the result and chosen image."
-        },
-        "scene_summary": {
-          "type": "string",
-          "description": "Brief summary of relevant objects and visibility conditions in the image set."
+        "contextual_clue": {
+          "type": ["string", "null"],
+          "description": "For candidate only, a concise description of the visible clue, where it is, and why moving toward it may reveal the target. Use null for found and not_found."
         }
       },
       "required": [
         "result",
-        "confidence",
         "candidate_image",
-        "candidate_position",
-        "evidence",
-        "scene_summary"
+        "target_position",
+        "contextual_clue"
       ],
       "additionalProperties": false
     }
@@ -77,28 +72,44 @@
   {
     "type": "function",
     "name": "assess_frame_search",
-    "description": "Verify whether the target is within the camera frame",
+    "description": "Find the target or identify one useful contextual clue in a single camera frame.",
     "parameters": {
       "type": "object",
       "properties": {
         "result": {
           "type": "string",
-          "description": "Use candidate when an object is visually clear or plausibly resembles the target. not_found means totally absent",
+          "description": "found means the requested target is definitively visible; candidate means the target is absent but a specific contextual clue is worth investigating; not_found means neither exists.",
           "enum": [
+            "found",
             "candidate",
             "not_found"
           ]
         },
         "confidence": {
           "type": "number",
-          "description": "Confidence in the selected result (candidate or not found), from 0 to 1.",
+          "description": "Required only for candidate: confidence that its contextual clue is worth investigating.",
           "minimum": 0,
           "maximum": 1
+        },
+        "target_position": {
+          "description": "For found only, a normalized point touching the target, using exactly x and y. Use null otherwise.",
+          "type": ["object", "null"],
+          "properties": {
+            "x": {"type": "number", "minimum": 0, "maximum": 1},
+            "y": {"type": "number", "minimum": 0, "maximum": 1}
+          },
+          "required": ["x", "y"],
+          "additionalProperties": false
+        },
+        "contextual_clue": {
+          "type": ["string", "null"],
+          "description": "For candidate only, a concise description of the visible clue, its direction, and why it may lead to the target. Use null otherwise."
         }
       },
       "required": [
         "result",
-        "confidence"
+        "target_position",
+        "contextual_clue"
       ],
       "additionalProperties": false
     }

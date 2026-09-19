@@ -40,7 +40,7 @@ from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
-from cognition.goal_executor import GoalExecutor
+from cognition.goal_executor import FindLoopConfig, GoalExecutor
 from cognition.state import robot_state,update_state
 from cognition.semantic_memory import SemanticMemory
 
@@ -55,6 +55,10 @@ zmq_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
 zmq_pub_socket = context.socket(zmq.PUB)
 zmq_pub_socket.connect("tcp://localhost:5557")
+map_overlay_socket = context.socket(zmq.PUSH)
+map_overlay_socket.setsockopt(zmq.SNDHWM, 8)
+map_overlay_socket.connect(os.environ.get("MAP_OVERLAY_ENDPOINT", "tcp://127.0.0.1:5560"))
+
 
 zmq_req_lock = asyncio.Lock()
 
@@ -431,6 +435,9 @@ async def main():
                 timeout=5.0,
             )
 
+    async def send_map_overlay(payload):
+        await map_overlay_socket.send_json(payload)
+
     headers = {
         "Authorization": "Bearer " + OPENAI_API_KEY,
         "OpenAI-Safety-Identifier": "hashed-user-id",
@@ -445,6 +452,7 @@ async def main():
                 ws=ws,
                 send_robot_command=send_robot_command,
                 camera=camera,
+                yolo=yolo,
             )
             track_action = TrackAction(
                 csrt_tracker=csrt_tracker,
@@ -453,12 +461,12 @@ async def main():
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
                 send_robot_command=send_robot_command,
-                search_action=search_action,
                 semantic_memory=semantic_memory,
             )
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
                 track_action=track_action,
+                search_action=search_action,
                 ws=ws,
                 camera=camera,
             )
@@ -477,7 +485,10 @@ async def main():
             move_camera_action = MoveCameraAction(
                 send_robot_command=send_robot_command
             )
-            navigate_action = NavigateAction(ws, camera, send_robot_command)
+            navigate_action = NavigateAction(
+                ws, camera, send_robot_command,
+                request_map_snapshot=send_map_overlay,
+            )
             goal_executor = GoalExecutor(
                 move_action=move_action,
                 search_action=search_action,
@@ -485,7 +496,9 @@ async def main():
                 approach_action=approach_action,
                 move_camera_action=move_camera_action,
                 semantic_memory=semantic_memory,
-                astra_action=astra_action,
+                navigate_action=navigate_action,
+                send_map_overlay=send_map_overlay,
+                map_snapshot_provider=camera.map_snapshot,
             )
 
             cognitive_manager = CognitionManager(
@@ -596,6 +609,7 @@ async def main():
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await yolo.close()
+        map_overlay_socket.close(linger=0)
 
 if __name__ == "__main__":
     try:

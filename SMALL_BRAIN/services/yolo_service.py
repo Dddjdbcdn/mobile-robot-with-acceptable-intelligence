@@ -23,13 +23,90 @@ class YoloService():
         self.pose_model = YOLO(pose_model_path, task="pose")
 
         self.conf_threshold = 0.3
-        self.vision_mode = "dj"
         self.camera = camera
 
         self.detections = []
         self.inference_thread = threading.Thread(target=self.timer_callback, daemon=True)
         self.running = False
         self.fps = 10.0
+        self._active_event = threading.Event()
+        self._state_condition = threading.Condition()
+        self._owner_modes = {}
+        self._mode_revision = 0
+        self._inference_sequence = 0
+
+    @property
+    def active(self):
+        with self._state_condition:
+            return bool(self._owner_modes)
+
+    def _effective_mode_locked(self):
+        modes = set(self._owner_modes.values()) - {"none"}
+        if "both" in modes or {"dj", "pose"}.issubset(modes):
+            return "both"
+        if "pose" in modes:
+            return "pose"
+        if "dj" in modes:
+            return "dj"
+        return "none"
+
+    @property
+    def vision_mode(self):
+        with self._state_condition:
+            return self._effective_mode_locked()
+
+    @vision_mode.setter
+    def vision_mode(self, mode):
+        # Compatibility for older callers. Action code should use owner modes.
+        self.set_owner_mode("legacy", mode)
+
+    def activate(self, owner, mode="dj"):
+        """Enable inference for one action and return the current sequence."""
+        owner = str(owner)
+        if mode not in {"dj", "pose", "both", "none"}:
+            raise ValueError(f"Unknown YOLO mode: {mode}")
+        with self._state_condition:
+            self._owner_modes[owner] = mode
+            self._mode_revision += 1
+            self.detections = []
+            if self._effective_mode_locked() == "none":
+                self._active_event.clear()
+            else:
+                self._active_event.set()
+            return self._inference_sequence
+
+    def set_owner_mode(self, owner, mode):
+        return self.activate(owner, mode)
+
+    def deactivate(self, owner):
+        """Release one action's inference lease."""
+        with self._state_condition:
+            if self._owner_modes.pop(str(owner), None) is None:
+                return
+            self._mode_revision += 1
+            self.detections = []
+            if self._effective_mode_locked() == "none":
+                self._active_event.clear()
+            else:
+                self._active_event.set()
+            self._state_condition.notify_all()
+
+    def _wait_for_inference_after(self, sequence, timeout):
+        with self._state_condition:
+            return self._state_condition.wait_for(
+                lambda: (
+                    self._inference_sequence > sequence
+                    or not self._owner_modes
+                    or not self.running
+                ),
+                timeout=timeout,
+            ) and self._inference_sequence > sequence
+
+    async def wait_for_inference_after(self, sequence, timeout=2.0):
+        """Wait without blocking asyncio for one fresh accepted inference."""
+        return await asyncio.to_thread(
+            self._wait_for_inference_after, sequence, timeout
+        )
 
     def start_background(self):
         dummy_frame = np.zeros(
@@ -59,6 +136,13 @@ class YoloService():
 
     def timer_callback(self):
         while self.running:
+            if not self._active_event.wait(timeout=0.1):
+                continue
+            with self._state_condition:
+                mode = self._effective_mode_locked()
+                mode_revision = self._mode_revision
+            if mode == "none":
+                continue
             loop_start = time.perf_counter()
 
             latest = self.camera.latest
@@ -72,7 +156,7 @@ class YoloService():
 
             detections = []
 
-            if self.vision_mode in ("dj", "both"):
+            if mode in ("dj", "both"):
                 dj_results = self.DJ_custom_model.predict(
                     source=frame,
                     device="intel:gpu",
@@ -82,7 +166,7 @@ class YoloService():
                     self.parse_dj(dj_results[0])
                 )
 
-            if self.vision_mode in ("pose", "both"):
+            if mode in ("pose", "both"):
                 pose_results = self.pose_model.predict(
                     source=frame,
                     device="intel:gpu",
@@ -93,11 +177,16 @@ class YoloService():
                 )
 
             current = self.camera.latest
-            if (
-                current is not None
-                and current.source_generation == source_generation
-            ):
-                self.detections = detections
+            with self._state_condition:
+                if (
+                    current is not None
+                    and current.source_generation == source_generation
+                    and mode_revision == self._mode_revision
+                    and self._effective_mode_locked() != "none"
+                ):
+                    self.detections = detections
+                    self._inference_sequence += 1
+                    self._state_condition.notify_all()
 
             elapsed = time.perf_counter() - loop_start
             remaining = 1/self.fps - elapsed
@@ -107,6 +196,9 @@ class YoloService():
 
     async def close(self):
         self.running = False
+        self._active_event.set()
+        with self._state_condition:
+            self._state_condition.notify_all()
         await asyncio.to_thread(self.inference_thread.join, 2)
 
     def parse_dj(self, result):

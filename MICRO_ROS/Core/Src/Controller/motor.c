@@ -67,7 +67,6 @@ volatile float previous_servo_pan_angle = 95;
 volatile float previous_servo_tilt_angle = 90;
 
 void Servo_Tilt_Rotate() {
-    if (fabsf(servo_tilt_angle - previous_servo_tilt_angle) > 90.0) return;
     previous_servo_tilt_angle = servo_tilt_angle;
 
     float rad_angle = servo_tilt_angle*M_PI / 180.0;
@@ -79,7 +78,6 @@ void Servo_Tilt_Rotate() {
     }
 }
 void Servo_Pan_Rotate() {
-    if (fabsf(servo_pan_angle - previous_servo_pan_angle) > 90.0) return;
     previous_servo_pan_angle = servo_pan_angle;
 
     float rad_angle = servo_pan_angle*M_PI / 180.0;

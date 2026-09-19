@@ -65,7 +65,7 @@ def create_csrttracker():
 
     # Optimization and loss detection
     params.admm_iterations = 3
-    params.psr_threshold = 0.08
+    params.psr_threshold = 0.2
 
     # Segmentation
     params.histogram_bins = 16
@@ -111,6 +111,7 @@ class CSRTTrackingManager:
             self._thread.join(timeout=2.0)
 
     def begin_tracking(self, detection_sequence, initialization_frame, bbox_xywh, target):
+        self.tracking_update = None
         command = StartTrackingCommand(detection_sequence, initialization_frame.copy(), bbox_xywh, target)
         try: self._commands.get_nowait()
         except queue.Empty: pass

@@ -46,6 +46,7 @@ class AstraApproachAction:
         self._tracking_task = None
         self._tracking_future = None
         self._approach_future = None
+        self._yolo_owner = None
         self._last_depth_sample = None
         self._last_destination = None
 
@@ -95,28 +96,46 @@ class AstraApproachAction:
                 outcome="replaced_by_new_goal",
             )
 
-        snapshot = self.camera.snapshot()
-        if snapshot.source != "astra":
-            return self._failure(
-                action_id,
-                "track_action",
-                target,
-                "ASTRA_SOURCE_CHANGED",
-                "precondition_failed",
-            )
-        jpeg_bytes = await asyncio.to_thread(
-            self.camera.jpeg_bytes_snapshot,
-            70,
-            False,
-            "results/action_results/astra_track_snapshot.jpg",
-        )
+        if (
+            normalized_target in dj_yolo_classes
+            and hasattr(self.yolo, "activate")
+        ):
+            self._yolo_owner = f"astra-track:{action_id}"
+            sequence = self.yolo.activate(self._yolo_owner, "dj")
+            try:
+                await self.yolo.wait_for_inference_after(sequence)
+            except BaseException:
+                self.yolo.deactivate(self._yolo_owner)
+                self._yolo_owner = None
+                raise
 
-        tracking_bbox, detection_source, confidence = await self._detect_bbox(
-            normalized_target,
-            snapshot,
-            jpeg_bytes,
-            allow_grounding_dino,
-        )
+        try:
+            snapshot = self.camera.snapshot()
+            if snapshot.source != "astra":
+                return self._failure(
+                    action_id,
+                    "track_action",
+                    target,
+                    "ASTRA_SOURCE_CHANGED",
+                    "precondition_failed",
+                )
+            jpeg_bytes = await asyncio.to_thread(
+                self.camera.jpeg_bytes_snapshot,
+                70,
+                False,
+                "results/action_results/astra_track_snapshot.jpg",
+            )
+
+            tracking_bbox, detection_source, confidence = await self._detect_bbox(
+                normalized_target,
+                snapshot,
+                jpeg_bytes,
+                allow_grounding_dino,
+            )
+        finally:
+            if self._yolo_owner is not None:
+                self.yolo.deactivate(self._yolo_owner)
+                self._yolo_owner = None
         if tracking_bbox is None:
             return self._failure(
                 action_id,
@@ -207,8 +226,8 @@ class AstraApproachAction:
         if not allow_grounding_dino:
             return None, None, None
 
-        previous_mode = self.yolo.vision_mode
-        self.yolo.vision_mode = "none"
+        if self._yolo_owner is not None:
+            self.yolo.set_owner_mode(self._yolo_owner, "none")
         await asyncio.sleep(0.1)
         try:
             result = await self.grounding_dino.detect(
@@ -220,7 +239,8 @@ class AstraApproachAction:
                 output_root=Path("results/grounding_results"),
             )
         finally:
-            self.yolo.vision_mode = previous_mode
+            if self._yolo_owner is not None:
+                self.yolo.set_owner_mode(self._yolo_owner, "dj")
 
         detection = result.best
         if detection is None:

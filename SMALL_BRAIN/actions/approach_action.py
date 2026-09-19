@@ -12,6 +12,7 @@ from cognition.state import robot_state
 from utilities.database_functions import load_json
 
 from actions.track_action import normalize_human_target, normalize_object_target
+from actions.search_action import PAN_POSITION_ANGLE, TILT_POSITION_ANGLE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
@@ -29,12 +30,14 @@ class ApproachAction:
         self,
         send_robot_command,
         track_action,
+        search_action,
         ws=None,
         camera=None,
         max_verification_retries=1,
     ):
         self.send_robot_command = send_robot_command
         self.track_action = track_action
+        self.search_action = search_action
         self.ws = ws
         self.camera = camera
         self.max_verification_retries = max(0, int(max_verification_retries))
@@ -48,7 +51,9 @@ class ApproachAction:
         self._verification_retries = 0
         self._navigation_attempts = 0
         self._verification_history: list[dict] = []
+        self._reacquisition_history: list[dict] = []
         self._last_destination: dict | None = None
+        self._saved_target_location: dict | None = None
 
     async def start_approaching(self, target, action_id):
         if self.active:
@@ -115,7 +120,14 @@ class ApproachAction:
         self._verification_retries = 0
         self._navigation_attempts = 0
         self._verification_history = []
+        self._reacquisition_history = []
         self._last_destination = None
+        saved_location = getattr(
+            self.track_action, "last_stable_target_location", None
+        )
+        self._saved_target_location = (
+            dict(saved_location) if isinstance(saved_location, dict) else None
+        )
 
         accepted, message = await self._dispatch_navigation(destination)
         if not accepted:
@@ -224,6 +236,7 @@ class ApproachAction:
 
     async def _verify_navigation_result(self):
         try:
+            await self._reacquire_target_before_verification()
             assessment = await self._request_approach_verification()
             self._verification_history.append(dict(assessment))
             result = assessment["result"]
@@ -242,18 +255,11 @@ class ApproachAction:
                 and confidence >= VERIFICATION_CONFIDENCE_THRESHOLD
                 and self._verification_retries < self.max_verification_retries
             ):
-                if not self.track_action.active:
+                if not await self._ensure_tracking_for_retry():
                     self._complete_verification_required(
                         assessment, "TARGET_NOT_TRACKED_AFTER_NAVIGATION"
                     )
                     return
-                if not self.track_action.stable:
-                    stable = await self.track_action.wait_until_stable(timeout=5.0)
-                    if not stable:
-                        self._complete_verification_required(
-                            assessment, "TRACKING_STABILITY_TIMEOUT"
-                        )
-                        return
 
                 destination = self._current_destination()
                 if destination is None:
@@ -306,6 +312,117 @@ class ApproachAction:
         finally:
             if asyncio.current_task() is self._verification_task:
                 self._verification_task = None
+
+    async def _reacquire_target_before_verification(self):
+        """Stop motion-era tracking, then search saved bearing before a sweep."""
+        if self.track_action.active:
+            await self.track_action.stop_tracking(
+                reason_code="APPROACH_NAVIGATION_COMPLETE",
+                status="succeeded",
+                outcome="ready_for_post_approach_reacquisition",
+            )
+
+        focused = await self._aim_at_saved_target_location()
+        if focused:
+            result = await self._run_reacquisition_search(
+                phase="saved_location",
+                effort="center",
+                initial_view_only=True,
+            )
+            if result.status == "succeeded":
+                return True
+
+        result = await self._run_reacquisition_search(
+            phase="general_fallback",
+            effort="best_effort",
+            initial_view_only=False,
+        )
+        return result.status == "succeeded"
+
+    async def _aim_at_saved_target_location(self):
+        saved = self._saved_target_location
+        pose = robot_state.get("pose") or {}
+        if not isinstance(saved, dict):
+            return False
+
+        try:
+            delta_x = float(saved["map_x"]) - float(pose["x"])
+            delta_y = float(saved["map_y"]) - float(pose["y"])
+            yaw = float(pose["yaw"])
+            target_bearing = math.atan2(delta_y, delta_x)
+            relative_bearing = math.atan2(
+                math.sin(target_bearing - yaw),
+                math.cos(target_bearing - yaw),
+            )
+            target_pan = PAN_POSITION_ANGLE["center"] + math.degrees(
+                relative_bearing
+            )
+        except (KeyError, TypeError, ValueError):
+            try:
+                target_pan = float(saved["camera_pan_angle"])
+            except (KeyError, TypeError, ValueError):
+                return False
+
+        try:
+            target_tilt = float(saved["camera_tilt_angle"])
+        except (KeyError, TypeError, ValueError):
+            target_tilt = TILT_POSITION_ANGLE["center"]
+
+        target_pan = min(
+            PAN_POSITION_ANGLE["leftmost"],
+            max(PAN_POSITION_ANGLE["rightmost"], target_pan),
+        )
+        target_tilt = min(
+            TILT_POSITION_ANGLE["downmost"],
+            max(TILT_POSITION_ANGLE["upmost"], target_tilt),
+        )
+        camera_state = robot_state.get("camera") or {}
+        self.search_action.pan_angle = float(
+            camera_state.get("pan_angle", PAN_POSITION_ANGLE["center"])
+        )
+        self.search_action.tilt_angle = float(
+            camera_state.get("tilt_angle", TILT_POSITION_ANGLE["center"])
+        )
+        await self.search_action.move_camera_angles(target_pan, target_tilt)
+        return True
+
+    async def _run_reacquisition_search(
+        self, phase, effort, initial_view_only
+    ):
+        result = await self.search_action.start_searching(
+            target=self.target,
+            action_id=f"{self.action_id}:reacquire:{phase}",
+            effort=effort,
+            initial_view_only=initial_view_only,
+        )
+        if result.status == "running":
+            result = await self.search_action.wait_until_finished()
+        self._reacquisition_history.append({
+            "phase": phase,
+            "status": result.status,
+            "outcome": result.outcome,
+            "reason_code": result.reason_code,
+        })
+        return result
+
+    async def _ensure_tracking_for_retry(self):
+        normalized_target = (
+            normalize_human_target(self.target)
+            or normalize_object_target(self.target)
+        )
+        if (
+            not self.track_action.active
+            or self.track_action.target != normalized_target
+        ):
+            result = await self.track_action.start_tracking(
+                target=self.target,
+                action_id=f"{self.action_id}:retry-track",
+            )
+            if result.status not in {"running", "succeeded"}:
+                return False
+        if self.track_action.stable:
+            return True
+        return await self.track_action.wait_until_stable(timeout=5.0)
 
     async def _request_approach_verification(self):
         if self.ws is None or self.camera is None or ASSESS_APPROACH_VERIFICATION_TOOL is None:
@@ -411,6 +528,8 @@ class ApproachAction:
             "verified": verified,
             "verification": dict(assessment),
             "verification_history": list(self._verification_history),
+            "reacquisition_history": list(self._reacquisition_history),
+            "saved_target_location": dict(self._saved_target_location or {}),
             "navigation_attempts": self._navigation_attempts,
             "automatic_retries": self._verification_retries,
             "destination": dict(self._last_destination or {}),

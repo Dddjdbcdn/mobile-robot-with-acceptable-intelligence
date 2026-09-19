@@ -170,7 +170,9 @@ class CognitionManager:
             task.cancel()
 
     async def shutdown(self):
-        if self.navigate_action is not None and self.navigate_action.active:
+        if self.goal_executor.active:
+            await self.goal_executor.stop("SHUTDOWN")
+        elif self.navigate_action is not None and self.navigate_action.active:
             await self.navigate_action.stop("SHUTDOWN")
         autonomy_task = self._autonomy_task
         if autonomy_task is not None and not autonomy_task.done():
@@ -251,8 +253,7 @@ class CognitionManager:
             return await self._enter_idle_mode(request.action_id)
 
         # Navigation owns motion and the camera throughout selection and travel.
-        motion_tools = {"navigate_action", "move_camera", "find_target",
-                        "watch_target", "approach_target"}
+        motion_tools = {"navigate_action", "move_camera", "find_object"}
         if (self.navigate_action is not None and self.navigate_action.active
                 and name in motion_tools):
             return ActionResult(request.action_id, name, "failed",
@@ -267,23 +268,17 @@ class CognitionManager:
                                     reason_code="ROBOT_BUSY", retryable=True)
             return await self.navigate_action.start(args.get("query"), request.action_id)
 
-        semantic_goals = {
-            "find_target": "search",
-            "watch_target": "track",
-            "approach_target": "approach",
-        }
-        if name in semantic_goals:
+        if name == "find_object":
             return await self.goal_executor.start(
-                goal=semantic_goals[name],
+                goal="find_object",
                 target=args.get("target"),
-                direction=args.get("direction"),
-                camera_region=args.get("camera_region"),
-                user_confirms_visible=args.get(
-                    "user_confirms_visible", False
-                ),
-                effort=args.get("effort", "center"),
                 action_id=request.action_id,
             )
+
+        if name == "watch_target":
+            return await self.track_action.start_tracking(
+                target=args.get("target"),
+                action_id=request.action_id)
 
         if name == "move_camera":
             camera_owner = None
@@ -507,9 +502,7 @@ class CognitionManager:
         if result.status == "running":
             action = {
                 "navigate_action": self.navigate_action,
-                "find_target": self.goal_executor,
-                "watch_target": self.goal_executor,
-                "approach_target": self.goal_executor,
+                "find_object": self.goal_executor,
             }.get(event.request.function_name)
 
             # Capture this run's future before another navigation can start.
@@ -564,48 +557,18 @@ class CognitionManager:
         self.action_results.append(result)
         self._last_activity_at = time.monotonic()
 
-        active_tracker = self._active_tracking_action()
-        if (
-            isinstance(result, ActionResult)
-            and result.action_type == "watch_target"
-            and result.status == "succeeded"
-            and active_tracker is not None
-        ):
-            async def wait_for_tracking_end():
-                try:
-                    if active_tracker is self.astra_action:
-                        tracking_result = (
-                            await active_tracker.wait_until_tracking_finished()
-                        )
-                    else:
-                        tracking_result = await active_tracker.wait_until_finished()
-                    tracking_event = ActionLifecycleFinished(
-                        event.request, result=tracking_result
-                    )
-                except BaseException as error:
-                    tracking_event = ActionLifecycleFinished(
-                        event.request, error=error
-                    )
-                await self.events.put(tracking_event)
-
-            asyncio.create_task(
-                wait_for_tracking_end(),
-                name=f"watch-finish-{event.request.action_id}",
-            )
-
         should_respond = not self._settled
         decision_instruction = None
         if autonomous_person_seek:
             person_found = (
                 isinstance(result, ActionResult)
-                and result.action_type == "watch_target"
+                and result.action_type == "find_object"
                 and result.status == "succeeded"
-                and active_tracker is not None
             )
             if person_found:
                 decision_instruction = (
                     "DJ autonomously chose to look for a person and has now found "
-                    "one and started tracking them. Greet the visible person once, "
+                    "one and approached them. Greet the visible person once, "
                     "briefly and naturally, in first person. Do not say the user "
                     "asked DJ to look, and do not call another tool."
                 )
@@ -686,8 +649,15 @@ class CognitionManager:
         step_result = data.get("step_result")
         if isinstance(step_result, dict):
             step_data = step_result.get("data")
-            if isinstance(step_data, dict) and step_data.get("message"):
-                compact["message"] = step_data["message"]
+            if isinstance(step_data, dict):
+                if step_data.get("message"):
+                    compact["message"] = step_data["message"]
+                if step_data.get("error"):
+                    compact["error"] = step_data["error"]
+                if step_data.get("error_type"):
+                    compact["error_type"] = step_data["error_type"]
+                if step_data.get("error_stage"):
+                    compact["error_stage"] = step_data["error_stage"]
             step_reason = step_result.get("reason_code")
             if step_reason and step_reason != result.reason_code:
                 compact["step_reason_code"] = step_reason
@@ -781,12 +751,17 @@ class CognitionManager:
             )
         if (
             isinstance(result, ActionResult)
-            and result.action_type == "find_target"
-            and result.status == "succeeded"
+            and result.action_type == "find_object"
         ):
+            if result.status != "succeeded":
+                return (
+                    "The autonomous object search ended without a verified approach. "
+                    "Report the reason and checked-space summary briefly. Do not retry "
+                    "unless the user supplies new information or explicitly asks."
+                )
             return (
-                "The target is found. Continue any requested watch or approach goal "
-                "without repeating the location hint."
+                "The robot found, tracked, approached, and verified the requested "
+                "object. Report completion briefly and do not call another tool."
             )
         return (
             "Continue the unresolved goal if needed; do not repeat the finished action."
@@ -1040,8 +1015,8 @@ class CognitionManager:
 
         action_id = f"autonomy-watch-person-{uuid.uuid4().hex}"
         request = ToolRequest(
-            function_name="watch_target",
-            arguments={"target": "person", "effort": "best_effort"},
+            function_name="find_object",
+            arguments={"target": "person"},
             call_id="",
             action_id=action_id,
             response_metadata={
@@ -1052,10 +1027,9 @@ class CognitionManager:
         )
         try:
             result = await self.goal_executor.start(
-                goal="track",
+                goal="find_object",
                 target="person",
                 action_id=action_id,
-                effort="best_effort",
             )
             if result.status == "running":
                 result = await asyncio.shield(

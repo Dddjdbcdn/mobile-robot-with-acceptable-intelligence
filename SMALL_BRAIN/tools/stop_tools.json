@@ -2,17 +2,7 @@
   {
     "type": "function",
     "name": "stop_goal",
-    "description": "Cancel an in-progress find_target or approach_target goal and stop the prerequisite currently executing.",
-    "parameters": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
-    "name": "stop_tracking",
-    "description": "Stop continuous tracking previously started by watch_target.",
+    "description": "Cancel the active find_object goal and its current search, navigation, tracking, or approach step.",
     "parameters": {
       "type": "object",
       "properties": {},
