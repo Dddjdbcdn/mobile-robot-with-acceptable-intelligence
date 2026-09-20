@@ -126,9 +126,9 @@ class Stm32SensorBridge(Node):
     # ULTRASONIC FUNCTIONS
     # ==========================================
     def listener_callback(self, msg):
-        self.publish_ultrasonic_range(self.pub_left, msg.x, 'ultrasonic_left_link')
+        self.publish_vl53l1x_range(self.pub_left, msg.x, 'ultrasonic_left_link')
         self.publish_tof_range(self.pub_center, msg.y, 'camera_tof_link')
-        self.publish_ultrasonic_range(self.pub_right, msg.z, 'ultrasonic_right_link')
+        self.publish_vl53l1x_range(self.pub_right, msg.z, 'ultrasonic_right_link')
 
     def publish_vl53l1x_range(self, publisher, distance, frame_id):
         range_msg = Range()

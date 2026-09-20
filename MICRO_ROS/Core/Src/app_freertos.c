@@ -190,7 +190,6 @@ void Hardware_Task(void *argument)
     for(;;)
     {
         Read_IMU();
-        Read_Ultrasonics();
 
         if (tof_data_ready) {
             tof_data_ready = 0; 

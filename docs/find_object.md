@@ -18,23 +18,30 @@ websocket and image-encoding code.
    side views and reassess center plus those sides together. Left and right are
    60-degree pans from center, so all three views span a conservative 180 degrees.
    YOLO is checked after every settled camera move and still stops the scan early.
-3. Assessment returns `found` for a definitive target, `candidate` for one
-   useful contextual clue, or `not_found` when neither target nor clue exists.
-4. For `candidate`, search aims at the selected frame and navigation receives
-   only that JPEG, its clue, and the map. For `not_found`, discovery receives the
-   coverage-rendered map without camera JPEGs.
-5. At an investigative waypoint, center the camera and check YOLO. A left or
-   right pan is captured only when at least 50% of that direction's independent,
-   obstacle-clipped 60-degree fan remains uncovered within 2 meters.
-   Contextual investigation can continue while grounded clues remain.
-6. When the first side has no clues, turn the body 180 degrees and apply the same
-   forward-coverage test before deciding between a centered check and a sweep.
-7. When both local searches are exhausted, MapLogic deterministically ranks
-   unshaded local viewpoints and useful rotations, then light-blue viewpoints
-   scanned once. It sends exactly one selected pose to NavigateAction, so no
-   waypoint-selection model call is made. Only after known local space is
-   exhausted does it rank and select a frontier; all frontiers remain rendered
-   as debug markers.
+3. Assessment returns `found`, `not_found`, or one typed candidate: `visual`,
+   `local`, `destination`, or `speculative`. The type is required for a candidate;
+   numeric candidate confidence is not used.
+4. GoalExecutor owns actionable candidate hypotheses and movement budgets. The
+   first candidate type fixes the chain allowance: visual 0, local 2, and
+   destination 10. Speculative candidates are ignored and create no actionable
+   hypothesis, candidate navigation request, or retry. Their camera views still
+   contribute to ordinary coverage. A visual candidate first receives one
+   single-frame reassessment from the already-aimed camera. If it remains a
+   candidate, GoalExecutor attempts tracking with GroundingDINO enabled and enters
+   the normal approach pipeline only when acquisition succeeds. Failed acquisition
+   rejects the clue as not found; visual candidates never navigate to a context
+   pose. Later frames receive the hypothesis ID, original clue, type, and remaining
+   allowance, but no historical images.
+5. MapStream copies the hypothesis fields onto every sampled pose. Visual and
+   local candidates cannot expose a frontier; destination candidates may expose
+   an aligned long-ray or frontier pose. NavigateAction receives the map, the
+   latest clue JPEG, and concise structured hypothesis metadata.
+6. Exploration first ranks uncovered known-space viewpoints and useful rotations
+   with frontiers disabled. When those local views are exhausted, exploration may
+   select a frontier. A speculative result does not change this sequence.
+7. Coverage exploration sends exactly one deterministic pose to NavigateAction,
+   so no waypoint-selection model call is made. Context navigation uses the LLM
+   only to choose among poses already filtered by the candidate policy.
    Every arrival gets a centered-camera check. Any arrival, including a frontier,
    translation, or rotation, may add a sweep when the forward-coverage test passes.
 8. Once found, tracking tolerates brief glitches and attempts same-view detector
@@ -57,11 +64,12 @@ range. Areas covered by two or more captures are pale pink. Every capture
 contributes to coverage even though only one clue frame may be sent to navigation.
 Candidate generation does not reject previously visited coordinates.
 Context mode samples positions directly inside the selected clue cone and adds
-one reachable backward viewpoint. Exploration mode samples camera-covered,
-reachable map cells (plus the robot's current cell), points each candidate
-toward its best uncovered camera view, and chooses the candidate that exposes
-the most uncovered grid cells. It uses a frontier only when the covered known
-space has no remaining view.
+one reachable backward viewpoint. The sampled poses inherit candidate type,
+hypothesis ID, remaining budget, and frontier permission. Exploration mode
+samples camera-covered, reachable map cells (plus the robot's current cell),
+points each candidate toward its best uncovered camera view, and chooses the
+candidate that exposes the most uncovered grid cells. It uses a frontier only
+after local coverage is exhausted.
 
 GoalExecutor sends the complete coverage and route state to MapImageStream over
 the dedicated overlay socket. MapImageStream raycasts against the raw occupancy
@@ -78,26 +86,12 @@ also includes the memory records and waypoint count for logging.
 
 The defaults in `GoalExecutor` are:
 
-- 4 consecutive contextual waypoints per clue chain
-- 12 frontier iterations
-- 20 total search waypoints
+- Candidate movement allowances: visual 0, local 2, destination 10; speculative ignored
+- 10-waypoint global safety ceiling for any candidate chain
+- 20 exploration iterations
+- 50 total search waypoints
 - 600 seconds total search time
-- Pan left/right independently when 50% of that 60-degree, 2-meter fan is unshaded
-
-All find-loop controls can be tuned without editing code:
-
-| Environment variable | Default |
-| --- | ---: |
-| `FIND_MAX_CONTEXT_WAYPOINTS` | `4` |
-| `FIND_MAX_EXPLORATION_WAYPOINTS` | `12` |
-| `FIND_MAX_TOTAL_WAYPOINTS` | `20` |
-| `FIND_MAX_DURATION_SECONDS` | `600` |
-| `FIND_CAMERA_CENTER_PAN_DEG` | `95` |
-| `FIND_CAMERA_HORIZONTAL_FOV_DEG` | `60` |
-| `FIND_SWEEP_TRIGGER_FOV_DEG` | `180` |
-| `FIND_SWEEP_SIDE_OFFSET_DEG` | `60` |
-| `FIND_CAMERA_RELIABLE_RANGE_M` | `2` |
-| `FIND_SWEEP_UNCOVERED_FRACTION` | `0.50` |
+- 60-degree camera FOV and 2-meter reliable coverage range
 
 The sweep fraction counts uncovered known-free occupancy cells. Occupied cells
 terminate visibility rays; the renderer only projects the resulting coverage grid.

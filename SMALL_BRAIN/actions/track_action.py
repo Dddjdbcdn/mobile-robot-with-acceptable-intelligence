@@ -345,6 +345,61 @@ class TrackAction():
         snapshot,
         allow_grounding_dino=True,
     ):
+        detection = await self._detect_and_start_object_tracker(
+            target,
+            jpeg_bytes=jpeg_bytes,
+            snapshot=snapshot,
+            allow_grounding_dino=allow_grounding_dino,
+        )
+
+        if detection is None:
+            action_id = self.action_id
+            self.action_id = None
+            self.target = None
+            self._deactivate_yolo()
+            return ActionResult(
+                action_id=action_id,
+                action_type="track_action",
+                status="failed",
+                target=target,
+                outcome="target_not_detected",
+                reason_code="OBJECT_DETECTION_FAILED",
+                retryable=True,
+            )
+
+        detection_source, detection_confidence = detection
+
+        await self.send_robot_command({
+            "command": "track_action",
+            "action_id": self.action_id,
+        })
+
+        self.active = True
+        self.completion_future = asyncio.get_running_loop().create_future()
+        self._tracking_task = asyncio.create_task(self._object_tracking_loop())
+
+        return ActionResult(
+            action_id=self.action_id,
+            action_type="track_action",
+            status="running",
+            target=target,
+            outcome="tracking",
+            data={
+                "tracking_stable": False,
+                "detection_source": detection_source,
+                "detection_confidence": detection_confidence,
+            },
+        )
+
+    async def _detect_and_start_object_tracker(
+        self,
+        target,
+        *,
+        jpeg_bytes=None,
+        snapshot=None,
+        allow_grounding_dino=True,
+    ):
+        """Detect an object in the current view and initialize CSRT for it."""
         tracking_bbox = None
         detection_source = None
         detection_confidence = None
@@ -353,21 +408,34 @@ class TrackAction():
             matching = [
                 detection
                 for detection in self.yolo.detections
-                if detection["class"] == target
+                if detection.get("class") == target
             ]
             if matching:
-                detection = max(matching, key=lambda item: item["confidence"])
-                bbox = detection["bbox"]
-                tracking_bbox = (
-                    int(bbox["x1"]),
-                    int(bbox["y1"]),
-                    int(bbox["x2"] - bbox["x1"]),
-                    int(bbox["y2"] - bbox["y1"]),
+                detection = max(
+                    matching,
+                    key=lambda item: float(item.get("confidence") or 0.0),
                 )
-                detection_source = "yolo"
-                detection_confidence = detection["confidence"]
+                bbox = detection.get("bbox") or {}
+                try:
+                    tracking_bbox = (
+                        int(bbox["x1"]),
+                        int(bbox["y1"]),
+                        int(bbox["x2"] - bbox["x1"]),
+                        int(bbox["y2"] - bbox["y1"]),
+                    )
+                    detection_confidence = float(
+                        detection.get("confidence") or 1.0
+                    )
+                except (KeyError, TypeError, ValueError):
+                    tracking_bbox = None
+                else:
+                    detection_source = "yolo"
 
         if tracking_bbox is None and allow_grounding_dino:
+            if jpeg_bytes is None:
+                jpeg_bytes = await asyncio.to_thread(
+                    self.camera.jpeg_bytes_snapshot, 70, False
+                )
             self._set_yolo_mode("none")
             await asyncio.sleep(0.1)
             try:
@@ -395,21 +463,11 @@ class TrackAction():
                 detection_confidence = detection.score
 
         if tracking_bbox is None:
-            action_id = self.action_id
-            self.action_id = None
-            self.target = None
-            self._deactivate_yolo()
-            return ActionResult(
-                action_id=action_id,
-                action_type="track_action",
-                status="failed",
-                target=target,
-                outcome="target_not_detected",
-                reason_code="OBJECT_DETECTION_FAILED",
-                retryable=True,
-            )
+            return None
 
         self.detection_confidence = float(detection_confidence or 1.0)
+        if snapshot is None:
+            snapshot = self.camera.snapshot()
 
         self.csrt_tracker.begin_tracking(
             detection_sequence=snapshot.sequence,
@@ -418,27 +476,7 @@ class TrackAction():
             target=target,
         )
 
-        feedback = await self.send_robot_command({
-            "command": "track_action",
-            "action_id": self.action_id,
-        })
-
-        self.active = True
-        self.completion_future = asyncio.get_running_loop().create_future()
-        self._tracking_task = asyncio.create_task(self._object_tracking_loop())
-
-        return ActionResult(
-            action_id=self.action_id,
-            action_type="track_action",
-            status="running",
-            target=target,
-            outcome="tracking",
-            data={
-                "tracking_stable": False,
-                "detection_source": detection_source,
-                "detection_confidence": detection_confidence,
-            },
-        )
+        return detection_source, detection_confidence
 
     async def _object_tracking_loop(self):
         failure_frames = 0
@@ -479,7 +517,18 @@ class TrackAction():
                 if failure_frames >= self.OBJECT_FAILURE_GRACE_FRAMES:
                     # Keep the camera at its last tracked angle. Re-detect there and
                     # initialize a fresh CSRT instance instead of recentering/searching.
-                    if await self._reacquire_object_at_current_view():
+                    reacquired = False
+                    for _attempt in range(self.OBJECT_REACQUIRE_ATTEMPTS):
+                        detection = await self._detect_and_start_object_tracker(
+                            self.target,
+                            allow_grounding_dino=self._allow_grounding_dino,
+                        )
+                        await asyncio.sleep(self.OBJECT_REACQUIRE_DELAY_SECONDS)
+                        if detection is not None:
+                            reacquired = True
+                            break
+
+                    if reacquired:
                         failure_frames = 0
                     else:
                         await self.stop_tracking(
@@ -490,75 +539,6 @@ class TrackAction():
                         return
 
             await asyncio.sleep(0.05)
-
-    async def _reacquire_object_at_current_view(self) -> bool:
-        """Re-detect and restart CSRT without moving the camera to center."""
-        target = self.target
-        for _attempt in range(self.OBJECT_REACQUIRE_ATTEMPTS):
-            snapshot = self.camera.snapshot()
-            tracking_bbox = None
-            confidence = None
-
-            if target in dj_yolo_classes:
-                matches = [
-                    detection for detection in self.yolo.detections
-                    if detection.get("class") == target
-                ]
-                if matches:
-                    detection = max(
-                        matches,
-                        key=lambda item: float(item.get("confidence") or 0.0),
-                    )
-                    bbox = detection.get("bbox") or {}
-                    try:
-                        tracking_bbox = (
-                            int(bbox["x1"]),
-                            int(bbox["y1"]),
-                            int(bbox["x2"] - bbox["x1"]),
-                            int(bbox["y2"] - bbox["y1"]),
-                        )
-                        confidence = float(detection.get("confidence") or 1.0)
-                    except (KeyError, TypeError, ValueError):
-                        tracking_bbox = None
-
-            if tracking_bbox is None and self._allow_grounding_dino:
-                jpeg_bytes = await asyncio.to_thread(
-                    self.camera.jpeg_bytes_snapshot, 70, False
-                )
-                self._set_yolo_mode("none")
-                try:
-                    grounding_result = await self.grounding_dino.detect(
-                        image_source=jpeg_bytes,
-                        target=target,
-                        box_threshold=0.25,
-                        text_threshold=0.25,
-                        nms_threshold=0.80,
-                        output_root=Path("results/grounding_results"),
-                    )
-                finally:
-                    self._set_yolo_mode("dj")
-                detection = grounding_result.best
-                if detection is not None:
-                    x, y, width, height = detection.tracker_box_xywh
-                    tracking_bbox = (
-                        int(x / 2.0), int(y / 2.0),
-                        int(width / 2.0), int(height / 2.0),
-                    )
-                    confidence = float(detection.score)
-
-            if tracking_bbox is not None:
-                self.detection_confidence = float(confidence or 1.0)
-                self.csrt_tracker.begin_tracking(
-                    detection_sequence=snapshot.sequence,
-                    initialization_frame=snapshot.tracking_bgr,
-                    bbox_xywh=tracking_bbox,
-                    target=target,
-                )
-                await asyncio.sleep(self.OBJECT_REACQUIRE_DELAY_SECONDS)
-                return True
-
-            await asyncio.sleep(self.OBJECT_REACQUIRE_DELAY_SECONDS)
-        return False
 
     async def _remember_stable_target(self):
         if self._memory_recorded_for_session:
@@ -848,6 +828,7 @@ class TrackAction():
         reason_code="USER_REQUESTED",
         status="cancelled",
         outcome="tracking_stopped",
+        reset_camera=True,
     ):
         if not self.active:
             return
@@ -857,6 +838,7 @@ class TrackAction():
         await self.send_robot_command({
             "command": "stop_tracking",
             "action_id": self.action_id,
+            "reset_camera": reset_camera is not False,
         })
 
         result = self.complete_tracking(

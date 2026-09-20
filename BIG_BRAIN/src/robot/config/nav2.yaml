@@ -232,7 +232,7 @@ local_costmap:
           model_type: 0
       range_layer:
         plugin: "nav2_costmap_2d::RangeSensorLayer"
-        enabled: True
+        enabled: False
         topics: ["/ultrasonic/left","/ultrasonic/right"]
         clear_on_max_reading: true
         
@@ -330,7 +330,7 @@ global_costmap:
         inflation_radius: 0.3
       range_layer:
         plugin: "nav2_costmap_2d::RangeSensorLayer"
-        enabled: True
+        enabled: False
         topics: ["/ultrasonic/left","/ultrasonic/right"]
         clear_on_max_reading: true
 

@@ -1,0 +1,102 @@
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+from unittest.mock import call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from services.camera_stream import CameraStream
+
+
+class UsbCameraControlTests(unittest.TestCase):
+    def test_environment_values_are_parsed_and_manual_modes_are_inferred(self):
+        controls = CameraStream.usb_controls_from_env({
+            "USB_CAMERA_EXPOSURE_TIME_ABSOLUTE": "300",
+            "USB_CAMERA_WHITE_BALANCE_TEMPERATURE": "5000",
+            "USB_CAMERA_EXPOSURE_DYNAMIC_FRAMERATE": "true",
+            "USB_CAMERA_POWER_LINE_FREQUENCY": "60hz",
+            "USB_CAMERA_BACKLIGHT_COMPENSATION": "20",
+        })
+
+        self.assertEqual(controls, {
+            "exposure_time_absolute": 300,
+            "white_balance_temperature": 5000,
+            "exposure_dynamic_framerate": 1,
+            "power_line_frequency": 2,
+            "backlight_compensation": 20,
+            "auto_exposure": 1,
+            "white_balance_automatic": 0,
+        })
+
+    def test_explicit_automatic_modes_are_preserved(self):
+        controls = CameraStream.usb_controls_from_env({
+            "USB_CAMERA_AUTO_EXPOSURE": "auto",
+            "USB_CAMERA_WHITE_BALANCE_AUTOMATIC": "yes",
+        })
+
+        self.assertEqual(controls, {
+            "auto_exposure": 3,
+            "white_balance_automatic": 1,
+        })
+
+    def test_native_controls_are_applied_in_dependency_order(self):
+        stream = CameraStream.__new__(CameraStream)
+        stream.usb_device = "/dev/video7"
+        stream.usb_controls = {
+            "brightness": 0,
+            "exposure_time_absolute": 300,
+            "auto_exposure": 1,
+        }
+        stream.applied_usb_controls = {}
+
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch(
+            "services.camera_stream.shutil.which",
+            return_value="/usr/bin/v4l2-ctl",
+        ), patch(
+            "services.camera_stream.subprocess.run",
+            return_value=completed,
+        ) as run:
+            stream._apply_usb_controls()
+
+        self.assertEqual(run.call_args_list, [
+            call(
+                [
+                    "/usr/bin/v4l2-ctl", "-d", "/dev/video7",
+                    "--set-ctrl", "auto_exposure=1",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            ),
+            call(
+                [
+                    "/usr/bin/v4l2-ctl", "-d", "/dev/video7",
+                    "--set-ctrl", "exposure_time_absolute=300",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            ),
+            call(
+                [
+                    "/usr/bin/v4l2-ctl", "-d", "/dev/video7",
+                    "--set-ctrl", "brightness=0",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            ),
+        ])
+        self.assertEqual(stream.applied_usb_controls, {
+            "auto_exposure": 1,
+            "exposure_time_absolute": 300,
+            "brightness": 0,
+        })
+
+
+if __name__ == "__main__":
+    unittest.main()

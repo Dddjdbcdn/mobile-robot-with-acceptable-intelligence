@@ -1,9 +1,11 @@
 import threading
 import time
 import struct
+import os
+import shutil
+import subprocess
 import cv2
 import json
-import copy
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -29,10 +31,41 @@ class CameraSnapshot:
 class CameraStream:
     SOURCES = ("usb", "astra")
 
+    USB_CONTROL_ENV = {
+        "USB_CAMERA_BRIGHTNESS": "brightness",
+        "USB_CAMERA_CONTRAST": "contrast",
+        "USB_CAMERA_SATURATION": "saturation",
+        "USB_CAMERA_HUE": "hue",
+        "USB_CAMERA_GAMMA": "gamma",
+        "USB_CAMERA_SHARPNESS": "sharpness",
+        "USB_CAMERA_BACKLIGHT_COMPENSATION": "backlight_compensation",
+        "USB_CAMERA_AUTO_EXPOSURE": "auto_exposure",
+        "USB_CAMERA_EXPOSURE_TIME_ABSOLUTE": "exposure_time_absolute",
+        "USB_CAMERA_EXPOSURE_DYNAMIC_FRAMERATE": "exposure_dynamic_framerate",
+        "USB_CAMERA_WHITE_BALANCE_AUTOMATIC": "white_balance_automatic",
+        "USB_CAMERA_WHITE_BALANCE_TEMPERATURE": "white_balance_temperature",
+        "USB_CAMERA_POWER_LINE_FREQUENCY": "power_line_frequency",
+    }
+    USB_CONTROL_ORDER = (
+        "auto_exposure",
+        "exposure_dynamic_framerate",
+        "exposure_time_absolute",
+        "white_balance_automatic",
+        "white_balance_temperature",
+        "power_line_frequency",
+        "backlight_compensation",
+        "brightness",
+        "contrast",
+        "saturation",
+        "hue",
+        "gamma",
+        "sharpness",
+    )
+
     def __init__(self, camera_index=0, capture_width=1280, capture_height=720, 
                  tracking_width=640, tracking_height=360, history_frames=60, fps=30,
                  astra_endpoint="tcp://127.0.0.1:5558", initial_source="usb",
-                 map_endpoint="tcp://127.0.0.1:5559", map_save_path=None):
+                 usb_controls=None, usb_device=None):
         if initial_source not in self.SOURCES:
             raise ValueError(f"Unknown camera source: {initial_source}")
         self.camera_index = camera_index
@@ -42,14 +75,9 @@ class CameraStream:
         self.fps = fps
         self.current_fps = 0.0
         self.astra_endpoint = astra_endpoint
-        self.map_endpoint = map_endpoint
-        self.map_save_path = Path(map_save_path) if map_save_path else (
-            Path(__file__).resolve().parents[1] / "results" / "map" / "latest.jpg"
-        )
-        self.map_thread = None
-        self._map_latest = None
-        self._map_save_override = None
-        self._map_save_lock = threading.Lock()
+        self.usb_device = usb_device or f"/dev/video{camera_index}"
+        self.usb_controls = dict(usb_controls or {})
+        self.applied_usb_controls = {}
 
         self.condition = threading.Condition()
         self.stop_event = threading.Event()
@@ -70,6 +98,102 @@ class CameraStream:
         self._source_change_callbacks = []
         self._switch_lock = threading.Lock()
         self._zmq_context = zmq.Context()
+
+    @classmethod
+    def usb_controls_from_env(cls, environ=None):
+        """Read optional native UVC controls without changing driver defaults."""
+        environ = os.environ if environ is None else environ
+        controls = {}
+        for env_name, control_name in cls.USB_CONTROL_ENV.items():
+            raw_value = environ.get(env_name)
+            if raw_value is None or not str(raw_value).strip():
+                continue
+            controls[control_name] = cls._parse_usb_control(
+                control_name, raw_value
+            )
+
+        # These controls are inactive while their automatic mode is enabled.
+        if "exposure_time_absolute" in controls:
+            controls.setdefault("auto_exposure", 1)
+        if "white_balance_temperature" in controls:
+            controls.setdefault("white_balance_automatic", 0)
+        return controls
+
+    @staticmethod
+    def _parse_usb_control(name, value):
+        text = str(value).strip().lower()
+        aliases = {
+            "auto_exposure": {
+                "manual": 1,
+                "auto": 3,
+                "aperture_priority": 3,
+                "aperture-priority": 3,
+            },
+            "power_line_frequency": {
+                "disabled": 0,
+                "off": 0,
+                "50hz": 1,
+                "50_hz": 1,
+                "60hz": 2,
+                "60_hz": 2,
+            },
+        }
+        if name in aliases and text in aliases[name]:
+            return aliases[name][text]
+        if name in {
+            "exposure_dynamic_framerate", "white_balance_automatic"
+        }:
+            if text in {"1", "true", "yes", "on"}:
+                return 1
+            if text in {"0", "false", "no", "off"}:
+                return 0
+            raise ValueError(
+                f"{name} must be true/false, on/off, yes/no, or 1/0"
+            )
+        try:
+            return int(text)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid USB camera value for {name}: {value!r}"
+            ) from error
+
+    def _apply_usb_controls(self):
+        """Apply configured controls exactly by their V4L2 driver names."""
+        self.applied_usb_controls = {}
+        if not self.usb_controls:
+            return
+        executable = shutil.which("v4l2-ctl")
+        if executable is None:
+            raise RuntimeError(
+                "USB camera controls were configured but v4l2-ctl is unavailable"
+            )
+
+        unknown = set(self.usb_controls) - set(self.USB_CONTROL_ORDER)
+        if unknown:
+            raise ValueError(
+                "Unknown USB camera controls: " + ", ".join(sorted(unknown))
+            )
+        for name in self.USB_CONTROL_ORDER:
+            if name not in self.usb_controls:
+                continue
+            value = int(self.usb_controls[name])
+            completed = subprocess.run(
+                [
+                    executable,
+                    "-d", self.usb_device,
+                    "--set-ctrl", f"{name}={value}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(
+                    f"Failed to set USB camera {name}={value}: {detail}"
+                )
+            self.applied_usb_controls[name] = value
+        print(f"[USB camera controls: {self.applied_usb_controls}]")
 
     @property
     def source(self):
@@ -145,11 +269,6 @@ class CameraStream:
             daemon=True,
         )
         self.astra_thread.start()
-        self.map_thread = threading.Thread(
-            target=self._map_receive_loop, name="map-image-receiver", daemon=True
-        )
-        self.map_thread.start()
-
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
 
@@ -167,8 +286,6 @@ class CameraStream:
             self.thread.join(timeout=2.0)
         if self.astra_thread:
             self.astra_thread.join(timeout=2.0)
-        if self.map_thread:
-            self.map_thread.join(timeout=2.0)
         self._zmq_context.term()
 
     def _record_frame(self, source, frame):
@@ -219,6 +336,7 @@ class CameraStream:
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
             camera.set(cv2.CAP_PROP_FPS, self.fps)
+            self._apply_usb_controls()
 
             first_frame_received = False
 
@@ -433,46 +551,3 @@ class CameraStream:
                 lambda: (self.latest and self.latest.sequence > sequence) or self.stop_event.is_set(),
                 timeout=timeout
             )
-
-    def _map_receive_loop(self):
-        socket = self._zmq_context.socket(zmq.SUB)
-        socket.setsockopt(zmq.RCVHWM, 2)
-        socket.setsockopt(zmq.RCVTIMEO, 200)
-        socket.setsockopt(zmq.SUBSCRIBE, b"map/image")
-        socket.connect(self.map_endpoint)
-        last_saved = 0.0
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    parts = socket.recv_multipart()
-                except zmq.Again:
-                    continue
-                try:
-                    if len(parts) != 2 or parts[0] != b"map/image":
-                        raise ValueError("expected map/image topic and payload")
-                    metadata, jpeg = self._split_ros_image_payload(parts[1])
-                    if metadata.get("schema_version") != 1 or not isinstance(metadata.get("candidates"), list):
-                        raise ValueError("unsupported map metadata")
-                    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if frame is None or not jpeg.startswith(bytes.fromhex("ffd8")):
-                        raise ValueError("invalid map JPEG")
-                    now = time.monotonic()
-                    with self.condition:
-                        self._map_latest = dict(received_at=now, jpeg_bytes=jpeg,
-                                                image=frame, metadata=metadata)
-                except (KeyError, TypeError, ValueError, OSError, cv2.error) as error:
-                    print(f"[Invalid map stream or save error: {error}]")
-        finally:
-            socket.close(linger=0)
-
-    def map_snapshot(self, max_age=3.0):
-        """Return a matching image/candidate set, refusing a stopped stream."""
-        with self.condition:
-            if self._map_latest is None:
-                raise RuntimeError("No map image available; check BIG BRAIN map/costmap/pose")
-            age = time.monotonic() - self._map_latest["received_at"]
-            if age > max_age:
-                raise RuntimeError(f"Map image is stale ({age:.1f} seconds)")
-            return {**self._map_latest, "age_seconds": age,
-                    "image": self._map_latest["image"].copy(),
-                    "metadata": copy.deepcopy(self._map_latest["metadata"])}

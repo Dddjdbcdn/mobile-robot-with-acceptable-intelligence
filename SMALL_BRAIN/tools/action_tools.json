@@ -2,7 +2,7 @@
   {
     "type": "function",
     "name": "find_object",
-    "description": "Find, track, and approach a named object as one complete goal. A scan may return a definitive target, one contextual clue to investigate, or no clue; no-clue searches use accumulated camera coverage to discover unvisited space and frontiers. Call once and use stop_goal to cancel.",
+    "description": "Find, track, and approach a named object as one complete goal. After approaching, the robot performs a maximum-effort search and must reacquire stable tracking; otherwise it resumes finding. Call once and use stop_goal to cancel.",
     "parameters": {
       "type": "object",
       "properties": {

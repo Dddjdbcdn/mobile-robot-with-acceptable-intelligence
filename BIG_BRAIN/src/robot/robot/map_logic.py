@@ -13,6 +13,11 @@ class LogicConfig:
     cost_limit: int = 99
     clearance: float = 0.10
 
+    # ToF approach ray
+    approach_ray_radius_m: float = 0.15
+    approach_obstacle_min_cells: int = 3
+    approach_obstacle_standoff_m: float = 0.25
+
     # Local navigation samples
     sample_radius: float = 3.0
     sample_step: float = 0.5
@@ -135,6 +140,7 @@ class MapLogic:
             "frame_id": pose["frame_id"],
             "grid": grid,
             "costmap": costmap,
+            "costs": costs,
             "reachable": reachable,
             "frontiers": frontiers,
             "frontier_mask": frontier_mask,
@@ -144,6 +150,141 @@ class MapLogic:
             "current_room_mask": current_room_mask,
         }
 
+    def resolve_approach_destination(
+        self, prepared, pose, target_x, target_y
+    ):
+        """Return the first safe approach pose on an inflated target ray."""
+        grid = prepared["grid"]
+        reachable = prepared["reachable"]
+        target_x = float(target_x)
+        target_y = float(target_y)
+        target_distance = math.hypot(target_x, target_y)
+        if not math.isfinite(target_distance) or target_distance <= 0.0:
+            raise ValueError("approach target must be away from the robot")
+
+        obstacles = grid.data >= self.cfg.occupied
+        costs = prepared.get("costs")
+        if costs is None and prepared.get("costmap") is not None:
+            costs = self._costs_on_map(grid, prepared["costmap"])
+        if costs is not None:
+            obstacles |= (
+                np.asarray(costs) >= 253
+            )
+
+        # Keep only obstacle groups large enough to represent a real object.
+        minimum_cells = max(1, self.cfg.approach_obstacle_min_cells)
+        if minimum_cells > 1 and np.any(obstacles):
+            component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+                obstacles.astype(np.uint8), connectivity=8
+            )
+            keep = np.zeros(component_count, dtype=bool)
+            keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= minimum_cells
+            obstacles = keep[labels]
+
+        # Looking up this clearance along the center line is equivalent to
+        # casting a ray inflated by approach_ray_radius_m.
+        clearance = cv2.distanceTransform(
+            (~obstacles).astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
+
+        local_bearing = math.atan2(target_y, target_x)
+        map_yaw = self._angle(float(pose["yaw"]) + local_bearing)
+        sample_count = max(
+            1, int(math.ceil(target_distance / (grid.resolution / 2.0)))
+        )
+        distances = np.linspace(0.0, target_distance, sample_count + 1)[1:]
+        xs = float(pose["x"]) + distances * math.cos(map_yaw)
+        ys = float(pose["y"]) + distances * math.sin(map_yaw)
+        cols, rows = grid.cells(xs, ys)
+        inside = grid.inside(cols, rows)
+
+        hit_distance = None
+        valid = np.flatnonzero(inside)
+        if valid.size:
+            ray_clearance = clearance[
+                np.asarray(rows[valid], dtype=int),
+                np.asarray(cols[valid], dtype=int),
+            ]
+            hits = valid[
+                ray_clearance <= self.cfg.approach_ray_radius_m
+            ]
+            if hits.size:
+                hit_distance = float(distances[int(hits[0])])
+
+        if hit_distance is None:
+            distance_limit = target_distance
+            resolution = "standoff_from_target"
+        else:
+            distance_limit = hit_distance
+            resolution = "standoff_from_obstacle"
+
+        resolved_distance = max(
+            0.0,
+            distance_limit - self.cfg.approach_obstacle_standoff_m,
+        )
+
+        destination_x = (
+            float(pose["x"]) + resolved_distance * math.cos(map_yaw)
+        )
+        destination_y = (
+            float(pose["y"]) + resolved_distance * math.sin(map_yaw)
+        )
+
+        # If the desired cell is unreachable, walk backward toward the robot.
+        # Geometric samples stay on the ray instead of shifting sideways.
+        col, row = (int(value) for value in grid.cells(
+            destination_x, destination_y
+        ))
+        moved_to_reachable = not (
+            grid.inside(col, row) and reachable[row, col]
+        )
+        if moved_to_reachable:
+            fallback_count = max(
+                1, int(math.ceil(resolved_distance / (grid.resolution / 2.0)))
+            )
+            fallback_distances = np.linspace(
+                resolved_distance, 0.0, fallback_count + 1
+            )
+            fallback_x = (
+                float(pose["x"])
+                + fallback_distances * math.cos(map_yaw)
+            )
+            fallback_y = (
+                float(pose["y"])
+                + fallback_distances * math.sin(map_yaw)
+            )
+            fallback_cols, fallback_rows = grid.cells(fallback_x, fallback_y)
+            valid = np.flatnonzero(
+                grid.inside(fallback_cols, fallback_rows)
+            )
+            if valid.size:
+                valid = valid[reachable[
+                    fallback_rows[valid], fallback_cols[valid]
+                ]]
+            if not valid.size:
+                raise ValueError("no reachable approach pose on target ray")
+
+            resolved_distance = float(fallback_distances[int(valid[0])])
+            destination_x = (
+                float(pose["x"]) + resolved_distance * math.cos(map_yaw)
+            )
+            destination_y = (
+                float(pose["y"]) + resolved_distance * math.sin(map_yaw)
+            )
+
+        goal_yaw = map_yaw
+        return {
+            "x": float(destination_x),
+            "y": float(destination_y),
+            "angle": float(goal_yaw),
+            "frame_id": str(prepared.get("frame_id") or pose["frame_id"]),
+            "resolution": resolution,
+            "was_clamped": hit_distance is not None,
+            "moved_to_reachable": moved_to_reachable,
+            "target_distance_m": float(target_distance),
+            "obstacle_distance_m": hit_distance,
+            "resolved_distance_m": float(resolved_distance),
+        }
 
     def live_camera_fov(self, pose, camera_pan_angle):
         if camera_pan_angle is None:
@@ -273,6 +414,21 @@ class MapLogic:
             return []
 
         grid, reachable = prepared["grid"], prepared["reachable"]
+        observation_payload = overlay.get("observation") or {}
+        candidate_attributes = {
+            key: observation_payload.get(key)
+            for key in (
+                "candidate_type", "hypothesis_id", "original_candidate_type",
+                "original_contextual_clue", "movement_limit", "movements_used",
+                "remaining_waypoints", "reassessment_limit",
+                "reassessments_used", "allow_frontier",
+            )
+            if observation_payload.get(key) is not None
+        }
+        allow_frontier = bool(
+            overlay.get("allow_frontier", True)
+            and observation_payload.get("allow_frontier", True)
+        )
         origin = observation["pose"]
         center = observation["center_yaw_rad"]
         half_fov = math.radians(observation["horizontal_fov_deg"] / 2.0)
@@ -310,6 +466,7 @@ class MapLogic:
                     "yaw": math.atan2(target[1] - y, target[0] - x),
                     "selection_reason": "inside_observation_fov",
                 }, pose)
+                candidate.update(candidate_attributes)
                 candidates.append(candidate)
                 used_cells.add(cell)
 
@@ -324,23 +481,25 @@ class MapLogic:
         farthest = self._furthest_reachable_on_ray(
             grid, reachable, origin, center
         )
-        if farthest is not None:
+        if farthest is not None and allow_frontier:
             x, y, cell = farthest
 
             if math.hypot(x - origin["x"], y - origin["y"]) >= observation["max_range_m"]:
-                candidates.append(self._describe({
+                far_candidate = self._describe({
                     "id": "CF",
                     "kind": "context",
                     "x": x,
                     "y": y,
                     "yaw": float(center),
                     "selection_reason": "furthest_reachable_on_center_ray",
-                }, pose))
+                }, pose)
+                far_candidate.update(candidate_attributes)
+                candidates.append(far_candidate)
 
         # A frontier remains relevant when it is farther away than the camera's
         # reliable range. Context mode therefore filters frontiers by the
         # observation's angular cone, rather than by max_range.
-        for frontier in prepared.get("frontiers", []):
+        for frontier in prepared.get("frontiers", []) if allow_frontier else []:
             dx = float(frontier["x"]) - origin["x"]
             dy = float(frontier["y"]) - origin["y"]
             if math.hypot(dx, dy) <= 1e-9:
@@ -354,9 +513,10 @@ class MapLogic:
             # by definition and that erosion would remove most valid goals.
             candidate = self._describe(dict(frontier), pose)
             candidate["selection_reason"] = "frontier_inside_observation_fov"
+            candidate.update(candidate_attributes)
             candidates.append(candidate)
 
-        back_distance = cfg.context_backup_distance_m,
+        back_distance = self.cfg.context_backup_distance_m
 
         x = pose["x"] - back_distance * math.cos(center)
         y = pose["y"] - back_distance * math.sin(center)
@@ -369,6 +529,7 @@ class MapLogic:
                 "yaw": math.atan2(target[1] - y, target[0] - x),
                 "selection_reason": "reverse_for_wider_view",
             }, pose)
+            backup.update(candidate_attributes)
             candidates.append(backup)
         return candidates
 
@@ -410,6 +571,9 @@ class MapLogic:
             return max(candidates, key=lambda item: (
                 item["uncovered_cell_count"], -item["distance_m"]
             ))
+
+        if not bool(overlay.get("allow_frontier", True)):
+            return None
 
         frontiers = [
             self._describe(dict(item), pose)

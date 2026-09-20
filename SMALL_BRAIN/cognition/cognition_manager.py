@@ -46,7 +46,6 @@ class CognitionManager:
     OOB_TOOLS = {
         "assess_frame_search",
         "assess_batch_search",
-        "assess_approach_verification",
         "select_navigation_pose",
     }
     STOP_TOOLS = {
@@ -69,7 +68,7 @@ class CognitionManager:
         response_manager,
         astra_action=None,
         idle_prompt_seconds=6000.0,
-        boot_observation_delay=1000.0,
+        boot_observation_delay=3.0,
         long_idle_person_seek_seconds=12000.0,
         proximity_cooldown=8.0,
         navigate_action=None,
@@ -459,12 +458,6 @@ class CognitionManager:
                 request.arguments,
                 request.response_metadata,
             )
-        elif request.function_name == "assess_approach_verification":
-            assessment = self.approach_action.assess_approach_verification(
-                request.arguments,
-                request.response_metadata,
-            )
-
         asyncio.create_task(assessment, name=request.function_name)
 
     async def handle_action_executed(self, event):
@@ -755,13 +748,15 @@ class CognitionManager:
         ):
             if result.status != "succeeded":
                 return (
-                    "The autonomous object search ended without a verified approach. "
+                    "The autonomous object search ended without stable post-approach "
+                    "reacquisition. "
                     "Report the reason and checked-space summary briefly. Do not retry "
                     "unless the user supplies new information or explicitly asks."
                 )
             return (
-                "The robot found, tracked, approached, and verified the requested "
-                "object. Report completion briefly and do not call another tool."
+                "The robot found and approached the requested object, then reacquired "
+                "stable tracking at the destination. Report completion briefly and do "
+                "not call another tool."
             )
         return (
             "Continue the unresolved goal if needed; do not repeat the finished action."

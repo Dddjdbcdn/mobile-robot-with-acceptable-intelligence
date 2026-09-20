@@ -31,6 +31,7 @@ from actions.navigate_action import NavigateAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream
+from services.map_client import MapClient
 from services.response_manager import ResponseManager
 
 from services.groundingdino_service import GroundingDINOService
@@ -55,9 +56,6 @@ zmq_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
 zmq_pub_socket = context.socket(zmq.PUB)
 zmq_pub_socket.connect("tcp://localhost:5557")
-map_overlay_socket = context.socket(zmq.PUSH)
-map_overlay_socket.setsockopt(zmq.SNDHWM, 8)
-map_overlay_socket.connect(os.environ.get("MAP_OVERLAY_ENDPOINT", "tcp://127.0.0.1:5560"))
 
 
 zmq_req_lock = asyncio.Lock()
@@ -378,6 +376,13 @@ async def main():
     app = AudioApp()
     print("\n✅ AUDIO IS READY")
 
+    map_client = MapClient(
+        context,
+        endpoint=os.environ.get(
+            "MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"
+        ),
+    )
+
     camera = CameraStream(
             camera_index=0,
             capture_width=1280,
@@ -387,9 +392,8 @@ async def main():
             history_frames=60,
             fps=30,
             astra_endpoint="tcp://127.0.0.1:5558",
-            map_endpoint=os.environ.get("MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"),
-            map_save_path=os.environ.get("MAP_SNAPSHOT_PATH"),
             initial_source=os.environ.get("CAMERA_SOURCE", "usb").lower(),
+            usb_controls=CameraStream.usb_controls_from_env(),
         )
     camera.start()
     print("\n✅ CAMERA IS READY")
@@ -436,7 +440,7 @@ async def main():
             )
 
     async def send_map_overlay(payload):
-        await map_overlay_socket.send_json(payload)
+        return await map_client.command(payload)
 
     headers = {
         "Authorization": "Bearer " + OPENAI_API_KEY,
@@ -466,9 +470,6 @@ async def main():
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
                 track_action=track_action,
-                search_action=search_action,
-                ws=ws,
-                camera=camera,
             )
             astra_action = AstraApproachAction(
                 csrt_tracker=csrt_tracker,
@@ -487,7 +488,7 @@ async def main():
             )
             navigate_action = NavigateAction(
                 ws, camera, send_robot_command,
-                request_map_snapshot=send_map_overlay,
+                request_map_snapshot=map_client.request_snapshot,
             )
             goal_executor = GoalExecutor(
                 move_action=move_action,
@@ -498,7 +499,6 @@ async def main():
                 semantic_memory=semantic_memory,
                 navigate_action=navigate_action,
                 send_map_overlay=send_map_overlay,
-                map_snapshot_provider=camera.map_snapshot,
             )
 
             cognitive_manager = CognitionManager(
@@ -609,7 +609,7 @@ async def main():
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await yolo.close()
-        map_overlay_socket.close(linger=0)
+        map_client.close()
 
 if __name__ == "__main__":
     try:

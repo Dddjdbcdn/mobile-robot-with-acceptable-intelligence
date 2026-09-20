@@ -8,18 +8,17 @@
       "properties": {
         "result": {
           "type": "string",
-          "description": "found means the requested target is definitively visible; candidate means the target is absent but one specific contextual clue justifies investigating a place; not_found means neither the target nor any useful contextual clue is visible.",
+          "description": "found means the requested target is definitively visible; candidate means one specific but not yet definitive piece of evidence is visible; not_found means neither the target nor useful evidence is visible.",
           "enum": [
             "found",
             "candidate",
             "not_found"
           ]
         },
-        "confidence": {
-          "type": "number",
-          "description": "Required only for candidate: confidence that the contextual clue is worth investigating.",
-          "minimum": 0,
-          "maximum": 1
+        "candidate_type": {
+          "description": "For candidate only: visual means an object closely matches the target visually, or a target-specific part is visible, but the target cannot yet be confirmed. local means specific target-linked evidence is visible nearby, and a short movement may reveal the target; generic containers or ordinary nearby objects are not local evidence. destination means a recognized or mapped place or route has a strong semantic relationship to the target, such as a recognized kitchen when searching for a fridge; an unidentified hallway alone is not a destination. speculative means only a generic possibility with no target-specific evidence. Speculative clues are stored while the robot explores unseen local space first. Use visual, local, or destination only when the visible evidence closely supports that definition; otherwise use speculative. Use null for found and not_found.",
+          "type": ["string", "null"],
+          "enum": ["visual", "local", "destination", "speculative", null]
         },
         "candidate_image": {
           "type": "string",
@@ -62,6 +61,7 @@
       },
       "required": [
         "result",
+        "candidate_type",
         "candidate_image",
         "target_position",
         "contextual_clue"
@@ -78,18 +78,17 @@
       "properties": {
         "result": {
           "type": "string",
-          "description": "found means the requested target is definitively visible; candidate means the target is absent but a specific contextual clue is worth investigating; not_found means neither exists.",
+          "description": "found means the requested target is definitively visible; candidate means one specific but not yet definitive piece of evidence is visible; not_found means neither exists.",
           "enum": [
             "found",
             "candidate",
             "not_found"
           ]
         },
-        "confidence": {
-          "type": "number",
-          "description": "Required only for candidate: confidence that its contextual clue is worth investigating.",
-          "minimum": 0,
-          "maximum": 1
+        "candidate_type": {
+          "description": "For candidate only: visual means an object closely matches the target visually, or a target-specific part is visible, but the target cannot yet be confirmed. local means specific target-linked evidence is visible nearby, and a short movement may reveal the target; generic containers or ordinary nearby objects are not local evidence. destination means a recognized or mapped place or route has a strong semantic relationship to the target, such as a recognized kitchen when searching for a fridge; an unidentified hallway alone is not a destination. speculative means only a generic possibility with no target-specific evidence. Speculative clues are stored while the robot explores unseen local space first. Use visual, local, or destination only when the visible evidence closely supports that definition; otherwise use speculative. Use null for found and not_found.",
+          "type": ["string", "null"],
+          "enum": ["visual", "local", "destination", "speculative", null]
         },
         "target_position": {
           "description": "For found only, a normalized point touching the target, using exactly x and y. Use null otherwise.",
@@ -103,64 +102,14 @@
         },
         "contextual_clue": {
           "type": ["string", "null"],
-          "description": "For candidate only, a concise description of the visible clue, its direction, and why it may lead to the target. Use null otherwise."
+          "description": "For candidate only, concisely describe the visible evidence, its direction, and the target-specific reason for its category. Use null otherwise."
         }
       },
       "required": [
         "result",
+        "candidate_type",
         "target_position",
         "contextual_clue"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
-    "name": "assess_approach_verification",
-    "description": "Verify from a fresh robot-camera frame whether an approach goal actually reached its target.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "result": {
-          "type": "string",
-          "enum": [
-            "reached",
-            "too_far",
-            "uncertain"
-          ],
-          "description": "Use reached only when the target is visibly present and clearly near the robot. Use too_far only when the target is identifiable and visibly still too far away. Use uncertain when visibility, perspective, or occlusion prevents a reliable judgment."
-        },
-        "confidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Confidence in the result from 0 to 1."
-        },
-        "target_visible": {
-          "type": "boolean",
-          "description": "Whether the requested target is identifiable in the frame."
-        },
-        "occlusion": {
-          "type": "string",
-          "enum": [
-            "clear",
-            "partial",
-            "heavy",
-            "not_visible"
-          ],
-          "description": "How much the target is occluded."
-        },
-        "evidence": {
-          "type": "string",
-          "description": "Brief visual evidence for the distance and occlusion judgment."
-        }
-      },
-      "required": [
-        "result",
-        "confidence",
-        "target_visible",
-        "occlusion",
-        "evidence"
       ],
       "additionalProperties": false
     }

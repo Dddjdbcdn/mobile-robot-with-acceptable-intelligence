@@ -471,7 +471,7 @@ class LLMRosBridge(Node):
         self.sub_socket.close(linger=0)
 
         self.zmq_context.term()
-        
+
     def listen_for_llm(self):
         while rclpy.ok():
             try:
@@ -532,25 +532,67 @@ class LLMRosBridge(Node):
 
                     self.publish_cmd(0.0, 0.0)
 
-                    self.servo.delta_pan_angle = self.servo.reset_pan_angle - self.servo.pan_angle
-                    self.servo.delta_tilt_angle = self.servo.reset_tilt_angle - self.servo.tilt_angle
+                    reset_camera = request.get("reset_camera", True) is not False
+                    if reset_camera:
+                        self.servo.delta_pan_angle = (
+                            self.servo.reset_pan_angle - self.servo.pan_angle
+                        )
+                        self.servo.delta_tilt_angle = (
+                            self.servo.reset_tilt_angle - self.servo.tilt_angle
+                        )
 
-                    self.servo.publish_servo_command(tracking=False)
+                        self.servo.publish_servo_command(tracking=False)
 
-                    self.rep_socket.send_json({"status": "accepted", "message": "Object tracking is stopped"})
+                    self.rep_socket.send_json({
+                        "status": "accepted",
+                        "message": "Object tracking is stopped",
+                        "camera_reset": reset_camera,
+                    })
 
-                elif cmd == "navigate_to_pose":
+                elif cmd in {"navigate_to_pose", "navigate_to_approach"}:
                     self.stop_all_motion()
-
-                    self.navigation_active = True
-                    self.current_nav_action_id = request.get("action_id")
 
                     x = float(request.get("x", 0.0))
                     y = float(request.get("y", 0.0))
                     angle = float(request.get("angle", 0.0))
+                    frame_id = str(request.get("frame_id", "base_footprint"))
+                    destination = None
+
+                    if cmd == "navigate_to_approach":
+                        with self.map_image_stream.state_lock:
+                            prepared = self.map_image_stream.prepared
+                        if prepared is None:
+                            self.rep_socket.send_json({
+                                "status": "error", "message": "Map is not ready"
+                            })
+                            continue
+                        map_frame = str(prepared.get("frame_id") or "map")
+                        pose = self.map_image_stream._pose(map_frame)
+                        if pose is None:
+                            self.rep_socket.send_json({
+                                "status": "error",
+                                "message": f"TF unavailable: {map_frame} -> base_footprint",
+                            })
+                            continue
+                        try:
+                            destination = self.map_image_stream.logic.resolve_approach_destination(
+                                prepared, pose, x, y
+                            )
+                        except (KeyError, TypeError, ValueError) as error:
+                            self.rep_socket.send_json({
+                                "status": "error", "message": str(error)
+                            })
+                            continue
+                        x = destination["x"]
+                        y = destination["y"]
+                        angle = destination["angle"]
+                        frame_id = destination["frame_id"]
+
+                    self.navigation_active = True
+                    self.current_nav_action_id = request.get("action_id")
 
                     pose_in = PoseStamped()
-                    pose_in.header.frame_id = str(request.get("frame_id", "base_footprint"))
+                    pose_in.header.frame_id = frame_id
                     # A zero stamp requests the latest complete TF chain. SLAM's
                     # map->odom transform can legitimately lag wall time.
                     pose_in.header.stamp = rclpy.time.Time().to_msg()
@@ -587,7 +629,13 @@ class LLMRosBridge(Node):
                     send_goal_future = self.nav_client.send_goal_async(goal)
                     send_goal_future.add_done_callback(self.nav_goal_response_cb)
 
-                    self.rep_socket.send_json({"status": "accepted", "message": "Nav2 Goal Dispatched"})
+                    response = {
+                        "status": "accepted",
+                        "message": "Nav2 Goal Dispatched",
+                    }
+                    if destination is not None:
+                        response["destination"] = destination
+                    self.rep_socket.send_json(response)
                 
                 elif cmd == "stop_moving":
                     self.stop_all_motion()

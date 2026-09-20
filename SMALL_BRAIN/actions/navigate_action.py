@@ -10,6 +10,7 @@ import traceback
 import uuid
 
 import cv2
+import zmq
 
 from actions.action_result import ActionResult
 
@@ -57,13 +58,13 @@ CF is the furthest reachable pose on the observation's center ray before a
 blockage. F-prefixed poses are frontiers inside the observation's angular span
 and may be farther than the reliable camera range.
 
-Use Image 2 and contextual_clue to choose the candidate that best follows the
-evidence. Prefer a meaningful translation toward the clue. Choose CF when the
-clue supports continuing straight and a long move is useful. Choose an aligned
-frontier when the clue suggests entering unvisited space, such as leaving the
-current room to continue the search. Do not choose CF or a frontier merely
-because it is farther away. Choose CB only to back up for a clearer or wider
-view when moving forward would not help.
+Use candidate_type, remaining_waypoints, Image 2, and contextual_clue to choose
+one pose that continues the active hypothesis. visual is handled without
+navigation by same-view reassessment and tracking; local permits nearby
+investigation; destination may follow a grounded route. Speculative clues are
+ignored and never reach navigation. The listed poses
+already enforce the movement scope. Do not reinterpret the clue or start a new
+hypothesis. Do not choose a farther pose merely because it is farther away.
 
 Never return goal_reached because target verification happens after arrival.
 Return blocked only when no listed pose can investigate the clue.""",
@@ -78,7 +79,6 @@ class NavigationError(RuntimeError):
 
 class NavigateAction:
     VISION_TIMEOUT = 15.0
-    MAP_OVERLAY_TIMEOUT = 8.0
     NAVIGATION_TIMEOUT = 90.0
     CAMERA_MAX_AGE = 2.0
     JPEG_QUALITY = 75
@@ -218,7 +218,6 @@ class NavigateAction:
                 )
 
                 if decision == 'goal_reached':
-                    self._save_goal_reached_map(snapshot)
                     self._finish('succeeded', 'goal_reached')
                     return
                 if decision == 'blocked':
@@ -291,54 +290,41 @@ class NavigateAction:
                              getattr(error, 'code', 'NAVIGATION_ERROR'))
 
     async def _capture(self):
-        deadline = asyncio.get_running_loop().time() + self.MAP_OVERLAY_TIMEOUT
-        map_request_id = None
         request_map_snapshot = getattr(self, 'request_map_snapshot', None)
-        if self._overlay_action_id is None and request_map_snapshot is not None:
-            map_request_id = uuid.uuid4().hex
-            await request_map_snapshot({
+        if request_map_snapshot is None:
+            raise NavigationError(
+                'MAP_STREAM_UNAVAILABLE', 'Map request client is not configured'
+            )
+        map_request_id = uuid.uuid4().hex
+        try:
+            snapshot = await request_map_snapshot({
                 'schema_version': 1,
                 'operation': 'snapshot',
                 'action_id': self.action_id,
                 'request_id': map_request_id,
+                'overlay_action_id': self._overlay_action_id,
+                'overlay_revision': self._overlay_revision,
             })
-        while True:
-            try:
-                snapshot = await asyncio.to_thread(self.camera.map_snapshot)
-            except RuntimeError as error:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise NavigationError(
-                        'MAP_STREAM_UNAVAILABLE', str(error)
-                    ) from error
-                await asyncio.sleep(0.1)
-                continue
-            overlay = (snapshot.get('metadata') or {}).get('search_overlay')
-            matches = (
-                (
-                    self._overlay_action_id is None
-                    and (
-                        map_request_id is None
-                        or str((snapshot.get('metadata') or {}).get(
-                            'snapshot_request_id'
-                        )) == map_request_id
-                    )
-                )
-                or (
-                    isinstance(overlay, dict)
-                    and str(overlay.get('action_id')) == str(self._overlay_action_id)
-                    and int(overlay.get('revision', 0)) >= self._overlay_revision
-                )
-            )
-            if matches:
-                break
-            if asyncio.get_running_loop().time() >= deadline:
-                raise NavigationError(
-                    'MAP_OVERLAY_TIMEOUT',
-                    'Map stream did not render the requested find overlay revision',
-                )
-            await asyncio.sleep(0.05)
+        except (asyncio.TimeoutError, TimeoutError, RuntimeError, zmq.ZMQError) as error:
+            raise NavigationError('MAP_STREAM_UNAVAILABLE', str(error)) from error
+
         metadata = snapshot['metadata']
+        if str(metadata.get('snapshot_request_id')) != map_request_id:
+            raise NavigationError(
+                'MAP_REQUEST_MISMATCH', 'Map service returned the wrong request'
+            )
+        overlay = metadata.get('search_overlay')
+        if self._overlay_action_id is not None and not (
+            isinstance(overlay, dict)
+            and str(overlay.get('action_id')) == str(self._overlay_action_id)
+            and int(overlay.get('revision', 0)) >= self._overlay_revision
+        ):
+            raise NavigationError(
+                'MAP_OVERLAY_TIMEOUT',
+                'Map service did not render the requested find overlay revision',
+            )
         self._snapshot_id = metadata['snapshot_id']
+        self._save_map_snapshot(snapshot)
         self._candidates = {
             candidate['id']: dict(candidate)
             for candidate in metadata['candidates']
@@ -394,7 +380,12 @@ class NavigateAction:
             'candidates': {
                 pose_id: {
                     key: candidate.get(key)
-                    for key in ('kind', 'distance_m')
+                    for key in (
+                        'kind', 'distance_m', 'selection_reason',
+                        'candidate_type', 'hypothesis_id',
+                        'remaining_waypoints', 'allow_frontier',
+                        'reassessment_limit', 'reassessments_used',
+                    )
                     if candidate.get(key) is not None
                 }
                 for pose_id, candidate in self._candidates.items()
@@ -402,7 +393,26 @@ class NavigateAction:
             'observation': (
                 {
                     'contextual_clue': self._observation.get('contextual_clue'),
-                    'clue_confidence': self._observation.get('clue_confidence'),
+                    'candidate_type': self._observation.get('candidate_type'),
+                    'original_candidate_type': self._observation.get(
+                        'original_candidate_type'
+                    ),
+                    'original_contextual_clue': self._observation.get(
+                        'original_contextual_clue'
+                    ),
+                    'hypothesis_id': self._observation.get('hypothesis_id'),
+                    'movement_limit': self._observation.get('movement_limit'),
+                    'movements_used': self._observation.get('movements_used'),
+                    'remaining_waypoints': self._observation.get(
+                        'remaining_waypoints'
+                    ),
+                    'reassessment_limit': self._observation.get(
+                        'reassessment_limit'
+                    ),
+                    'reassessments_used': self._observation.get(
+                        'reassessments_used'
+                    ),
+                    'allow_frontier': self._observation.get('allow_frontier'),
                 }
                 if self._observation is not None else None
             ),
@@ -420,7 +430,7 @@ class NavigateAction:
             else bytes(self._observation['jpeg_bytes'])
         )
         self._save_debug_inputs(
-            map_jpeg, vision_jpeg, snapshot['metadata'], context, prompt, tool,
+            vision_jpeg, snapshot['metadata'], context, prompt, tool,
             step_number, self._request_id,
         )
         content = [{'type': 'input_text', 'text': prompt}]
@@ -517,7 +527,7 @@ class NavigateAction:
         temporary.write_bytes(data)
         temporary.replace(path)
 
-    def _save_debug_inputs(self, map_jpeg, vision_jpeg, map_metadata, context,
+    def _save_debug_inputs(self, vision_jpeg, map_metadata, context,
                            prompt, tool, step_number, request_id):
         """Persist the exact text, tool, and image order sent to vision."""
         manifest = {
@@ -532,7 +542,6 @@ class NavigateAction:
             'selection_context': context,
         }
         try:
-            self._atomic_write(self.debug_dir / 'latest_map.jpg', map_jpeg)
             self._atomic_write(self.debug_dir / 'latest_vision.jpg', vision_jpeg)
             self._atomic_write(
                 self.debug_dir / 'latest_request.json',
@@ -544,7 +553,7 @@ class NavigateAction:
             # Debug output must never prevent the robot from navigating.
             self._result_data['debug_save_error'] = str(error)
 
-    def _save_goal_reached_map(self, snapshot):
+    def _save_map_snapshot(self, snapshot):
         """Save the map-stream image exactly as navigation received it."""
         try:
             self._atomic_write(
