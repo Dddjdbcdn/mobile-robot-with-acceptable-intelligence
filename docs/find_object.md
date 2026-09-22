@@ -21,29 +21,25 @@ websocket and image-encoding code.
 3. Assessment returns `found`, `not_found`, or one typed candidate: `visual`,
    `local`, `destination`, or `speculative`. The type is required for a candidate;
    numeric candidate confidence is not used.
-4. GoalExecutor owns actionable candidate hypotheses and movement budgets. The
-   first candidate type fixes the chain allowance: visual 0, local 2, and
-   destination 10. Speculative candidates are ignored and create no actionable
-   hypothesis, candidate navigation request, or retry. Their camera views still
-   contribute to ordinary coverage. A visual candidate first receives one
-   single-frame reassessment from the already-aimed camera. If it remains a
-   candidate, GoalExecutor attempts tracking with GroundingDINO enabled and enters
-   the normal approach pipeline only when acquisition succeeds. Failed acquisition
-   rejects the clue as not found; visual candidates never navigate to a context
-   pose. Later frames receive the hypothesis ID, original clue, type, and remaining
-   allowance, but no historical images.
-5. MapStream copies the hypothesis fields onto every sampled pose. Visual and
-   local candidates cannot expose a frontier; destination candidates may expose
-   an aligned long-ray or frontier pose. NavigateAction receives the map, the
-   latest clue JPEG, and concise structured hypothesis metadata.
-6. Exploration first ranks uncovered known-space viewpoints and useful rotations
-   with frontiers disabled. When those local views are exhausted, exploration may
-   select a frontier. A speculative result does not change this sequence.
-7. Coverage exploration sends exactly one deterministic pose to NavigateAction,
-   so no waypoint-selection model call is made. Context navigation uses the LLM
-   only to choose among poses already filtered by the candidate policy.
-   Every arrival gets a centered-camera check. Any arrival, including a frontier,
-   translation, or rotation, may add a sweep when the forward-coverage test passes.
+4. GoalExecutor routes `local` and `destination` through one contextual loop.
+   Local clues use a 2-waypoint budget and destination clues use a 10-waypoint
+   budget. A new observation of the same type consumes the current budget; a
+   switch between local and destination resets the loop with the new type's
+   budget. `not_found` exits to exploration. Speculative candidates are ignored.
+   A visual candidate receives one same-view reassessment, followed by a
+   GroundingDINO tracking attempt if it remains plausible.
+5. MapStream copies the current candidate type and movement counters onto the
+   sampled context poses. Local and destination candidates use the same cone and
+   center-ray geometry, with destination extending the selection radius to 4 m.
+   Neither mode offers frontier candidates.
+6. Exploration ranks uncovered known-space viewpoints with frontiers disabled.
+   After choosing its normal coverage pose, it casts a 4 m forward ray. A known
+   obstacle or camera-covered area keeps the original pose; unknown or clear
+   space extends the move to the furthest safe known position on that ray.
+7. Exploration sends exactly one deterministic pose to NavigateAction, so no
+   waypoint-selection model call is made. Local and destination navigation use
+   the LLM only to choose among poses already filtered by map logic. Every
+   arrival gets a centered-camera check and may add a sweep when appropriate.
 8. Once found, tracking tolerates brief glitches and attempts same-view detector
    reacquisition without recentering. When tracking becomes stable, it saves the
    target's map point, range, camera pose, observer pose, and confidence.
@@ -64,12 +60,11 @@ range. Areas covered by two or more captures are pale pink. Every capture
 contributes to coverage even though only one clue frame may be sent to navigation.
 Candidate generation does not reject previously visited coordinates.
 Context mode samples positions directly inside the selected clue cone and adds
-one reachable backward viewpoint. The sampled poses inherit candidate type,
-hypothesis ID, remaining budget, and frontier permission. Exploration mode
-samples camera-covered, reachable map cells (plus the robot's current cell),
-points each candidate toward its best uncovered camera view, and chooses the
-candidate that exposes the most uncovered grid cells. It uses a frontier only
-after local coverage is exhausted.
+one reachable backward viewpoint. The sampled poses inherit the current candidate type and remaining budget.
+Exploration samples camera-covered, reachable map cells (plus the robot's
+current cell), points each candidate toward its best uncovered camera view, and
+chooses the candidate that exposes the most uncovered grid cells before applying
+the safe forward-ray extension.
 
 GoalExecutor sends the complete coverage and route state to MapImageStream over
 the dedicated overlay socket. MapImageStream raycasts against the raw occupancy
@@ -87,7 +82,7 @@ also includes the memory records and waypoint count for logging.
 The defaults in `GoalExecutor` are:
 
 - Candidate movement allowances: visual 0, local 2, destination 10; speculative ignored
-- 10-waypoint global safety ceiling for any candidate chain
+- Per-type contextual budgets reset when the observed candidate type changes
 - 20 exploration iterations
 - 50 total search waypoints
 - 600 seconds total search time

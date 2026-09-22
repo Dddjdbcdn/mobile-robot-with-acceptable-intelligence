@@ -123,11 +123,9 @@ class SearchAction:
                 "This is the single same-view reassessment before any movement. "
             )
         return (
-            "\nContinue the active candidate hypothesis instead of starting a new "
-            f"one: id={context.get('hypothesis_id')}; "
+            "\nContinue evaluating the current contextual clue: "
             f"type={context.get('candidate_type')}; "
-            f"original clue={context.get('original_contextual_clue') or context.get('contextual_clue')}; "
-            f"latest clue={context.get('contextual_clue')}; "
+            f"clue={context.get('contextual_clue')}; "
             f"remaining movements={context.get('remaining_waypoints')}. "
             f"{reassessment}"
             "Return candidate only if the current view still supports that same "
@@ -817,10 +815,9 @@ class SearchAction:
         allowed_frame_keys = {
             "image_id", "pan_position", "tilt_position", "pan_angle",
             "tilt_angle", "jpeg_bytes", "robot_pose", "contextual_clue",
-            "candidate_type", "hypothesis_id", "original_candidate_type",
-            "original_contextual_clue",
+            "candidate_type",
             "movement_limit", "movements_used", "remaining_waypoints",
-            "reassessment_limit", "reassessments_used", "allow_frontier",
+            "reassessment_limit", "reassessments_used",
         }
         self.last_coverage_frames = [
             {

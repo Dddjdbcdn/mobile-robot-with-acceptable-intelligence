@@ -2,12 +2,15 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
+
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from services import camera_stream as stream_module
 from services.camera_stream import CameraStream
 
 
@@ -96,6 +99,59 @@ class UsbCameraControlTests(unittest.TestCase):
             "exposure_time_absolute": 300,
             "brightness": 0,
         })
+
+
+class UsbCameraRecoveryTests(unittest.TestCase):
+    def test_open_uses_stable_device_path(self):
+        device = "/dev/v4l/by-id/test-camera-video-index0"
+        stream = CameraStream(usb_device=device)
+        camera = MagicMock()
+        camera.isOpened.return_value = True
+
+        with patch(
+            "services.camera_stream.cv2.VideoCapture",
+            return_value=camera,
+        ) as video_capture:
+            opened = stream._open_usb_camera()
+
+        self.assertIs(opened, camera)
+        video_capture.assert_called_once_with(
+            device, stream_module.cv2.CAP_V4L2
+        )
+        self.assertEqual(camera.set.call_count, 4)
+        stream._zmq_context.term()
+
+    def test_capture_loop_reopens_after_repeated_read_failures(self):
+        device = "/dev/v4l/by-id/test-camera-video-index0"
+        stream = CameraStream(usb_device=device)
+        stream.USB_RECONNECT_DELAY = 0
+        stream.USB_READ_FAILURE_LIMIT = 2
+
+        failed_camera = MagicMock()
+        failed_camera.isOpened.return_value = True
+        failed_camera.read.return_value = (False, None)
+
+        recovered_camera = MagicMock()
+        recovered_camera.isOpened.return_value = True
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def recovered_read():
+            stream.stop_event.set()
+            return True, frame
+
+        recovered_camera.read.side_effect = recovered_read
+
+        with patch(
+            "services.camera_stream.cv2.VideoCapture",
+            side_effect=[failed_camera, recovered_camera],
+        ) as video_capture:
+            stream._capture_loop()
+
+        self.assertEqual(video_capture.call_count, 2)
+        failed_camera.release.assert_called_once()
+        recovered_camera.release.assert_called_once()
+        self.assertEqual(stream.sequence, 1)
+        stream._zmq_context.term()
 
 
 if __name__ == "__main__":

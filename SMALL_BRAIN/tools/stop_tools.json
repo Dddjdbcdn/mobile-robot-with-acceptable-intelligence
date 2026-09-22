@@ -18,5 +18,25 @@
       "properties": {},
       "additionalProperties": false
     }
+  },
+  {
+    "type": "function",
+    "name": "stop_follow",
+    "description": "Stop the active follow_action, including its current search, tracking, or approach step.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "stop_tracking",
+    "description": "Stop passive tracking started by watch_target. Use this when the robot should stop watching even if no other action follows.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
   }
 ]

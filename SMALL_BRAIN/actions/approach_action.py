@@ -20,9 +20,21 @@ class ApproachAction:
         self.completion_future: asyncio.Future[ActionResult] | None = None
         self._navigation_attempts = 0
         self._last_destination: dict | None = None
+        self.following = False
 
-    async def start_approaching(self, target, action_id):
-        if self.active:
+    async def start_approaching(
+        self, target, action_id, standoff_m=None, *, follow=False
+    ):
+        normalized_target = (
+            normalize_human_target(target) or normalize_object_target(target)
+        )
+        updating_follow = (
+            self.active
+            and follow
+            and self.following
+            and normalized_target == self.track_action.target
+        )
+        if self.active and not updating_follow:
             return ActionResult(
                 action_id=action_id,
                 action_type="approach_action",
@@ -34,9 +46,6 @@ class ApproachAction:
                 data={"active_action_id": self.action_id},
             )
 
-        normalized_target = (
-            normalize_human_target(target) or normalize_object_target(target)
-        )
         if (
             not self.track_action.active
             or normalized_target != self.track_action.target
@@ -95,25 +104,35 @@ class ApproachAction:
             "tof_range": tof_range,
         }
 
-        self.completion_future = asyncio.get_running_loop().create_future()
-        self.active = True
-        self.action_id = action_id
-        self.target = target
-        self._navigation_attempts = 0
-        self._last_destination = None
+        if not updating_follow:
+            self.completion_future = asyncio.get_running_loop().create_future()
+            self.active = True
+            self.action_id = action_id
+            self.target = target
+            self._navigation_attempts = 0
+            self._last_destination = None
+            self.following = follow
 
-        feedback = await self.send_robot_command({
-            "command": "navigate_to_approach",
+        command = {
+            "command": "navigate_to_follow" if follow else "navigate_to_approach",
             "action_id": self.action_id,
             "frame_id": "base_footprint",
             **raw_destination,
-        })
+        }
+        if standoff_m is not None:
+            command["standoff_m"] = float(standoff_m)
+        feedback = await self.send_robot_command(command)
         if not isinstance(feedback, dict) or feedback.get("status") != "accepted":
             message = (
                 feedback.get("message", "navigation_rejected")
                 if isinstance(feedback, dict)
                 else "invalid_navigation_feedback"
             )
+            if updating_follow:
+                await self.send_robot_command({
+                    "command": "stop_moving",
+                    "action_id": self.action_id,
+                })
             return self.complete_approaching(
                 status="failed",
                 outcome="rejected",
@@ -121,7 +140,7 @@ class ApproachAction:
                 data={"message": message},
             )
 
-        self._navigation_attempts = 1
+        self._navigation_attempts += 1
         resolved = feedback.get("destination")
         self._last_destination = (
             dict(resolved)
@@ -130,11 +149,13 @@ class ApproachAction:
         )
 
         return ActionResult(
-            action_id=action_id,
+            action_id=self.action_id,
             action_type="approach_action",
             status="running",
             target=target,
-            outcome="approaching",
+            outcome="follow_goal_updated" if updating_follow else (
+                "following" if follow else "approaching"
+            ),
             data={
                 "tracking_stable": True,
                 "raw_destination": dict(raw_destination),
@@ -204,6 +225,7 @@ class ApproachAction:
         self.active = False
         self.action_id = None
         self.target = None
+        self.following = False
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
         return result

@@ -7,8 +7,9 @@ bt_navigator:
     default_server_timeout: 1000
     wait_for_service_timeout: 1000
     action_server_result_timeout: 900.0
+    goal_updater_topic: /goal_update
     navigators: ["navigate_to_pose", "navigate_through_poses"]
-    default_nav_to_pose_bt_xml: $(find-pkg-share robot)/config/behavior_approach.xml
+    default_nav_to_pose_bt_xml: $(find-pkg-share robot)/config/behavior_dj.xml
     navigate_to_pose:
       plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
       enable_groot_monitoring: true
@@ -232,8 +233,8 @@ local_costmap:
           model_type: 0
       range_layer:
         plugin: "nav2_costmap_2d::RangeSensorLayer"
-        enabled: False
-        topics: ["/ultrasonic/left","/ultrasonic/right"]
+        enabled: True
+        topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
         
       always_send_full_costmap: True
@@ -330,8 +331,8 @@ global_costmap:
         inflation_radius: 0.3
       range_layer:
         plugin: "nav2_costmap_2d::RangeSensorLayer"
-        enabled: False
-        topics: ["/ultrasonic/left","/ultrasonic/right"]
+        enabled: True
+        topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
 
 planner_server:
@@ -486,12 +487,12 @@ collision_monitor:
       enabled: True
     range_left:
       type: "range"
-      topic: "/ultrasonic/left"
-      enabled: False
+      topic: "/range/left"
+      enabled: True
     range_right:
       type: "range"
-      topic: "/ultrasonic/right"
-      enabled: False
+      topic: "/range/right"
+      enabled: True
 
 docking_server:
   ros__parameters:

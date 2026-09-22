@@ -32,7 +32,7 @@ def generate_launch_description():
     default_bt_xml = os.path.join(
         get_package_share_directory('robot'),
         'config',
-        'behavior_approach.xml',
+        'behavior_dj.xml',
     )
 
     namespace = LaunchConfiguration('namespace')

@@ -214,53 +214,53 @@
 
 <link name="imu_link"/>
 
-<!-- ==================== Ultrasonic Left ==================== -->
-<joint name="ultrasonic_left_joint" type="fixed">
+<!-- ==================== Range Left ==================== -->
+<joint name="range_left_joint" type="fixed">
   <parent link="base_link"/>
-  <child link="ultrasonic_left_link"/>
-  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 ${ultrasonic_z_angle}"/>
+  <child link="range_left_link"/>
+  <origin xyz="${base_length/2 - range_x_offset} ${side_range_y_offset} ${wheel_radius + wheel_z_offset - range_z_offset}" rpy="0 0 ${range_z_angle}"/>
 </joint>
 
-<link name="ultrasonic_left_link">
+<link name="range_left_link">
   <visual>
     <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    <geometry><box size="${range_length} ${range_width} ${range_height}"/>
     </geometry>
     <material name="green"/>
   </visual>
   <collision>
     <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    <geometry><box size="${range_length} ${range_width} ${range_height}"/>
     </geometry>
   </collision>
   <inertial>
     <mass value="0.01"/>
-    <xacro:box_inertia mass="0.01" x="${ultrasonic_length}" y="${ultrasonic_width}" z="${ultrasonic_height}"/>
+    <xacro:box_inertia mass="0.01" x="${range_length}" y="${range_width}" z="${range_height}"/>
   </inertial>
 </link>
 
-<!-- ==================== Ultrasonic Right ==================== -->
-<joint name="ultrasonic_right_joint" type="fixed">
+<!-- ==================== Range Right ==================== -->
+<joint name="range_right_joint" type="fixed">
   <parent link="base_link"/>
-  <child link="ultrasonic_right_link"/>
-  <origin xyz="${base_length/2 - ultrasonic_x_offset} ${-side_ultrasonic_y_offset} ${wheel_radius + wheel_z_offset - ultrasonic_z_offset}" rpy="0 0 ${-ultrasonic_z_angle}"/>
+  <child link="range_right_link"/>
+  <origin xyz="${base_length/2 - range_x_offset} ${-side_range_y_offset} ${wheel_radius + wheel_z_offset - range_z_offset}" rpy="0 0 ${-range_z_angle}"/>
 </joint>
 
-<link name="ultrasonic_right_link">
+<link name="range_right_link">
   <visual>
     <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    <geometry><box size="${range_length} ${range_width} ${range_height}"/>
     </geometry>
     <material name="green"/>
   </visual>
   <collision>
     <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry><box size="${ultrasonic_length} ${ultrasonic_width} ${ultrasonic_height}"/>
+    <geometry><box size="${range_length} ${range_width} ${range_height}"/>
     </geometry>
   </collision>
   <inertial>
     <mass value="0.01"/>
-    <xacro:box_inertia mass="0.01" x="${ultrasonic_length}" y="${ultrasonic_width}" z="${ultrasonic_height}"/>
+    <xacro:box_inertia mass="0.01" x="${range_length}" y="${range_width}" z="${range_height}"/>
   </inertial>
 </link>
 </robot>

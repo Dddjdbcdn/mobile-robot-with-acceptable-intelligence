@@ -9,7 +9,7 @@
 #include "microros_app.h"
 #include "imu.h"
 #include "motor.h"
-#include "ultrasonic.h"
+#include "range.h"
 #include "vl53l7cx_api.h"
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
@@ -67,8 +67,8 @@ std_msgs__msg__String debug_msg;
 rcl_publisher_t imu_publisher;
 geometry_msgs__msg__Point32 imu_msg;
 
-rcl_publisher_t ultrasonic_publisher;
-geometry_msgs__msg__Point32 ultrasonic_msg;
+rcl_publisher_t range_publisher;
+geometry_msgs__msg__Point32 range_msg;
 
 rcl_publisher_t wheel_state_publisher;
 sensor_msgs__msg__JointState wheel_state_msg;
@@ -111,7 +111,7 @@ double sub_efforts[2];
 // --- Initialize Timers ---
 rcl_timer_t wheel_timer;
 rcl_timer_t imu_timer;
-rcl_timer_t ultrasonic_timer;
+rcl_timer_t range_timer;
 rcl_timer_t tof_timer;
 rcl_timer_t pwm_timer;
 
@@ -190,13 +190,13 @@ void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
     }
 }
 
-void ultrasonic_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+void range_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
     if (timer != NULL) {
-      ultrasonic_msg.x = final_dist[0] / 1000.0f;
-      ultrasonic_msg.y = final_dist[1] / 1000.0f;
-      ultrasonic_msg.z = final_dist[2] / 1000.0f;
-      rcl_ret_t ret = rcl_publish(&ultrasonic_publisher, &ultrasonic_msg, NULL);
+      range_msg.x = range_mm[0] / 1000.0f;
+      range_msg.y = range_mm[1] / 1000.0f;
+      range_msg.z = range_mm[2] / 1000.0f;
+      rcl_ret_t ret = rcl_publish(&range_publisher, &range_msg, NULL);
       (void)ret;
     }
 }
@@ -331,7 +331,7 @@ void run_microros_app()
       &imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32), "stm32/imu_msg");
 
     rclc_publisher_init_best_effort(
-      &ultrasonic_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32), "stm32/ultrasonic_msg");
+      &range_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32), "stm32/range_msg");
 
     rclc_publisher_init_best_effort(
       &tof_raw_publisher, &node, 
@@ -368,7 +368,7 @@ void run_microros_app()
     rclc_timer_init_default2(
         &imu_timer, &support, RCL_MS_TO_NS(20), imu_timer_callback, true); // 50Hz
     rclc_timer_init_default2(
-        &ultrasonic_timer, &support, RCL_MS_TO_NS(50), ultrasonic_timer_callback, true); // 20Hz
+        &range_timer, &support, RCL_MS_TO_NS(50), range_timer_callback, true); // 20Hz
     rclc_timer_init_default2(
         &tof_timer, &support, RCL_MS_TO_NS(100), tof_timer_callback, true); // 10Hz
     rclc_timer_init_default2(
@@ -380,7 +380,7 @@ void run_microros_app()
     rclc_executor_add_subscription(&executor, &servo_pan_subscriber, &servo_pan_msg, &servo_pan_callback, ON_NEW_DATA);
     rclc_executor_add_timer(&executor, &wheel_timer);
     rclc_executor_add_timer(&executor, &imu_timer);
-    rclc_executor_add_timer(&executor, &ultrasonic_timer);
+    rclc_executor_add_timer(&executor, &range_timer);
     rclc_executor_add_timer(&executor, &tof_timer);
     rclc_executor_add_timer(&executor, &pwm_timer);
 

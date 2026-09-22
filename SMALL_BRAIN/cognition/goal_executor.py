@@ -15,7 +15,8 @@ from actions.track_action import (
 
 @dataclass(frozen=True, slots=True)
 class FindLoopConfig:
-    max_context_waypoints: int = 10
+    max_local_waypoints: int = 2
+    max_destination_waypoints: int = 10
     max_exploration_waypoints: int = 20
     max_total_waypoints: int = 50
     max_duration_seconds: float = 600.0
@@ -23,24 +24,6 @@ class FindLoopConfig:
     camera_horizontal_fov_deg: float = 60.0
     camera_reliable_range_m: float = 2.0
 
-
-CANDIDATE_POLICIES = {
-    "visual": {
-        "max_waypoints": 0,
-        "max_reassessments": 1,
-        "allow_frontier": False,
-    },
-    "local": {
-        "max_waypoints": 2,
-        "max_reassessments": 0,
-        "allow_frontier": False,
-    },
-    "destination": {
-        "max_waypoints": 10,
-        "max_reassessments": 0,
-        "allow_frontier": True,
-    },
-}
 
 class GoalExecutor:
     """Own the complete find -> track -> approach object goal."""
@@ -70,7 +53,7 @@ class GoalExecutor:
         search_action,
         track_action,
         approach_action,
-        move_camera_action,
+        see_action,
         semantic_memory=None,
         navigate_action=None,
         send_map_overlay=None,
@@ -79,7 +62,7 @@ class GoalExecutor:
         self.search_action = search_action
         self.track_action = track_action
         self.approach_action = approach_action
-        self.move_camera_action = move_camera_action
+        self.see_action = see_action
         self.semantic_memory = semantic_memory
         self.navigate_action = navigate_action
         self.send_map_overlay = send_map_overlay
@@ -99,14 +82,16 @@ class GoalExecutor:
         self._map_overlay_revision = 0
         self._search_waypoint_count = 0
         self._search_started_at = 0.0
-        self._candidate_sequence = 0
+        self._approach_standoff_m: float | None = None
+        self._approach_follow = False
 
     async def start(
         self,
         goal,
         target,
         action_id,
-        **_legacy_options,
+        approach_standoff_m=None,
+        approach_follow=False,
     ) -> ActionResult:
         """Start the one supported composite goal: find, track, and approach."""
         target = str(target or "").strip()
@@ -138,7 +123,11 @@ class GoalExecutor:
         self._search_poses = []
         self._search_waypoint_count = 0
         self._map_overlay_revision = 0
-        self._candidate_sequence = 0
+        self._approach_standoff_m = (
+            float(approach_standoff_m)
+            if approach_standoff_m is not None else None
+        )
+        self._approach_follow = bool(approach_follow)
         self._remember_search_pose("search_start")
         await self._publish_map_overlay()
         self._search_started_at = time.monotonic()
@@ -224,6 +213,9 @@ class GoalExecutor:
                 )
                 if approach_result.status != "succeeded":
                     raise GoalStepFailed("approach", approach_result)
+                if getattr(self, "_approach_follow", False):
+                    self._completed_steps.append("target_following")
+                    break
 
                 reacquired = await self._post_approach_reacquire(search_round)
                 if reacquired.status == "succeeded":
@@ -269,7 +261,11 @@ class GoalExecutor:
 
         self._complete(
             status="succeeded",
-            outcome="found_reached_and_reacquired",
+            outcome=(
+                "found_tracked_and_following"
+                if getattr(self, "_approach_follow", False)
+                else "found_reached_and_reacquired"
+            ),
         )
 
     async def _turn_body(self, direction: str, step: str) -> ActionResult:
@@ -293,7 +289,7 @@ class GoalExecutor:
                 status="cancelled",
                 outcome="replaced_by_new_goal",
             )
-        return await self.move_camera_action.move_to_region(
+        return await self.see_action.move_to_region(
             region=region,
             action_id=self._step_id(step),
         )
@@ -324,7 +320,19 @@ class GoalExecutor:
         result = await self.approach_action.start_approaching(
             target=self.target,
             action_id=self._step_id(step),
+            standoff_m=self._approach_standoff_m,
+            follow=getattr(self, "_approach_follow", False),
         )
+        if getattr(self, "_approach_follow", False) and result.status == "running":
+            self._approach_result_data = dict(result.data)
+            return ActionResult(
+                action_id=result.action_id,
+                action_type=result.action_type,
+                status="succeeded",
+                target=result.target,
+                outcome="follow_navigation_started",
+                data=result.data,
+            )
         result = await self._terminal_result(self.approach_action, result)
         if result.status == "succeeded":
             self._approach_result_data = dict(result.data)
@@ -368,13 +376,10 @@ class GoalExecutor:
             data={"tracking_stable": True, "search_effort": "best_effort"},
         )
 
-    async def _navigate_search_step(
-        self, observation, mode, step, *, allow_frontier=True
-    ):
+    async def _navigate_search_step(self, observation, mode, step):
         revision = await self._publish_map_overlay(
             mode=mode,
             observation=observation,
-            allow_frontier=allow_frontier,
         )
         result = await self.navigate_action.start_find_object_step(
             target=self.target,
@@ -414,26 +419,13 @@ class GoalExecutor:
                 None,
                 mode="exploration",
                 step=exploration_step,
-                allow_frontier=False,
             )
             if navigation.status != "succeeded":
                 if navigation.reason_code in {
                     "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
                 }:
-                    navigation = await self._navigate_search_step(
-                        None,
-                        mode="exploration",
-                        step=exploration_step,
-                        allow_frontier=True,
-                    )
-                    if navigation.status != "succeeded":
-                        if navigation.reason_code in {
-                            "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
-                        }:
-                            return self._search_exhausted_result(navigation)
-                        return navigation
-                else:
-                    return navigation
+                    return self._search_exhausted_result(navigation)
+                return navigation
 
             print(f"🌊 [INSPECTION]: {exploration_index}/{self.find_loop.max_exploration_waypoints}")
             result = await self._inspect_area(
@@ -445,127 +437,173 @@ class GoalExecutor:
         return self._search_exhausted_result()
 
     async def _inspect_area(self, prefix, *, candidate_context=None):
-        hypothesis = None
-        for clue_index in range(self.find_loop.max_context_waypoints + 1):
-            step = (
-                prefix if clue_index == 0
-                else f"{prefix}_context_{clue_index}"
-            )
-            centered = await self._move_camera_for_goal(
-                region="center", step=f"{step}_center_camera"
-            )
-            if centered.status != "succeeded":
-                return centered
+        scan = await self._scan_area(
+            prefix,
+            candidate_context=candidate_context,
+            initial=True,
+        )
+        if scan.status == "succeeded":
+            return scan
+        if scan.reason_code not in {
+            "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
+        }:
+            return scan
 
-            scan_step = (
-                f"{prefix}_center_scan" if clue_index == 0
-                else f"{step}_camera_check"
-            )
+        observation = self.search_action.last_observation_frame
+        if observation is None:
+            print("🌊 [SEARCH]: NO CLUE")
+            return None
+        return await self._route_candidate(prefix, observation)
 
-            print(f"🌊 [SEARCH]: {clue_index}/{self.find_loop.max_context_waypoints}")
-            scan = await self._search(
-                scan_step,
-                initial_view_only=False,
-                sweep_directions=("left","right"),
-                candidate_context=(
-                    candidate_context if clue_index == 0
-                    else self._candidate_observation(hypothesis)
-                ),
-            )
-            if scan.status == "succeeded":
-                return scan
-            if scan.reason_code not in {
-                "TARGET_NOT_VISIBLE",
-                "SEARCH_CONTEXTUAL_CLUE",
-            }:
-                return scan
+    async def _scan_area(
+        self, step, *, candidate_context=None, initial=False
+    ) -> ActionResult:
+        centered = await self._move_camera_for_goal(
+            region="center", step=f"{step}_center_camera"
+        )
+        if centered.status != "succeeded":
+            return centered
+        return await self._search(
+            f"{step}_center_scan" if initial else f"{step}_camera_check",
+            initial_view_only=False,
+            sweep_directions=("left", "right"),
+            candidate_context=candidate_context,
+        )
 
-            observation = self.search_action.last_observation_frame
-            if observation is None:
-                print(f"🌊 [SEARCH]: NO CLUE")
-                break
+    async def _route_candidate(self, prefix, observation):
+        """Dispatch a search assessment to its deliberately distinct behavior."""
+        candidate_type = str(observation.get("candidate_type") or "")
+        print(f"🌊 [SEARCH]: CANDIDATE: {candidate_type or 'none'}")
+        handlers = {
+            "visual": self._handle_visual_candidate,
+            "local": self._handle_contextual_candidate,
+            "destination": self._handle_contextual_candidate,
+            "speculative": self._handle_speculative_candidate,
+        }
+        handler = handlers.get(candidate_type)
+        if handler is None:
+            return None
+        return await handler(prefix, observation)
 
-            if hypothesis is None:
-                hypothesis = self._new_candidate_hypothesis(observation)
-                if hypothesis is None:
-                    break
-                print(f"🌊 [SEARCH]: HYPBOTHESIS: {hypothesis["candidate_type"]}")
-                if hypothesis["candidate_type"] == "visual":
-                    reassessment = await self._search(
-                        f"{prefix}_visual_reassessment",
-                        initial_view_only=True,
-                        sweep_directions=(),
-                        candidate_context=self._candidate_observation(hypothesis),
-                    )
-                    hypothesis["reassessments_used"] += 1
-                    if reassessment.status == "succeeded":
-                        return reassessment
-                    if reassessment.reason_code not in {
-                        "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
-                    }:
-                        return reassessment
-                    observation = self.search_action.last_observation_frame
-                    if observation is None:
-                        hypothesis["status"] = "rejected"
-                        break
-                    track_result = await self._track(
-                        allow_grounding_dino=True,
-                        step=f"{prefix}_visual_track",
-                    )
-                    if track_result.status == "succeeded":
-                        print(f"🌊 [SEARCH]: VISUAL HYPBOTHESIS ACCEPTED")
+    async def _handle_visual_candidate(self, prefix, observation):
+        context = dict(observation)
+        context.update({
+            "candidate_type": "visual",
+            "reassessment_limit": 1,
+            "reassessments_used": 0,
+        })
+        reassessment = await self._search(
+            f"{prefix}_visual_reassessment",
+            initial_view_only=True,
+            sweep_directions=(),
+            candidate_context=context,
+        )
+        if reassessment.status == "succeeded":
+            return reassessment
+        if reassessment.reason_code not in {
+            "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
+        }:
+            return reassessment
+        if self.search_action.last_observation_frame is None:
+            return None
 
-                        hypothesis["status"] = "tracked"
-                        return ActionResult(
-                            action_id=self._step_id(
-                                f"{prefix}_visual_track_confirmed"
-                            ),
-                            action_type="search_action",
-                            status="succeeded",
-                            target=self.target,
-                            outcome="visual_candidate_tracked",
-                            data={
-                                "hypothesis_id": hypothesis["hypothesis_id"],
-                                "candidate_type": "visual",
-                                "tracker_result": self._result_data(track_result),
-                            },
-                        )
-                    # A visual candidate must be detectable from the already-aimed
-                    # current view. Failed acquisition rejects it instead of moving.
-                    hypothesis["status"] = "rejected"
-                    print(f"🌊 [SEARCH]: VISUAL HYPBOTHESIS REJECTED")
-                    break
+        track_result = await self._track(
+            allow_grounding_dino=True,
+            step=f"{prefix}_visual_track",
+        )
+        if track_result.status != "succeeded":
+            print("🌊 [SEARCH]: VISUAL CANDIDATE REJECTED")
+            return None
+        print("🌊 [SEARCH]: VISUAL CANDIDATE ACCEPTED")
+        return ActionResult(
+            action_id=self._step_id(f"{prefix}_visual_track_confirmed"),
+            action_type="search_action",
+            status="succeeded",
+            target=self.target,
+            outcome="visual_candidate_tracked",
+            data={"tracker_result": self._result_data(track_result)},
+        )
 
-            movement_limit = hypothesis["movement_limit"]
-            if hypothesis["movements_used"] >= movement_limit:
-                hypothesis["status"] = "exhausted"
-                break
-            observation = self._candidate_observation(hypothesis, observation)
+    async def _handle_contextual_candidate(self, prefix, observation):
+        """Follow local/destination clues and reset when their type changes."""
+        candidate_type = str(observation.get("candidate_type") or "")
+        movement_index = 0
+
+        while candidate_type in {"local", "destination"}:
+            if candidate_type == "local":
+                mode = "context"
+                label = "LOCAL CLUE"
+                movement_limit = self.find_loop.max_local_waypoints
+            else:
+                mode = "destination"
+                label = "DESTINATION"
+                movement_limit = self.find_loop.max_destination_waypoints
+
+            if movement_index >= movement_limit:
+                return None
 
             limit_result = self._search_limit_result()
             if limit_result is not None:
                 return limit_result
 
+            payload = dict(observation)
+            payload.update({
+                "movement_limit": movement_limit,
+                "movements_used": movement_index,
+                "remaining_waypoints": movement_limit - movement_index,
+            })
             print(
-                "🔥 [FOLLOW CLUE]: "
-                f"{hypothesis['candidate_type']} "
-                f"{hypothesis['movements_used']}/{movement_limit}"
+                f"🔥 [FOLLOW {label}]: {movement_index}/{movement_limit}"
             )
+            step_kind = "context" if mode == "context" else "destination"
+            step = f"{prefix}_{step_kind}_{movement_index + 1}"
             navigation = await self._navigate_search_step(
-                observation,
-                mode="context",
-                step=f"{prefix}_context_{clue_index + 1}",
-                allow_frontier=hypothesis["allow_frontier"],
+                payload,
+                mode=mode,
+                step=step,
             )
             if navigation.status != "succeeded":
                 if navigation.reason_code in {
                     "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
                 }:
-                    break
+                    return None
                 return navigation
-            hypothesis["movements_used"] += 1
-            hypothesis["observation"] = observation
 
+            movement_index += 1
+            scan_context = dict(payload)
+            scan_context.update({
+                "movements_used": movement_index,
+                "remaining_waypoints": movement_limit - movement_index,
+            })
+            scan = await self._scan_area(
+                step,
+                candidate_context=scan_context,
+            )
+            if scan.status == "succeeded":
+                return scan
+            if scan.reason_code not in {
+                "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
+            }:
+                return scan
+
+            next_observation = self.search_action.last_observation_frame
+            next_type = str(
+                (next_observation or {}).get("candidate_type") or ""
+            )
+            if next_type not in {"local", "destination"}:
+                if next_type in {"visual", "speculative"}:
+                    return await self._route_candidate(step, next_observation)
+                return None
+
+            if next_type != candidate_type:
+                prefix = step
+                movement_index = 0
+            observation = next_observation
+            candidate_type = next_type
+        return None
+
+    async def _handle_speculative_candidate(self, _prefix, _observation):
+        """Speculation is intentionally acknowledged without causing motion."""
         return None
 
     async def _search(
@@ -598,66 +636,6 @@ class GoalExecutor:
         if self._remember_search_pose(step, frames=coverage_frames):
             await self._publish_map_overlay()
         return search_result
-
-    def _new_candidate_hypothesis(self, observation):
-        if not isinstance(observation, dict):
-            return None
-        candidate_type = str(observation.get("candidate_type") or "")
-        policy = CANDIDATE_POLICIES.get(candidate_type)
-        if policy is None:
-            return None
-        self._candidate_sequence = getattr(self, "_candidate_sequence", 0) + 1
-        movement_limit = min(
-            int(policy["max_waypoints"]),
-            int(self.find_loop.max_context_waypoints),
-        )
-        return {
-            "hypothesis_id": f"{self.action_id}:candidate:{self._candidate_sequence}",
-            "candidate_type": candidate_type,
-            "original_candidate_type": candidate_type,
-            "contextual_clue": str(observation.get("contextual_clue") or ""),
-            "original_contextual_clue": str(
-                observation.get("contextual_clue") or ""
-            ),
-            "movement_limit": movement_limit,
-            "movements_used": 0,
-            "reassessment_limit": int(policy["max_reassessments"]),
-            "reassessments_used": 0,
-            "allow_frontier": bool(policy["allow_frontier"]),
-            "status": "active",
-            "observation": dict(observation),
-        }
-
-    @staticmethod
-    def _candidate_observation(hypothesis, observation=None):
-        source = observation or hypothesis.get("observation") or {}
-        payload = dict(source)
-        limit = int(hypothesis.get("movement_limit", 0))
-        used = int(hypothesis.get("movements_used", 0))
-        payload.update({
-            "hypothesis_id": hypothesis.get("hypothesis_id"),
-            "candidate_type": hypothesis.get("candidate_type"),
-            "original_candidate_type": hypothesis.get("original_candidate_type"),
-            "contextual_clue": str(
-                source.get("contextual_clue")
-                or hypothesis.get("contextual_clue") or ""
-            ),
-            "original_contextual_clue": str(
-                hypothesis.get("original_contextual_clue")
-                or hypothesis.get("contextual_clue") or ""
-            ),
-            "movement_limit": limit,
-            "movements_used": used,
-            "remaining_waypoints": max(0, limit - used),
-            "reassessment_limit": int(
-                hypothesis.get("reassessment_limit", 0)
-            ),
-            "reassessments_used": int(
-                hypothesis.get("reassessments_used", 0)
-            ),
-            "allow_frontier": bool(hypothesis.get("allow_frontier", False)),
-        })
-        return payload
 
     def _remember_search_pose(self, reason, pose=None, frames=None):
         """Upsert robot poses and attach every camera view captured there."""
@@ -730,11 +708,10 @@ class GoalExecutor:
                 and item.get("tilt") == view["tilt"]
             ), None)
             for key in (
-                "candidate_type", "hypothesis_id", "original_candidate_type",
-                "contextual_clue", "original_contextual_clue",
+                "candidate_type", "contextual_clue",
                 "movement_limit", "movements_used",
                 "remaining_waypoints", "reassessment_limit",
-                "reassessments_used", "allow_frontier",
+                "reassessments_used",
             ):
                 if frame.get(key) is not None:
                     view[key] = frame[key]
@@ -746,9 +723,7 @@ class GoalExecutor:
                 changed = True
         return changed
 
-    async def _publish_map_overlay(
-        self, mode=None, observation=None, *, allow_frontier=True
-    ):
+    async def _publish_map_overlay(self, mode=None, observation=None):
         if self.send_map_overlay is None or not self.action_id:
             return self._map_overlay_revision
         self._map_overlay_revision += 1
@@ -778,16 +753,6 @@ class GoalExecutor:
                         "candidate_type": str(
                             observation.get("candidate_type") or ""
                         ),
-                        "original_candidate_type": str(
-                            observation.get("original_candidate_type") or ""
-                        ),
-                        "original_contextual_clue": str(
-                            observation.get("original_contextual_clue")
-                            or observation.get("contextual_clue") or ""
-                        ),
-                        "hypothesis_id": str(
-                            observation.get("hypothesis_id") or ""
-                        ),
                         "movement_limit": int(
                             observation.get("movement_limit") or 0
                         ),
@@ -803,9 +768,6 @@ class GoalExecutor:
                         "reassessments_used": int(
                             observation.get("reassessments_used") or 0
                         ),
-                        "allow_frontier": bool(
-                            observation.get("allow_frontier", False)
-                        ),
                     }
                 except (KeyError, TypeError, ValueError):
                     observation_payload = None
@@ -816,7 +778,6 @@ class GoalExecutor:
             "revision": self._map_overlay_revision,
             "frame_id": frame_id,
             "mode": str(mode or "goal"),
-            "allow_frontier": bool(allow_frontier),
             "observation": observation_payload,
             "search_poses": list(self._search_poses),
             "camera_horizontal_fov_deg": self.find_loop.camera_horizontal_fov_deg,

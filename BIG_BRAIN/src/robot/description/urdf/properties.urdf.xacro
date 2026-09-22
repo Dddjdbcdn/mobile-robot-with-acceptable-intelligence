@@ -43,15 +43,15 @@
   <!-- IMU -->
   <xacro:property name="imu_z_offset" value="0.0"/> <!-- MPU to Base bottom -->
 
-  <!-- Ultrasonic -->
-  <xacro:property name="ultrasonic_x_offset" value="0.012"/> <!-- Ultrasonic center to Base front -->
-  <xacro:property name="side_ultrasonic_y_offset" value="0.105"/> <!-- Side ultrasonic center to Base center -->
-  <xacro:property name="ultrasonic_z_offset" value="0.012"/> <!-- Ultrasonic center to Base bottom -->
+  <!-- Range -->
+  <xacro:property name="range_x_offset" value="0.019"/> <!-- Range center to Base front -->
+  <xacro:property name="side_range_y_offset" value="0.093"/> <!-- Side range center to Base center -->
+  <xacro:property name="range_z_offset" value="0.01"/> <!-- Range center to Base bottom -->
 
-  <xacro:property name="ultrasonic_z_angle" value="0.43"/> <!-- Side ultrasonic angle to Base front -->
-  <xacro:property name="ultrasonic_length" value="0.01"/>
-  <xacro:property name="ultrasonic_width" value="0.04"/>
-  <xacro:property name="ultrasonic_height" value="0.02"/>
+  <xacro:property name="range_z_angle" value="0.3554"/> <!-- Side range angle to Base front -->
+  <xacro:property name="range_length" value="0.016"/>
+  <xacro:property name="range_width" value="0.005"/>
+  <xacro:property name="range_height" value="0.014"/>
 
   <!-- Materials -->
   <material name="blue">

@@ -300,35 +300,6 @@
   },
   {
     "type": "function",
-    "name": "move_camera",
-    "description": "Aim only the camera at an absolute semantic region without rotating or translating the robot body. Use when the user says to look up, down, left, right, center, or toward a corner without naming a target to track. Do not use while a target goal or continuous tracking owns the camera.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "region": {
-          "type": "string",
-          "enum": [
-            "upper_left",
-            "up",
-            "upper_right",
-            "left",
-            "center",
-            "right",
-            "lower_left",
-            "down",
-            "lower_right"
-          ],
-          "description": "Absolute camera region requested by the user. Natural phrases such as top-left map to upper_left, straight ahead maps to center, and bottom-right maps to lower_right."
-        }
-      },
-      "required": [
-        "region"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
     "name": "go_idle",
     "description": "Put DJ into settled idle mode when the user explicitly asks it to wait, chill, stop talking, go idle, settle down, rest, or stop initiating interactions. This stops active robot behavior, centers the camera, and suppresses autonomous proximity reactions, idle conversation, and person-seeking until the user speaks or gives another command.",
     "parameters": {

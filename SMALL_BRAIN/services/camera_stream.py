@@ -30,6 +30,8 @@ class CameraSnapshot:
 
 class CameraStream:
     SOURCES = ("usb", "astra")
+    USB_RECONNECT_DELAY = 0.5
+    USB_READ_FAILURE_LIMIT = 5
 
     USB_CONTROL_ENV = {
         "USB_CAMERA_BRIGHTNESS": "brightness",
@@ -327,40 +329,56 @@ class CameraStream:
 
     def _capture_loop(self):
         camera = None
+        connected_once = False
         try:
-            camera = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
-            if not camera.isOpened():
-                raise RuntimeError(f"Could not open camera {self.camera_index}.")
-
-            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
-            camera.set(cv2.CAP_PROP_FPS, self.fps)
-            self._apply_usb_controls()
-
-            first_frame_received = False
-
-            last_time = time.monotonic()
-            frame_count = 0
-
             while not self.stop_event.is_set():
-                ok, full_frame = camera.read()
-                if not ok or full_frame is None:
-                    time.sleep(0.01)
+                try:
+                    camera = self._open_usb_camera()
+                except Exception as error:
+                    if connected_once:
+                        print(f"[USB camera reconnect failed: {error}]")
+                    else:
+                        print(f"[Waiting for USB camera {self.usb_device}: {error}]")
+                    self._mark_usb_unavailable()
+                    if self.stop_event.wait(self.USB_RECONNECT_DELAY):
+                        break
                     continue
 
-                now = time.monotonic()
-                frame_count += 1
-                if now - last_time >= 1.0: 
-                    self.current_fps = frame_count / (now - last_time)
-                    frame_count = 0
-                    last_time = now
+                if connected_once:
+                    print(f"[USB camera reconnected: {self.usb_device}]")
+                connected_once = True
+                last_time = time.monotonic()
+                frame_count = 0
+                read_failures = 0
 
-                self._record_frame("usb", full_frame)
+                while not self.stop_event.is_set():
+                    ok, full_frame = camera.read()
+                    if not ok or full_frame is None:
+                        read_failures += 1
+                        if read_failures >= self.USB_READ_FAILURE_LIMIT:
+                            print(
+                                "[USB camera stopped delivering frames; "
+                                "reopening device]"
+                            )
+                            break
+                        self.stop_event.wait(0.01)
+                        continue
 
-                if not first_frame_received:
-                    first_frame_received = True
-                    
+                    read_failures = 0
+                    now = time.monotonic()
+                    frame_count += 1
+                    if now - last_time >= 1.0:
+                        self.current_fps = frame_count / (now - last_time)
+                        frame_count = 0
+                        last_time = now
+
+                    self._record_frame("usb", full_frame)
+
+                camera.release()
+                camera = None
+                self._mark_usb_unavailable()
+                if not self.stop_event.is_set():
+                    self.stop_event.wait(self.USB_RECONNECT_DELAY)
         except Exception as error:
             self.startup_error = error
             self.ready_event.set()
@@ -369,6 +387,35 @@ class CameraStream:
                 camera.release()
             with self.condition:
                 self.condition.notify_all()
+
+    def _open_usb_camera(self):
+        """Open the stable V4L2 path and restore its capture configuration."""
+        camera = cv2.VideoCapture(self.usb_device, cv2.CAP_V4L2)
+        if not camera.isOpened():
+            camera.release()
+            raise RuntimeError(f"Could not open camera {self.usb_device}.")
+
+        try:
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+            camera.set(cv2.CAP_PROP_FPS, self.fps)
+            self._apply_usb_controls()
+        except Exception:
+            camera.release()
+            raise
+        return camera
+
+    def _mark_usb_unavailable(self):
+        """Prevent consumers from using a stale frame while USB reconnects."""
+        with self.condition:
+            self._source_latest.pop("usb", None)
+            if self._source == "usb":
+                self.latest = None
+                self.history.clear()
+                self.history_sequence = self.sequence
+                self.current_fps = 0.0
+            self.condition.notify_all()
 
     def _astra_receive_loop(self):
         socket = self._zmq_context.socket(zmq.SUB)

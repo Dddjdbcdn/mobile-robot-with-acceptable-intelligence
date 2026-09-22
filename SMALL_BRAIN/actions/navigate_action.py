@@ -55,19 +55,34 @@ Image 2 is the clue frame selected by search. The orange outline shows the
 reliable close-range portion of that observation; its angular direction
 continues beyond the outline. Numbered C poses investigate the clue nearby.
 CF is the furthest reachable pose on the observation's center ray before a
-blockage. F-prefixed poses are frontiers inside the observation's angular span
-and may be farther than the reliable camera range.
+blockage. Context mode never offers frontier poses.
 
-Use candidate_type, remaining_waypoints, Image 2, and contextual_clue to choose
-one pose that continues the active hypothesis. visual is handled without
-navigation by same-view reassessment and tracking; local permits nearby
-investigation; destination may follow a grounded route. Speculative clues are
-ignored and never reach navigation. The listed poses
-already enforce the movement scope. Do not reinterpret the clue or start a new
-hypothesis. Do not choose a farther pose merely because it is farther away.
+Use remaining_waypoints, Image 2, and contextual_clue to choose one nearby
+investigative pose. The listed poses already enforce the movement scope. Do not
+choose a farther pose merely because it is farther away.
 
 Never return goal_reached because target verification happens after arrival.
 Return blocked only when no listed pose can investigate the clue.""",
+    "destination": """MODE: destination
+Image 2 is the grounded destination clue selected by search. Choose the safe
+context pose that best follows that clue. Destination poses use the same cone
+logic as local investigation but may reach up to 4 metres to encourage useful
+wide movement. No frontier poses are offered.
+
+Never return goal_reached because target verification happens after arrival.
+Return blocked only when no listed pose can follow the grounded clue.""",
+    "exploration": """MODE: exploration
+Image 2 is a fresh center-facing camera view. The map offers the best nearby
+inspection pose and EF, the furthest reachable pose continuing forward through
+known traversable space. Space between the two poses may not have been visually
+inspected even when it is traversable.
+
+Choose EF only when the centered camera view and map show that advancing farther
+is likely more useful than inspecting from the nearby pose. Prefer the nearby
+pose when objects, openings, side areas, or other useful search detail could be
+missed between the choices. Never return goal_reached because target
+verification happens after arrival. Return blocked only when neither pose can
+support exploration.""",
 }
 
 
@@ -87,12 +102,15 @@ class NavigateAction:
 
     def __init__(
         self, ws, camera, send_robot_command, debug_dir=None,
-        request_map_snapshot=None,
+        request_map_snapshot=None, map_crop_size_m=None,
+        see_action=None, send_map_overlay=None,
     ):
         self.ws = ws
         self.camera = camera
         self.send_robot_command = send_robot_command
         self.request_map_snapshot = request_map_snapshot
+        self.send_map_overlay = send_map_overlay
+        self.see_action = see_action
         path = Path(__file__).resolve().parents[1] / 'tools' / 'vision_oob_tools.json'
         tool_definitions = json.loads(path.read_text())
         self.selection_tool_template = next(
@@ -104,6 +122,13 @@ class NavigateAction:
             Path(__file__).resolve().parents[1] / 'results' / 'navigation'
         )
         self.active = False
+        self.map_crop_size_m = float(
+            map_crop_size_m
+            if map_crop_size_m is not None
+            else os.environ.get('NAVIGATION_MAP_CROP_SIZE_M', '4.0')
+        )
+        if not 1.0 <= self.map_crop_size_m <= 20.0:
+            raise ValueError('navigation map crop size must be between 1 and 20 metres')
         self.action_id = self.target = None
         self.stage = 'idle'
         self.completion_future = None
@@ -111,6 +136,8 @@ class NavigateAction:
         self._request_id = self._snapshot_id = None
         self._overlay_action_id = None
         self._overlay_revision = 0
+        self._owns_goal_overlay = False
+        self._goal_search_poses = []
         self._candidates = {}
         self._stop_requested = self._command_sent = False
         self._command_lock = asyncio.Lock()
@@ -139,7 +166,7 @@ class NavigateAction:
         if not isinstance(query, str) or not query.strip():
             return ActionResult(action_id, 'navigate_action', 'failed',
                                 reason_code='NAVIGATION_QUERY_REQUIRED')
-        if mode not in {'goal', 'context', 'exploration'}:
+        if mode not in {'goal', 'context', 'destination', 'exploration'}:
             return ActionResult(action_id, 'navigate_action', 'failed',
                                 reason_code='UNKNOWN_NAVIGATION_MODE')
         self.active = True
@@ -152,8 +179,16 @@ class NavigateAction:
             and isinstance(observation.get('jpeg_bytes'), (bytes, bytearray))
             else None
         )
-        self._overlay_action_id = overlay_action_id
-        self._overlay_revision = int(overlay_revision or 0)
+        self._owns_goal_overlay = (
+            mode == 'goal' and self.send_map_overlay is not None
+        )
+        self._overlay_action_id = (
+            action_id if self._owns_goal_overlay else overlay_action_id
+        )
+        self._overlay_revision = (
+            0 if self._owns_goal_overlay else int(overlay_revision or 0)
+        )
+        self._goal_search_poses = []
         self._max_steps = max(
             1, min(self.MAX_STEPS, int(max_steps or self.MAX_STEPS))
         )
@@ -193,6 +228,9 @@ class NavigateAction:
             completed_steps = []
             self._result_data['steps'] = completed_steps
 
+            if self._owns_goal_overlay:
+                await self._publish_goal_overlay()
+
             for step_number in range(1, self._max_steps + 1):
                 if time.monotonic() - started_at > self.MAX_DURATION:
                     raise NavigationError(
@@ -205,7 +243,7 @@ class NavigateAction:
                 snapshot, camera_jpeg = await self._capture()
                 selection = (
                     self._deterministic_selection(snapshot)
-                    if self._mode == 'exploration'
+                    if self._mode == 'exploration' and len(self._candidates) == 1
                     else await self._select_pose(
                         snapshot, camera_jpeg, step_number
                     )
@@ -289,22 +327,25 @@ class NavigateAction:
                 self._finish('failed', 'navigation_failed',
                              getattr(error, 'code', 'NAVIGATION_ERROR'))
 
-    async def _capture(self):
+    async def _capture(self, refresh_goal_overlay=True):
         request_map_snapshot = getattr(self, 'request_map_snapshot', None)
         if request_map_snapshot is None:
             raise NavigationError(
                 'MAP_STREAM_UNAVAILABLE', 'Map request client is not configured'
             )
         map_request_id = uuid.uuid4().hex
+        request = {
+            'schema_version': 1,
+            'operation': 'snapshot',
+            'action_id': self.action_id,
+            'request_id': map_request_id,
+            'overlay_action_id': self._overlay_action_id,
+            'overlay_revision': self._overlay_revision,
+        }
+        if self._mode != 'exploration':
+            request['crop_size_m'] = getattr(self, 'map_crop_size_m', 4.0)
         try:
-            snapshot = await request_map_snapshot({
-                'schema_version': 1,
-                'operation': 'snapshot',
-                'action_id': self.action_id,
-                'request_id': map_request_id,
-                'overlay_action_id': self._overlay_action_id,
-                'overlay_revision': self._overlay_revision,
-            })
+            snapshot = await request_map_snapshot(request)
         except (asyncio.TimeoutError, TimeoutError, RuntimeError, zmq.ZMQError) as error:
             raise NavigationError('MAP_STREAM_UNAVAILABLE', str(error)) from error
 
@@ -324,6 +365,13 @@ class NavigateAction:
                 'Map service did not render the requested find overlay revision',
             )
         self._snapshot_id = metadata['snapshot_id']
+        if (
+            refresh_goal_overlay
+            and self._remember_goal_pose(metadata.get('robot_pose'))
+        ):
+            await self._publish_goal_overlay()
+            return await self._capture(refresh_goal_overlay=False)
+
         self._save_map_snapshot(snapshot)
         self._candidates = {
             candidate['id']: dict(candidate)
@@ -332,9 +380,29 @@ class NavigateAction:
         if not self._candidates:
             raise NavigationError('NO_NAVIGATION_CANDIDATES', 'No reachable map candidates')
 
-        # Exploration is map-ranked, and context already supplies its clue frame.
-        if self._mode != 'goal':
+        # Contextual modes already carry the exact clue frame. A single
+        # exploration candidate is map-ranked and needs no vision request.
+        if self._mode in {'context', 'destination'}:
             return snapshot, None
+        if self._mode == 'exploration' and len(self._candidates) == 1:
+            return snapshot, None
+
+        if self._mode == 'exploration':
+            camera_mover = getattr(self, 'see_action', None)
+            if camera_mover is None:
+                raise NavigationError(
+                    'CAMERA_CENTER_UNAVAILABLE',
+                    'Exploration pose comparison requires camera centering',
+                )
+            centered = await camera_mover.move_to_region(
+                region='center',
+                action_id=f'{self.action_id}:center-camera',
+            )
+            if centered.status != 'succeeded':
+                raise NavigationError(
+                    'CAMERA_CENTER_FAILED',
+                    centered.reason_code or 'Could not center the camera',
+                )
 
         frame = self.camera.snapshot()
         if time.monotonic() - frame.captured_at > self.CAMERA_MAX_AGE:
@@ -346,6 +414,57 @@ class NavigateAction:
         if not ok:
             raise NavigationError('CAMERA_ENCODING_FAILED', 'Could not encode camera image')
         return snapshot, jpeg.tobytes()
+
+    def _remember_goal_pose(self, pose):
+        if not getattr(self, '_owns_goal_overlay', False) or not isinstance(pose, dict):
+            return False
+        try:
+            observed = {
+                'x': float(pose['x']),
+                'y': float(pose['y']),
+                'yaw': float(pose['yaw']),
+                'frame_id': str(pose.get('frame_id') or 'map'),
+                'kind': 'navigation_pose',
+                'reason': (
+                    'navigation_start' if not self._goal_search_poses
+                    else 'waypoint_reached'
+                ),
+                'step': len(self._goal_search_poses),
+                'views': [],
+            }
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._goal_search_poses.append(observed)
+        self._overlay_revision += 1
+        return True
+
+    async def _publish_goal_overlay(self):
+        await self.send_map_overlay({
+            'schema_version': 1,
+            'operation': 'set',
+            'action_id': self.action_id,
+            'revision': self._overlay_revision,
+            'frame_id': (
+                self._goal_search_poses[-1]['frame_id']
+                if self._goal_search_poses else 'map'
+            ),
+            'mode': 'goal',
+            'observation': None,
+            'search_poses': list(self._goal_search_poses),
+        })
+
+    def _discard_goal_overlay(self):
+        if (
+            not getattr(self, '_owns_goal_overlay', False)
+            or getattr(self, 'send_map_overlay', None) is None
+        ):
+            return
+        asyncio.create_task(self.send_map_overlay({
+            'schema_version': 1,
+            'operation': 'clear',
+            'action_id': self.action_id,
+            'revision': self._overlay_revision,
+        }))
 
     def _deterministic_selection(self, snapshot):
         metadata = snapshot.get('metadata') or {}
@@ -382,8 +501,9 @@ class NavigateAction:
                     key: candidate.get(key)
                     for key in (
                         'kind', 'distance_m', 'selection_reason',
-                        'candidate_type', 'hypothesis_id',
-                        'remaining_waypoints', 'allow_frontier',
+                        'ray_extension_m', 'uncovered_cell_count',
+                        'candidate_type',
+                        'remaining_waypoints',
                         'reassessment_limit', 'reassessments_used',
                     )
                     if candidate.get(key) is not None
@@ -394,13 +514,6 @@ class NavigateAction:
                 {
                     'contextual_clue': self._observation.get('contextual_clue'),
                     'candidate_type': self._observation.get('candidate_type'),
-                    'original_candidate_type': self._observation.get(
-                        'original_candidate_type'
-                    ),
-                    'original_contextual_clue': self._observation.get(
-                        'original_contextual_clue'
-                    ),
-                    'hypothesis_id': self._observation.get('hypothesis_id'),
                     'movement_limit': self._observation.get('movement_limit'),
                     'movements_used': self._observation.get('movements_used'),
                     'remaining_waypoints': self._observation.get(
@@ -412,7 +525,6 @@ class NavigateAction:
                     'reassessments_used': self._observation.get(
                         'reassessments_used'
                     ),
-                    'allow_frontier': self._observation.get('allow_frontier'),
                 }
                 if self._observation is not None else None
             ),
@@ -426,7 +538,7 @@ class NavigateAction:
         )
         vision_jpeg = (
             camera_jpeg
-            if self._mode == 'goal'
+            if self._mode in {'goal', 'exploration'}
             else bytes(self._observation['jpeg_bytes'])
         )
         self._save_debug_inputs(
@@ -535,7 +647,7 @@ class NavigateAction:
             'request_id': request_id,
             'snapshot_id': self._snapshot_id,
             'step': step_number,
-            'input_images': ['latest_map.jpg', 'latest_vision.jpg'],
+            'input_images': ['latest_map_crop.jpg', 'latest_vision.jpg'],
             'prompt': prompt,
             'tool': tool,
             'map_metadata': map_metadata,
@@ -554,10 +666,14 @@ class NavigateAction:
             self._result_data['debug_save_error'] = str(error)
 
     def _save_map_snapshot(self, snapshot):
-        """Save the map-stream image exactly as navigation received it."""
+        """Save both the exact LLM crop and the uncropped map for debugging."""
         try:
             self._atomic_write(
-                self.debug_dir / 'latest_map.jpg', snapshot['jpeg_bytes']
+                self.debug_dir / 'latest_map_crop.jpg', snapshot['jpeg_bytes']
+            )
+            self._atomic_write(
+                self.debug_dir / 'latest_map_full.jpg',
+                snapshot.get('full_jpeg_bytes', snapshot['jpeg_bytes']),
             )
         except OSError as error:
             self._result_data['debug_save_error'] = str(error)
@@ -610,6 +726,8 @@ class NavigateAction:
         self.active = False
         self.stage = 'idle'
         self._request_id = None
+        self._discard_goal_overlay()
+        self._owns_goal_overlay = False
         for future in (self._selection_future, self._navigation_future):
             if future is not None and not future.done():
                 future.cancel()

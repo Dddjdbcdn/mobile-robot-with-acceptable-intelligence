@@ -154,14 +154,6 @@ class MapImageStream:
                     "tilt_angle": float(observation.get("tilt_angle", 90.0)),
                     "contextual_clue": str(observation.get("contextual_clue") or ""),
                     "candidate_type": str(observation.get("candidate_type") or ""),
-                    "original_candidate_type": str(
-                        observation.get("original_candidate_type") or ""
-                    ),
-                    "original_contextual_clue": str(
-                        observation.get("original_contextual_clue")
-                        or observation.get("contextual_clue") or ""
-                    ),
-                    "hypothesis_id": str(observation.get("hypothesis_id") or ""),
                     "movement_limit": int(observation.get("movement_limit") or 0),
                     "movements_used": int(observation.get("movements_used") or 0),
                     "remaining_waypoints": int(
@@ -172,9 +164,6 @@ class MapImageStream:
                     ),
                     "reassessments_used": int(
                         observation.get("reassessments_used") or 0
-                    ),
-                    "allow_frontier": bool(
-                        observation.get("allow_frontier", False)
                     ),
                 }
         search_poses = []
@@ -195,7 +184,6 @@ class MapImageStream:
             "revision": revision,
             "frame_id": str(message.get("frame_id") or "map"),
             "mode": mode,
-            "allow_frontier": bool(message.get("allow_frontier", True)),
             "observation": normalized_observation,
             "search_poses": search_poses,
             "camera_horizontal_fov_deg": float(message.get("camera_horizontal_fov_deg", 60.0)),
@@ -211,11 +199,10 @@ class MapImageStream:
             "tilt": float(view["tilt"]),
         }
         for key in (
-            "candidate_type", "hypothesis_id", "original_candidate_type",
-            "contextual_clue", "original_contextual_clue",
+            "candidate_type", "contextual_clue",
             "movement_limit", "movements_used",
             "remaining_waypoints", "reassessment_limit",
-            "reassessments_used", "allow_frontier",
+            "reassessments_used",
         ):
             if view.get(key) is not None:
                 normalized[key] = view[key]
@@ -312,16 +299,20 @@ class MapImageStream:
             if operation != "snapshot":
                 self.socket.send_json({"ok": True, "operation": operation})
                 return
-            encoded = self._encoded_cache if self.delivery_mode == "fixed_hz" else None
+            crop_size_m = message.get("crop_size_m")
+            encoded = (
+                self._encoded_cache
+                if self.delivery_mode == "fixed_hz" and crop_size_m is None else None
+            )
             if encoded is None:
-                encoded = self._encode_snapshot()
+                encoded = self._encode_snapshot(crop_size_m=crop_size_m)
                 # At startup a request can arrive before the first periodic
                 # analysis. Prepare immediately once instead of making the
                 # client wait for the background schedule.
                 if encoded is None and self.prepared is None:
                     self._refresh_analysis()
-                    encoded = self._encode_snapshot()
-                if self.delivery_mode == "fixed_hz":
+                    encoded = self._encode_snapshot(crop_size_m=crop_size_m)
+                if self.delivery_mode == "fixed_hz" and crop_size_m is None:
                     self._encoded_cache = encoded
             if encoded is None:
                 self.socket.send_json({
@@ -333,12 +324,13 @@ class MapImageStream:
                     "retryable": self._last_render_error is None,
                 })
                 return
-            metadata, jpeg = encoded
+            metadata, jpeg, full_jpeg = encoded
             response_metadata = dict(metadata)
             response_metadata["snapshot_request_id"] = str(message.get("request_id") or "")
-            self.socket.send_multipart([
-                json.dumps(response_metadata).encode("utf-8"), jpeg,
-            ])
+            parts = [json.dumps(response_metadata).encode("utf-8"), jpeg]
+            if full_jpeg is not None:
+                parts.append(full_jpeg)
+            self.socket.send_multipart(parts)
         except Exception as error:
             self.node.get_logger().warning(f"Map request: {error}")
             self.socket.send_json({
@@ -396,6 +388,7 @@ class MapImageStream:
         )
 
         mode = str((overlay or {}).get("mode") or "goal")
+        deterministic = mode == "exploration" and len(candidates) == 1
         search_poses = (overlay or {}).get("search_poses") or []
         metadata = {
             "schema_version": 1,
@@ -410,11 +403,11 @@ class MapImageStream:
             "sample_radius_m": self.logic.cfg.sample_radius,
             "selection_mode": mode,
             "selection_policy": (
-                "deterministic" if mode == "exploration" else "vision"
+                "deterministic" if deterministic else "vision"
             ),
             "selected_pose_id": (
                 candidates[0]["id"]
-                if mode == "exploration" and len(candidates) == 1 else None
+                if deterministic and len(candidates) == 1 else None
             ),
             "live_camera_fov": live_fov,
             "observation_fov": observation,
@@ -423,12 +416,8 @@ class MapImageStream:
                     "action_id": overlay.get("action_id"),
                     "revision": int(overlay.get("revision", 0)),
                     "mode": mode,
-                    "allow_frontier": bool(overlay.get("allow_frontier", True)),
                     "candidate_type": str(
                         (overlay.get("observation") or {}).get("candidate_type") or ""
-                    ),
-                    "hypothesis_id": str(
-                        (overlay.get("observation") or {}).get("hypothesis_id") or ""
                     ),
                     "coverage_observation_count": sum(
                         len(item.get("views") or []) for item in search_poses
@@ -447,8 +436,53 @@ class MapImageStream:
             },
         }
         return image, metadata
+    @staticmethod
+    def _crop_snapshot(image, metadata, crop_size_m):
+        size = float(crop_size_m)
+        if not math.isfinite(size) or size <= 0.0:
+            raise ValueError("crop_size_m must be a positive finite number")
+        pose = metadata["robot_pose"]
+        bounds = metadata["image_world_bounds"]
+        height, width = image.shape[:2]
+        ppm_x = width / (bounds["xmax"] - bounds["xmin"])
+        ppm_y = height / (bounds["ymax"] - bounds["ymin"])
+        crop_width = max(1, round(size * ppm_x))
+        crop_height = max(1, round(size * ppm_y))
+        center_x = round((pose["x"] - bounds["xmin"]) * ppm_x)
+        center_y = round((bounds["ymax"] - pose["y"]) * ppm_y)
+        x0 = center_x - crop_width // 2
+        y0 = center_y - crop_height // 2
+        x1, y1 = x0 + crop_width, y0 + crop_height
+        source_x0, source_y0 = max(0, x0), max(0, y0)
+        source_x1, source_y1 = min(width, x1), min(height, y1)
+        cropped = image[source_y0:source_y1, source_x0:source_x1]
+        cropped = cv2.copyMakeBorder(
+            cropped,
+            source_y0 - y0, y1 - source_y1,
+            source_x0 - x0, x1 - source_x1,
+            cv2.BORDER_CONSTANT, value=(62, 62, 62),
+        )
+        half = size / 2.0
+        crop_bounds = {
+            "xmin": float(pose["x"]) - half,
+            "xmax": float(pose["x"]) + half,
+            "ymin": float(pose["y"]) - half,
+            "ymax": float(pose["y"]) + half,
+        }
+        metadata = dict(metadata)
+        metadata["full_image_world_bounds"] = bounds
+        metadata["image_world_bounds"] = crop_bounds
+        metadata["map_crop_size_m"] = size
+        if metadata.get("selection_policy") == "vision":
+            metadata["candidates"] = [
+                item for item in metadata["candidates"]
+                if crop_bounds["xmin"] <= item["x"] <= crop_bounds["xmax"]
+                and crop_bounds["ymin"] <= item["y"] <= crop_bounds["ymax"]
+            ]
+        return cropped, metadata
 
-    def _encode_snapshot(self):
+
+    def _encode_snapshot(self, crop_size_m=None):
         self._last_render_error = None
         with self.state_lock:
             prepared = self.prepared
@@ -469,11 +503,24 @@ class MapImageStream:
             image, metadata = self._compose_snapshot(
                 prepared, pose, camera_pan_angle
             )
+            full_image = image
+            if crop_size_m is not None:
+                image, metadata = self._crop_snapshot(
+                    image, metadata, crop_size_m
+                )
             ok, jpeg = cv2.imencode(
                 ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]
             )
             if not ok:
                 raise RuntimeError("OpenCV failed to encode the map JPEG")
+            full_jpeg = None
+            if crop_size_m is not None:
+                full_ok, full_encoded = cv2.imencode(
+                    ".jpg", full_image, [cv2.IMWRITE_JPEG_QUALITY, 85]
+                )
+                if not full_ok:
+                    raise RuntimeError("OpenCV failed to encode the full map JPEG")
+                full_jpeg = full_encoded.tobytes()
             encoded_at = time.monotonic()
             self.sequence += 1
             metadata.update({
@@ -489,7 +536,7 @@ class MapImageStream:
                 "render_ms": round((encoded_at - started_at) * 1000, 1),
             })
             self._not_ready_reason = None
-            return metadata, jpeg.tobytes()
+            return metadata, jpeg.tobytes(), full_jpeg
         except Exception as error:
             self._last_render_error = (
                 f"Map render failed: {type(error).__name__}: {error}"

@@ -53,18 +53,15 @@ class MapRenderer:
         )
 
         mode = str((search_overlay or {}).get("mode") or "")
-        frontiers = (
-            prepared["frontiers"] if mode == "exploration"
-            else [item for item in candidates if item.get("kind") == "frontier"]
-        )
-        self._draw_frontier_candidates(
-            image, view, frontiers, debug=mode == "exploration"
-        )
+        frontiers = [
+            item for item in candidates if item.get("kind") == "frontier"
+        ]
+        self._draw_frontier_candidates(image, view, frontiers)
         self._draw_dynamic(
             image, view, pose,
             [item for item in candidates if item.get("kind") != "frontier"],
         )
-        if mode == "exploration" and candidates:
+        if mode == "exploration" and len(candidates) == 1:
             self._draw_selected_pose(image, view, candidates[0])
         return image
 

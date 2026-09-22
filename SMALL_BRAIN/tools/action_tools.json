@@ -20,7 +20,7 @@
   {
     "type": "function",
     "name": "watch_target",
-    "description": "Start continuous camera tracking. If succeeded, tracking remains active until stopped.",
+    "description": "Start continuous camera tracking. If succeeded, tracking remains active until replaced by another camera action or stopped with stop_tracking.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -32,6 +32,65 @@
       "required": [
         "target"
       ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "see_action",
+    "description": "Look at the current scene and answer a visual question. Optionally move the camera to a semantic region first; the observation is always captured after the camera settles, so never call a separate camera-move tool.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to inspect or determine from the new camera image."
+        },
+        "region": {
+          "type": ["string", "null"],
+          "enum": ["upper_left", "up", "upper_right", "left", "center", "right", "lower_left", "down", "lower_right", null],
+          "description": "Optional camera direction to move to before observing; null keeps the current view."
+        }
+      },
+      "required": ["query", "region"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "navigate_action",
+    "description": "Goal-mode navigation. The robot may repeatedly inspect a local map crop and camera view, choose safe Nav2 waypoints, and roam until the complete movement goal is visibly confirmed, blocked, stopped, or a safety limit is reached. Call once for the whole navigation goal.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The complete destination or roaming goal, including any visual arrival condition."
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "follow_action",
+    "description": "Continuously find and track a person, approaching again whenever they move beyond the requested radius. This remains active until stopped and includes target-loss recovery.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The person to follow. Use person for an unspecified person."
+        },
+        "radius_m": {
+          "type": ["number", "null"],
+          "minimum": 0.4,
+          "maximum": 5.0,
+          "description": "Desired following distance in metres; null uses the configured default."
+        }
+      },
+      "required": ["target", "radius_m"],
       "additionalProperties": false
     }
   }

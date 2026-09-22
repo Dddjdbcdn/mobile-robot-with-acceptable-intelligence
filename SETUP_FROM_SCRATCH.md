@@ -613,7 +613,7 @@ Reset the STM32, then check topics from another ROS terminal:
 ros2 node list
 ros2 topic hz /stm32/imu_msg
 ros2 topic hz /stm32/wheel_states
-ros2 topic hz /stm32/ultrasonic_msg
+ros2 topic hz /stm32/range_msg
 ros2 topic hz /stm32/tof_raw_data
 ```
 

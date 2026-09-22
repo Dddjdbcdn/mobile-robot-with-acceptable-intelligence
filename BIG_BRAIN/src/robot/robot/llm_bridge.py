@@ -3,6 +3,7 @@ import threading
 import json
 import struct
 from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -125,7 +126,13 @@ class LLMRosBridge(Node):
         self.cmd_pub = self.create_publisher(TwistStamped, '/diff_drive_controller/cmd_vel', 10)
         self.servo_pan_pub = self.create_publisher(Float32, '/stm32/servo_pan', 10)
         self.servo_tilt_pub = self.create_publisher(Float32, '/stm32/servo_tilt', 10)
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.goal_update_pub = self.create_publisher(
+            PoseStamped, "/goal_update", 10
+        )
+        config_dir = Path(get_package_share_directory("robot")) / "config"
+        self.dj_bt = str(config_dir / "behavior_dj.xml")
+        self.follow_bt = str(config_dir / "behavior_follow.xml")
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -179,6 +186,8 @@ class LLMRosBridge(Node):
         self.move_action_timer = None
         self.track_action_timer = None
         self.navigation_active = False
+        self.navigation_mode = None
+        self.nav_goal_generation = 0
         self.moving_active = False
         self.tracking_body_active = False
         self.max_tracking_time = 10.0
@@ -374,11 +383,17 @@ class LLMRosBridge(Node):
         ang = ang_vel if elapsed < rot_dur else 0.0
         self.publish_cmd(lin, ang)
 
-    def nav_goal_response_cb(self, future):
+    def nav_goal_response_cb(
+        self, future, action_id, navigation_mode, generation
+    ):
         goal_handle = future.result()
+        if generation != self.nav_goal_generation:
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
+            return
         if not goal_handle.accepted:
             self.navigation_active = False
-            action_id = self.current_nav_action_id
+            self.navigation_mode = None
             self.current_nav_action_id = None
             self.send_event(
                 "navigation",
@@ -386,17 +401,27 @@ class LLMRosBridge(Node):
                 action_id,
             )
             return
-        
+
         self.current_nav_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.nav_result_cb)
+        result_future.add_done_callback(
+            lambda completed: self.nav_result_cb(
+                completed, goal_handle, action_id, navigation_mode, generation
+            )
+        )
 
-    def nav_result_cb(self, future):
+    def nav_result_cb(
+        self, future, goal_handle, action_id, navigation_mode, generation
+    ):
         status = future.result().status
-        self.navigation_active = False
-        self.current_nav_goal_handle = None
-        action_id = self.current_nav_action_id
-        self.current_nav_action_id = None
+        if (
+            generation == self.nav_goal_generation
+            and self.current_nav_goal_handle is goal_handle
+        ):
+            self.navigation_active = False
+            self.navigation_mode = None
+            self.current_nav_goal_handle = None
+            self.current_nav_action_id = None
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.send_event("navigation", "Goal Reached", action_id)
         else:
@@ -411,10 +436,13 @@ class LLMRosBridge(Node):
             self.move_action_timer.cancel()
             self.move_action_timer = None
             self.moving_active = False
+        self.nav_goal_generation += 1
         if self.current_nav_goal_handle:
             self.current_nav_goal_handle.cancel_goal_async()
-            self.current_nav_goal_handle = None
-            self.navigation_active = False
+        self.current_nav_goal_handle = None
+        self.current_nav_action_id = None
+        self.navigation_active = False
+        self.navigation_mode = None
 
         self.publish_cmd(0.0, 0.0)
 
@@ -549,16 +577,18 @@ class LLMRosBridge(Node):
                         "camera_reset": reset_camera,
                     })
 
-                elif cmd in {"navigate_to_pose", "navigate_to_approach"}:
-                    self.stop_all_motion()
-
+                elif cmd in {
+                    "navigate_to_pose",
+                    "navigate_to_approach",
+                    "navigate_to_follow",
+                }:
                     x = float(request.get("x", 0.0))
                     y = float(request.get("y", 0.0))
                     angle = float(request.get("angle", 0.0))
                     frame_id = str(request.get("frame_id", "base_footprint"))
                     destination = None
 
-                    if cmd == "navigate_to_approach":
+                    if cmd in {"navigate_to_approach", "navigate_to_follow"}:
                         with self.map_image_stream.state_lock:
                             prepared = self.map_image_stream.prepared
                         if prepared is None:
@@ -576,7 +606,8 @@ class LLMRosBridge(Node):
                             continue
                         try:
                             destination = self.map_image_stream.logic.resolve_approach_destination(
-                                prepared, pose, x, y
+                                prepared, pose, x, y,
+                                standoff_m=request.get("standoff_m"),
                             )
                         except (KeyError, TypeError, ValueError) as error:
                             self.rep_socket.send_json({
@@ -588,20 +619,13 @@ class LLMRosBridge(Node):
                         angle = destination["angle"]
                         frame_id = destination["frame_id"]
 
-                    self.navigation_active = True
-                    self.current_nav_action_id = request.get("action_id")
-
                     pose_in = PoseStamped()
                     pose_in.header.frame_id = frame_id
-                    # A zero stamp requests the latest complete TF chain. SLAM's
-                    # map->odom transform can legitimately lag wall time.
+                    # A zero stamp requests the latest complete TF chain.
                     pose_in.header.stamp = rclpy.time.Time().to_msg()
-                    
                     pose_in.pose.position.x = x
                     pose_in.pose.position.y = y
                     pose_in.pose.position.z = 0.0
-                    
-                    # Apply the local yaw angle
                     pose_in.pose.orientation.z = math.sin(angle / 2.0)
                     pose_in.pose.orientation.w = math.cos(angle / 2.0)
 
@@ -610,33 +634,76 @@ class LLMRosBridge(Node):
                     else:
                         try:
                             timeout = rclpy.duration.Duration(seconds=0.1)
-                            pose_map = self.tf_buffer.transform(pose_in, 'map', timeout=timeout)
-                        except Exception as e:
-                            self.navigation_active = False
-                            self.current_nav_action_id = None
-                            self.rep_socket.send_json({"status": "error", "message": f"TF Transform failed: {e}"})
+                            pose_map = self.tf_buffer.transform(
+                                pose_in, "map", timeout=timeout
+                            )
+                        except Exception as error:
+                            self.rep_socket.send_json({
+                                "status": "error",
+                                "message": f"TF Transform failed: {error}",
+                            })
                             continue
+
+                    # GoalUpdater rejects zero-stamped messages and uses the stamp
+                    # to decide whether an update is newer than the seed goal.
+                    pose_map.header.stamp = self.get_clock().now().to_msg()
+
+                    if (
+                        cmd == "navigate_to_follow"
+                        and self.navigation_active
+                        and self.navigation_mode == "follow"
+                    ):
+                        self.goal_update_pub.publish(pose_map)
+                        self.rep_socket.send_json({
+                            "status": "accepted",
+                            "message": "Follow Goal Updated",
+                            "destination": destination,
+                        })
+                        continue
+
+                    self.stop_all_motion()
+                    if not self.nav_client.wait_for_server(timeout_sec=1.0):
+                        self.rep_socket.send_json({
+                            "status": "error", "message": "Nav2 not available"
+                        })
+                        continue
+
+                    action_id = request.get("action_id")
+                    navigation_mode = (
+                        "follow" if cmd == "navigate_to_follow" else "navigate"
+                    )
+                    self.navigation_active = True
+                    self.navigation_mode = navigation_mode
+                    self.current_nav_action_id = action_id
+                    self.nav_goal_generation += 1
+                    generation = self.nav_goal_generation
 
                     goal = NavigateToPose.Goal()
                     goal.pose = pose_map
-                    
-                    if not self.nav_client.wait_for_server(timeout_sec=1.0):
-                        self.navigation_active = False
-                        self.current_nav_action_id = None
-                        self.rep_socket.send_json({"status": "error", "message": "Nav2 not available"})
-                        continue
-
+                    goal.behavior_tree = (
+                        self.follow_bt
+                        if navigation_mode == "follow"
+                        else self.dj_bt
+                    )
                     send_goal_future = self.nav_client.send_goal_async(goal)
-                    send_goal_future.add_done_callback(self.nav_goal_response_cb)
+                    send_goal_future.add_done_callback(
+                        lambda completed: self.nav_goal_response_cb(
+                            completed, action_id, navigation_mode, generation
+                        )
+                    )
 
                     response = {
                         "status": "accepted",
-                        "message": "Nav2 Goal Dispatched",
+                        "message": (
+                            "Nav2 Follow Goal Dispatched"
+                            if navigation_mode == "follow"
+                            else "Nav2 Goal Dispatched"
+                        ),
                     }
                     if destination is not None:
                         response["destination"] = destination
                     self.rep_socket.send_json(response)
-                
+
                 elif cmd == "stop_moving":
                     self.stop_all_motion()
                     self.rep_socket.send_json({"status": "accepted", "message": "All motion stopped"})

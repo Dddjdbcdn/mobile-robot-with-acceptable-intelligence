@@ -75,14 +75,15 @@ Every streamed frame identifies the applied state under
 count, and pose count. NavigateAction waits for the requested action/revision
 before using the snapshot, preventing a decision against older planning state.
 In context mode, MapLogic creates candidates directly inside the selected clue
-cone at three ranges and three bearings, keeps up to six reachable choices, and
-adds one reachable backward viewpoint (`CB`) that still looks toward the clue.
+cone at three ranges and three bearings and adds a reachable backward viewpoint
+(`CB`) that still looks toward the clue. Destination uses the same vision-chosen
+context candidates with a wider 4 metre radius. Neither mode offers frontiers.
 An orange outline and ray show the source observation. In exploration mode,
-MapLogic samples reachable cells every 0.5 meters, shortlists cells near dense
-uncovered coverage, tests eight camera headings, and publishes only the pose and
-yaw that reveal the most uncovered known-free cells. Frontiers remain visible
-for debugging and become selectable when no sampled view has gain. The selected
-candidate reports `uncovered_cell_count` and `uncovered_ahead_fraction`.
+MapLogic samples reachable cells every 0.5 metres, shortlists cells near dense
+uncovered coverage, and tests eight camera headings. From the best pose it casts
+a 4 metre ray: an obstacle or covered cell keeps the original pose, while a
+clear or unknown-ending ray extends the goal to its furthest safe cell. The
+selected candidate reports coverage gain and ray-terminal metadata.
 GoalExecutor always captures the center, left, and right views at each
 inspection pose. Coverage is used to rank exploration viewpoints, not to gate
 camera sweep directions.
@@ -118,7 +119,8 @@ The implementation is split into two modules:
 
 - `BIG_BRAIN/src/robot/robot/map_logic.py`: occupancy/costmap processing,
   reachability, frontiers, doors, rooms, local samples, FOV/coverage sampling,
-  context filtering, and deterministic exploration ranking.
+  local and destination context filtering, and deterministic exploration-ray
+  ranking.
 - `BIG_BRAIN/src/robot/robot/map_renderer.py`: standalone OpenCV background and
   overlay rendering from already-computed candidates and grid masks.
 - `BIG_BRAIN/src/robot/robot/map_stream.py`: MapLogic/renderer orchestration,
@@ -128,8 +130,9 @@ The implementation is split into two modules:
 The renderer calls `MapLogic.prepare()` for the slow map analysis and
 `MapLogic.plan_candidates()` for every current-pose snapshot. The rendered
 candidate IDs and `metadata.candidates` therefore come from the same plan.
-`selection_policy=deterministic` includes one `selected_pose_id`; otherwise
-NavigateAction may ask vision to choose among the supplied IDs.
+Exploration snapshots use `selection_policy=deterministic` and include one
+`selected_pose_id`. Destination and local context snapshots use vision to choose
+among the supplied safe candidate IDs.
 
 IDs are only valid for their accompanying snapshot. Four-connected grid
 reachability is **not a Nav2 path check**. Nav2 remains responsible for path

@@ -52,10 +52,11 @@ class LogicConfig:
     context_radius_samples: int = 3
     context_bearing_fractions: tuple = (-0.75, 0.0, 0.75)
     context_backup_distance_m: float = 0.5
+    destination_context_radius_m: float = 4.0
     exploration_step: float = 0.5
     exploration_headings: int = 8
     exploration_shortlist: int = 16
-    exploration_frontier_distance_floor_m: float = 0.25
+    exploration_ray_m: float = 4.0
 
 
 def yaw_of(q):
@@ -151,7 +152,7 @@ class MapLogic:
         }
 
     def resolve_approach_destination(
-        self, prepared, pose, target_x, target_y
+        self, prepared, pose, target_x, target_y, standoff_m=None
     ):
         """Return the first safe approach pose on an inflated target ray."""
         grid = prepared["grid"]
@@ -218,10 +219,13 @@ class MapLogic:
             distance_limit = hit_distance
             resolution = "standoff_from_obstacle"
 
-        resolved_distance = max(
-            0.0,
-            distance_limit - self.cfg.approach_obstacle_standoff_m,
+        requested_standoff = (
+            self.cfg.approach_obstacle_standoff_m
+            if standoff_m is None else float(standoff_m)
         )
+        if not math.isfinite(requested_standoff) or requested_standoff < 0.0:
+            raise ValueError("approach standoff must be a non-negative finite number")
+        resolved_distance = max(0.0, distance_limit - requested_standoff)
 
         destination_x = (
             float(pose["x"]) + resolved_distance * math.cos(map_yaw)
@@ -284,6 +288,7 @@ class MapLogic:
             "target_distance_m": float(target_distance),
             "obstacle_distance_m": hit_distance,
             "resolved_distance_m": float(resolved_distance),
+            "standoff_m": requested_standoff,
         }
 
     def live_camera_fov(self, pose, camera_pan_angle):
@@ -345,21 +350,25 @@ class MapLogic:
     def plan_candidates(
         self, prepared, pose, search_overlay=None, *, coverage=None
     ):
-        if not isinstance(search_overlay, dict):
-            return []
-
-        overlay = search_overlay
+        # Standalone goal navigation does not need search history in order to
+        # produce reachable local poses. Search-specific modes still receive
+        # their context through an overlay.
+        overlay = search_overlay if isinstance(search_overlay, dict) else {}
         mode = str(overlay.get("mode") or "goal")
 
         if mode == "context":
             return self._context_candidates(prepared, pose, overlay)
+        elif mode == "destination":
+            return self._context_candidates(
+                prepared, pose, overlay,
+                max_range_m=self.cfg.destination_context_radius_m,
+            )
         elif mode == "exploration":
             if coverage is None:
                 coverage = self.coverage_counts(prepared["grid"], overlay) > 0
-            winner = self._exploration_candidate(
+            return self._exploration_candidates(
                 prepared, pose, overlay, coverage
             )
-            return [winner] if winner else []
         elif mode == "goal":
             candidates = self._local_candidates(
                 prepared["grid"], prepared["reachable"], pose
@@ -387,10 +396,15 @@ class MapLogic:
             grid.inside(col, row) and reachable[int(row), int(col)]
         )
 
-    def _furthest_reachable_on_ray(self, grid, reachable, origin, yaw):
+    def _furthest_reachable_on_ray(
+        self, grid, reachable, origin, yaw, max_distance=None
+    ):
         """Return the center of the last reachable cell before a ray is blocked."""
-        height, width = grid.data.shape
-        max_distance = math.hypot(width, height) * grid.resolution
+        if max_distance is None:
+            height, width = grid.data.shape
+            max_distance = math.hypot(width, height) * grid.resolution
+        else:
+            max_distance = max(0.0, float(max_distance))
         step = max(grid.resolution / 2.0, 1e-6)
         last_cell = None
 
@@ -407,8 +421,10 @@ class MapLogic:
         x, y = grid.world(*last_cell)
         return float(x), float(y), last_cell
 
-    def _context_candidates(self, prepared, pose, overlay):
-        """Offer close clue views, aligned frontiers, and long center travel."""
+    def _context_candidates(
+        self, prepared, pose, overlay, *, max_range_m=None
+    ):
+        """Offer close clue views and the furthest valid center-ray point."""
         observation = self.observation_fov(overlay)
         if observation is None:
             return []
@@ -418,21 +434,20 @@ class MapLogic:
         candidate_attributes = {
             key: observation_payload.get(key)
             for key in (
-                "candidate_type", "hypothesis_id", "original_candidate_type",
-                "original_contextual_clue", "movement_limit", "movements_used",
+                "candidate_type", "movement_limit", "movements_used",
                 "remaining_waypoints", "reassessment_limit",
-                "reassessments_used", "allow_frontier",
+                "reassessments_used",
             )
             if observation_payload.get(key) is not None
         }
-        allow_frontier = bool(
-            overlay.get("allow_frontier", True)
-            and observation_payload.get("allow_frontier", True)
-        )
         origin = observation["pose"]
         center = observation["center_yaw_rad"]
         half_fov = math.radians(observation["horizontal_fov_deg"] / 2.0)
-        max_range = observation["max_range_m"]
+        max_range = (
+            float(max_range_m)
+            if max_range_m is not None
+            else observation["max_range_m"]
+        )
         target = (
             origin["x"] + max_range * math.cos(center),
             origin["y"] + max_range * math.sin(center),
@@ -478,13 +493,16 @@ class MapLogic:
         # should not prevent a deliberate long move in the clue direction.
         # Replace any ordinary sample in the same cell with a clearly labeled
         # endpoint at the last reachable cell before the center ray is blocked.
-        farthest = self._furthest_reachable_on_ray(
-            grid, reachable, origin, center
+        ray_limit = (
+            float(max_range_m) if max_range_m is not None else None
         )
-        if farthest is not None and allow_frontier:
+        farthest = self._furthest_reachable_on_ray(
+            grid, reachable, origin, center, max_distance=ray_limit
+        )
+        if farthest is not None:
             x, y, cell = farthest
 
-            if math.hypot(x - origin["x"], y - origin["y"]) >= observation["max_range_m"]:
+            if math.hypot(x - origin["x"], y - origin["y"]) >= grid.resolution:
                 far_candidate = self._describe({
                     "id": "CF",
                     "kind": "context",
@@ -495,26 +513,6 @@ class MapLogic:
                 }, pose)
                 far_candidate.update(candidate_attributes)
                 candidates.append(far_candidate)
-
-        # A frontier remains relevant when it is farther away than the camera's
-        # reliable range. Context mode therefore filters frontiers by the
-        # observation's angular cone, rather than by max_range.
-        for frontier in prepared.get("frontiers", []) if allow_frontier else []:
-            dx = float(frontier["x"]) - origin["x"]
-            dy = float(frontier["y"]) - origin["y"]
-            if math.hypot(dx, dy) <= 1e-9:
-                continue
-            bearing = math.atan2(dy, dx)
-            if abs(self._angle(bearing - center)) > half_fov:
-                continue
-            # Frontier extraction already guarantees a connected, free,
-            # cost-valid endpoint. Do not recheck it against the clearance-
-            # eroded local-candidate mask: frontier cells border unknown space
-            # by definition and that erosion would remove most valid goals.
-            candidate = self._describe(dict(frontier), pose)
-            candidate["selection_reason"] = "frontier_inside_observation_fov"
-            candidate.update(candidate_attributes)
-            candidates.append(candidate)
 
         back_distance = self.cfg.context_backup_distance_m
 
@@ -533,15 +531,15 @@ class MapLogic:
             candidates.append(backup)
         return candidates
 
-    def _exploration_candidate(self, prepared, pose, overlay, coverage):
-        """Pick the sampled reachable pose that reveals most uncovered cells."""
+    def _exploration_candidates(self, prepared, pose, overlay, coverage):
+        """Pick the best unseen view and optionally offer a farther move."""
         grid, reachable = prepared["grid"], prepared["reachable"]
         known_free = (grid.data >= 0) & (grid.data < self.cfg.occupied)
         unseen = known_free & ~coverage
         rows, cols = self._exploration_samples(
             grid, reachable, unseen, coverage, pose
         )
-        candidates = []
+        scored_candidates = []
 
         for index, (row, col) in enumerate(zip(rows, cols), 1):
             x, y = grid.world(col, row)
@@ -565,35 +563,57 @@ class MapLogic:
                 "ranking_score": gain,
                 "selection_reason": "largest_unseen_view",
             })
-            candidates.append(candidate)
+            scored_candidates.append(candidate)
 
-        if candidates:
-            return max(candidates, key=lambda item: (
-                item["uncovered_cell_count"], -item["distance_m"]
-            ))
-
-        if not bool(overlay.get("allow_frontier", True)):
-            return None
-
-        frontiers = [
-            self._describe(dict(item), pose)
-            for item in prepared["frontiers"]
-        ]
-        if not frontiers:
-            return None
-        distance_floor = max(
-            1e-6, self.cfg.exploration_frontier_distance_floor_m
-        )
-        winner = max(frontiers, key=lambda item: (
-            item.get("information_gain_m2", 0.0)
-            / max(distance_floor, item["distance_m"])
+        if not scored_candidates:
+            return []
+        winner = max(scored_candidates, key=lambda item: (
+            item["uncovered_cell_count"], -item["distance_m"]
         ))
-        winner["selection_reason"] = "coverage_complete_frontier"
-        winner["ranking_score"] = round(
-            winner.get("information_gain_m2", 0.0)
-            / max(distance_floor, winner["distance_m"]), 4
+        candidates = [winner]
+        travel_dx = winner["x"] - pose["x"]
+        travel_dy = winner["y"] - pose["y"]
+        travel_distance = math.hypot(travel_dx, travel_dy)
+        if travel_distance < prepared["grid"].resolution:
+            return candidates
+
+        travel_yaw = math.atan2(travel_dy, travel_dx)
+        center_fov = float(overlay.get(
+            "camera_horizontal_fov_deg", self.cfg.camera_horizontal_fov_deg
+        ))
+        if abs(self._angle(travel_yaw - pose["yaw"])) > math.radians(
+            center_fov / 2.0
+        ):
+            return candidates
+
+        farthest = self._furthest_reachable_on_ray(
+            prepared["grid"], prepared["reachable"], winner, travel_yaw,
+            max_distance=self.cfg.exploration_ray_m,
         )
-        return winner
+        if farthest is None:
+            return candidates
+        x, y, _ = farthest
+        extension = math.hypot(x - winner["x"], y - winner["y"])
+        if extension < prepared["grid"].resolution:
+            return candidates
+
+        far = {
+            key: value for key, value in winner.items()
+            if key not in {
+                "uncovered_cell_count", "uncovered_ahead_fraction",
+                "ranking_score",
+            }
+        }
+        far.update({
+            "id": "EF",
+            "x": float(x),
+            "y": float(y),
+            "yaw": float(travel_yaw),
+            "selection_reason": "furthest_reachable_forward_ray",
+            "ray_extension_m": round(float(extension), 3),
+        })
+        candidates.append(self._describe(far, pose))
+        return candidates
 
     def _exploration_samples(self, grid, reachable, unseen, seen, pose):
         """Shortlist seen reachable cells near dense unseen areas."""

@@ -69,7 +69,7 @@ class MapClient:
                     raise TimeoutError(
                         f"Timed out waiting {self.timeout:.1f}s for the map service"
                     ) from error
-                if len(parts) == 2:
+                if len(parts) in {2, 3}:
                     metadata = json.loads(parts[0].decode("utf-8"))
                     jpeg = bytes(parts[1])
                     if metadata.get("schema_version") != 1:
@@ -82,6 +82,7 @@ class MapClient:
                         "received_at": time.monotonic(),
                         "age_seconds": 0.0,
                         "jpeg_bytes": jpeg,
+                        "full_jpeg_bytes": bytes(parts[2]) if len(parts) == 3 else jpeg,
                         "metadata": metadata,
                     }
                 if len(parts) != 1:

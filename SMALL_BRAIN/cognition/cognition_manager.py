@@ -49,11 +49,10 @@ class CognitionManager:
         "select_navigation_pose",
     }
     STOP_TOOLS = {
-        "stop_searching",
-        "stop_tracking",
-        "stop_approaching",
         "stop_goal",
         "stop_navigation",
+        "stop_follow",
+        "stop_tracking",
     }
 
     def __init__(
@@ -63,12 +62,12 @@ class CognitionManager:
         see_action,
         track_action,
         move_action,
-        move_camera_action,
         goal_executor,
+        follow_executor,
         response_manager,
         astra_action=None,
         idle_prompt_seconds=6000.0,
-        boot_observation_delay=3.0,
+        boot_observation_delay=3000.0,
         long_idle_person_seek_seconds=12000.0,
         proximity_cooldown=8.0,
         navigate_action=None,
@@ -78,9 +77,9 @@ class CognitionManager:
         self.see_action = see_action
         self.track_action = track_action
         self.move_action = move_action
-        self.move_camera_action = move_camera_action
         self.navigate_action = navigate_action
         self.goal_executor = goal_executor
+        self.follow_executor = follow_executor
         self.astra_action = astra_action
         self.response_manager = response_manager
 
@@ -169,7 +168,9 @@ class CognitionManager:
             task.cancel()
 
     async def shutdown(self):
-        if self.goal_executor.active:
+        if self.follow_executor.active:
+            await self.follow_executor.stop("SHUTDOWN")
+        elif self.goal_executor.active:
             await self.goal_executor.stop("SHUTDOWN")
         elif self.navigate_action is not None and self.navigate_action.active:
             await self.navigate_action.stop("SHUTDOWN")
@@ -251,21 +252,48 @@ class CognitionManager:
         if name == "go_idle":
             return await self._enter_idle_mode(request.action_id)
 
-        # Navigation owns motion and the camera throughout selection and travel.
-        motion_tools = {"navigate_action", "move_camera", "find_object"}
-        if (self.navigate_action is not None and self.navigate_action.active
-                and name in motion_tools):
-            return ActionResult(request.action_id, name, "failed",
-                                reason_code="NAVIGATION_BUSY", retryable=True)
+        camera_tools = {
+            "navigate_action", "find_object", "follow_action", "see_action"
+        }
+        camera_tools.add("watch_target")
+        if name in camera_tools:
+            camera_owner = self._camera_owner()
+            if camera_owner == "watch_target" and name != "watch_target":
+                await self.track_action.stop_tracking(
+                    reason_code="REPLACED",
+                    status="cancelled",
+                    outcome=f"replaced_by_{name}",
+                    reset_camera=False,
+                )
+                camera_owner = self._camera_owner()
+            if camera_owner is not None and camera_owner != "watch_target":
+                return ActionResult(
+                    action_id=request.action_id,
+                    action_type=name,
+                    status="failed",
+                    target=args.get("target") or args.get("region"),
+                    outcome="precondition_failed",
+                    reason_code="CAMERA_IN_USE",
+                    retryable=True,
+                    data={"camera_owner": camera_owner},
+                )
+
+        if name in {"navigate_action", "find_object", "follow_action"}:
+            if self._decision_state()["active_actions"]:
+                return ActionResult(
+                    request.action_id, name, "failed",
+                    reason_code="ROBOT_BUSY", retryable=True,
+                )
 
         if name == "navigate_action":
             if self.navigate_action is None:
-                return ActionResult(request.action_id, name, "failed",
-                                    reason_code="NAVIGATION_UNAVAILABLE")
-            if self._decision_state()["active_actions"]:
-                return ActionResult(request.action_id, name, "failed",
-                                    reason_code="ROBOT_BUSY", retryable=True)
-            return await self.navigate_action.start(args.get("query"), request.action_id)
+                return ActionResult(
+                    request.action_id, name, "failed",
+                    reason_code="NAVIGATION_UNAVAILABLE",
+                )
+            return await self.navigate_action.start(
+                args.get("query"), request.action_id
+            )
 
         if name == "find_object":
             return await self.goal_executor.start(
@@ -274,43 +302,23 @@ class CognitionManager:
                 action_id=request.action_id,
             )
 
+        if name == "follow_action":
+            return await self.follow_executor.start(
+                target=args.get("target"),
+                radius_m=args.get("radius_m"),
+                action_id=request.action_id,
+            )
+
         if name == "watch_target":
             return await self.track_action.start_tracking(
                 target=args.get("target"),
-                action_id=request.action_id)
-
-        if name == "move_camera":
-            camera_owner = None
-            if self.goal_executor.active:
-                camera_owner = self.goal_executor.action_type
-            elif self.search_action.active:
-                camera_owner = "search_action"
-            elif self.track_action.active:
-                camera_owner = "track_action"
-            elif self.approach_action.active:
-                camera_owner = "approach_action"
-            elif self.astra_action is not None and self.astra_action.active:
-                camera_owner = "astra_approach_action"
-
-            if camera_owner is not None:
-                return ActionResult(
-                    action_id=request.action_id,
-                    action_type="move_camera",
-                    status="failed",
-                    target=args.get("region"),
-                    outcome="precondition_failed",
-                    reason_code="CAMERA_IN_USE",
-                    retryable=True,
-                    data={"camera_owner": camera_owner},
-                )
-
-            return await self.move_camera_action.move_to_region(
-                region=args.get("region"),
                 action_id=request.action_id,
             )
+
         if name == "see_action":
             return await self.see_action.see(
                 query=args.get("query"),
+                region=args.get("region"),
                 action_id=request.action_id,
             )
 
@@ -334,6 +342,9 @@ class CognitionManager:
             await asyncio.gather(autonomy_task, return_exceptions=True)
 
         stopped = []
+        if self.follow_executor.active:
+            await self.follow_executor.stop("USER_REQUESTED_IDLE")
+            stopped.append("follow")
         if self.navigate_action is not None and self.navigate_action.active:
             await self.navigate_action.stop("USER_REQUESTED_IDLE")
             stopped.append("visual_navigation")
@@ -356,12 +367,10 @@ class CognitionManager:
             await self.track_action.stop_tracking("USER_REQUESTED_IDLE")
             stopped.append("tracking")
 
-        camera_result = None
-        if not self.move_camera_action.active:
-            camera_result = await self.move_camera_action.move_to_region(
-                region="center",
-                action_id=f"{action_id}:settle_camera",
-            )
+        camera_result = await self.see_action.move_to_region(
+            region="center",
+            action_id=f"{action_id}:settle_camera",
+        )
         self._tof_history.clear()
         self._proximity_candidate_count = 0
         return ActionResult(
@@ -380,44 +389,32 @@ class CognitionManager:
         )
 
     async def execute_stop(self, request):
-        if (request.function_name == "stop_navigation"
-                and self.navigate_action is not None and self.navigate_action.active):
-            action, stop_method_name = self.navigate_action, "stop"
-        elif (
-            request.function_name == "stop_tracking"
-            and self.astra_action is not None
-            and self.astra_action.tracking_active
-        ):
-            action, stop_method_name = self.astra_action, "stop_tracking"
-        elif (
-            request.function_name == "stop_approaching"
-            and self.astra_action is not None
-            and self.astra_action.approaching_active
-        ):
-            action, stop_method_name = self.astra_action, "stop_approaching"
-        else:
-            action, stop_method_name = {
-                "stop_searching": (
-                    self.search_action,
-                    "stop_searching",
-                ),
-                "stop_tracking": (
-                    self.track_action,
-                    "stop_tracking",
-                ),
-                "stop_approaching": (
-                    self.approach_action,
-                    "stop_approaching",
-                ),
-                "stop_goal": (
-                    self.goal_executor,
-                    "stop",
-                ),
-                "stop_navigation": (
-                    self.navigate_action,
-                    "stop",
-                ),
-            }[request.function_name]
+        if request.function_name == "stop_tracking" and self.track_action.active:
+            camera_owner = self._camera_owner()
+            if camera_owner != "watch_target":
+                result = ActionResult(
+                    action_id=request.action_id,
+                    action_type="stop_tracking",
+                    status="failed",
+                    target=self.track_action.target,
+                    outcome="precondition_failed",
+                    reason_code="CAMERA_IN_USE",
+                    retryable=False,
+                    data={"camera_owner": camera_owner},
+                )
+                await self.response_manager.send_function_output(
+                    request.call_id,
+                    self._action_envelope("command_result", result),
+                )
+                await self.response_manager.create_voice_response()
+                return
+
+        action, stop_method_name = {
+            "stop_goal": (self.goal_executor, "stop"),
+            "stop_navigation": (self.navigate_action, "stop"),
+            "stop_follow": (self.follow_executor, "stop"),
+            "stop_tracking": (self.track_action, "stop_tracking"),
+        }[request.function_name]
         was_active = bool(getattr(action, "active", False))
         if was_active:
             stop_result = await getattr(action, stop_method_name)()
@@ -438,7 +435,7 @@ class CognitionManager:
                 },
             ),
         )
-        if not was_active:
+        if request.function_name == "stop_tracking" or not was_active:
             await self.response_manager.create_voice_response()
 
     async def oob_assessment(self, request):
@@ -496,6 +493,7 @@ class CognitionManager:
             action = {
                 "navigate_action": self.navigate_action,
                 "find_object": self.goal_executor,
+                "follow_action": self.follow_executor,
             }.get(event.request.function_name)
 
             # Capture this run's future before another navigation can start.
@@ -758,9 +756,36 @@ class CognitionManager:
                 "stable tracking at the destination. Report completion briefly and do "
                 "not call another tool."
             )
+        if (
+            isinstance(result, ActionResult)
+            and result.action_type == "follow_action"
+        ):
+            if result.status == "cancelled":
+                return "Briefly confirm that following has stopped."
+            return (
+                "Report why continuous following ended. Do not restart follow_action "
+                "unless the user explicitly asks."
+            )
         return (
             "Continue the unresolved goal if needed; do not repeat the finished action."
         )
+
+    def _camera_owner(self):
+        if self.follow_executor.active:
+            return "follow_action"
+        if self.goal_executor.active:
+            return self.goal_executor.action_type
+        if self.navigate_action is not None and self.navigate_action.active:
+            return "navigate_action"
+        if self.search_action.active:
+            return "search_action"
+        if self.track_action.active:
+            return "watch_target"
+        if self.approach_action.active:
+            return "approach_action"
+        if self.astra_action is not None and self.astra_action.active:
+            return "astra_approach_action"
+        return None
 
     def _active_tracking_action(self):
         if self.astra_action is not None and self.astra_action.tracking_active:
@@ -777,8 +802,8 @@ class CognitionManager:
             ("approach_action", self.approach_action, "active"),
             ("astra_approach_action", self.astra_action, "active"),
             ("move_action_internal", self.move_action, "active"),
-            ("move_camera", self.move_camera_action, "active"),
             ("navigate_action", self.navigate_action, "active"),
+            ("follow_action", self.follow_executor, "active"),
         ):
             if action is not None and getattr(action, active_attribute, False):
                 active_actions.append({

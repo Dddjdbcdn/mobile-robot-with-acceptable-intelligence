@@ -26,7 +26,6 @@ from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
 from actions.move_action import MoveAction
-from actions.move_camera_action import MoveCameraAction
 from actions.navigate_action import NavigateAction
 
 from services.audio_stream import AudioApp, send_mic_audio
@@ -41,6 +40,7 @@ from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
+from cognition.follow_executor import FollowConfig, FollowExecutor
 from cognition.goal_executor import FindLoopConfig, GoalExecutor
 from cognition.state import robot_state,update_state
 from cognition.semantic_memory import SemanticMemory
@@ -394,6 +394,11 @@ async def main():
             astra_endpoint="tcp://127.0.0.1:5558",
             initial_source=os.environ.get("CAMERA_SOURCE", "usb").lower(),
             usb_controls=CameraStream.usb_controls_from_env(),
+            usb_device=os.environ.get(
+                "USB_CAMERA_DEVICE",
+                "/dev/v4l/by-id/usb-HBVCAM_Camera_"
+                "USB_Camera_HB202400001-video-index0",
+            ),
         )
     camera.start()
     print("\n✅ CAMERA IS READY")
@@ -481,24 +486,37 @@ async def main():
                     os.environ.get("ASTRA_APPROACH_STANDOFF_M", "0.65")
                 ),
             )
-            see_action = SeeAction(ws=ws, camera=camera)
             move_action = MoveAction(send_robot_command=send_robot_command)
-            move_camera_action = MoveCameraAction(
-                send_robot_command=send_robot_command
+            see_action = SeeAction(
+                ws=ws,
+                camera=camera,
+                send_robot_command=send_robot_command,
             )
             navigate_action = NavigateAction(
                 ws, camera, send_robot_command,
                 request_map_snapshot=map_client.request_snapshot,
+                see_action=see_action,
+                send_map_overlay=send_map_overlay,
             )
             goal_executor = GoalExecutor(
                 move_action=move_action,
                 search_action=search_action,
                 track_action=track_action,
                 approach_action=approach_action,
-                move_camera_action=move_camera_action,
+                see_action=see_action,
                 semantic_memory=semantic_memory,
                 navigate_action=navigate_action,
                 send_map_overlay=send_map_overlay,
+            )
+            follow_executor = FollowExecutor(
+                goal_executor=goal_executor,
+                track_action=track_action,
+                approach_action=approach_action,
+                config=FollowConfig(
+                    default_radius_m=float(
+                        os.environ.get("FOLLOW_RADIUS_M", "1.0")
+                    )
+                ),
             )
 
             cognitive_manager = CognitionManager(
@@ -507,18 +525,20 @@ async def main():
                 see_action=see_action,
                 track_action=track_action,
                 move_action=move_action,
-                move_camera_action=move_camera_action,
                 navigate_action=navigate_action,
                 goal_executor=goal_executor,
+                follow_executor=follow_executor,
                 response_manager=response_manager,
                 astra_action=astra_action,
             )
 
             async def stop_actions_for_source_change(previous_source, new_source):
-                if navigate_action.active:
-                    await navigate_action.stop("CAMERA_SOURCE_CHANGED")
-                if goal_executor.active:
+                if follow_executor.active:
+                    await follow_executor.stop("CAMERA_SOURCE_CHANGED")
+                elif goal_executor.active:
                     await goal_executor.stop("CAMERA_SOURCE_CHANGED")
+                elif navigate_action.active:
+                    await navigate_action.stop("CAMERA_SOURCE_CHANGED")
                 if previous_source == "usb":
                     if approach_action.active:
                         await approach_action.stop_approaching(

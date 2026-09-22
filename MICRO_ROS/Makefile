@@ -38,7 +38,7 @@ Core/Src/main.c \
 Core/Src/Controller/microros_app.c \
 Core/Src/Controller/imu.c \
 Core/Src/Controller/motor.c \
-Core/Src/Controller/ultrasonic.c \
+Core/Src/Controller/range.c \
 Core/Src/Controller/tof/vl53l7cx_api.c \
 Core/Src/Controller/tof/vl53l7cx_plugin_detection_thresholds.c \
 Core/Src/Controller/tof/vl53l7cx_plugin_motion_indicator.c \
