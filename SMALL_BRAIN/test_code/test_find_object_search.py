@@ -1032,7 +1032,7 @@ class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(executor._fresh_distance(), 5.0)
 
-    async def test_quick_acquisition_searches_tracks_then_starts_follow(self):
+    async def test_acquisition_searches_then_tracks_without_approaching(self):
         search = type("Search", (), {"active": False})()
         search.start_searching = AsyncMock(return_value=ActionResult(
             "search", "search_action", "succeeded", target="person"
@@ -1048,12 +1048,13 @@ class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
             "follow", "approach_action", "running", target="person"
         ))
         goal_executor = type("Goal", (), {"search_action": search})()
+        goal_executor.start = AsyncMock()
         executor = FollowExecutor(goal_executor, tracker, approach)
         executor.action_id = "follow-1"
         executor.radius_m = 1.25
         executor._approach_count = 0
 
-        result = await executor._quick_search_track_follow("initial")
+        result = await executor._acquire_target("initial")
 
         self.assertEqual(result.status, "succeeded")
         search.start_searching.assert_awaited_once_with(
@@ -1062,39 +1063,39 @@ class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
             effort="best_effort",
             initial_view_only=False,
         )
-        tracker.wait_until_stable.assert_awaited_once_with(timeout=10.0)
-        approach.start_approaching.assert_awaited_once_with(
-            target="person",
-            action_id="follow-1:initial:follow",
-            standoff_m=1.25,
-            follow=True,
-        )
+        tracker.start_tracking.assert_awaited_once()
+        approach.start_approaching.assert_not_awaited()
+        goal_executor.start.assert_not_awaited()
 
-    async def test_recovery_tries_quick_search_before_full_find(self):
+    async def test_recovery_reacquires_without_running_find_object(self):
         executor = FollowExecutor.__new__(FollowExecutor)
         executor.config = FollowConfig(
-            max_recovery_attempts=1, recovery_delay_seconds=0.0
+            tracking_recovery_seconds=0.0
         )
         executor._stop_requested = False
         executor._recovery_count = 0
         executor.track_action = type("Tracker", (), {"active": True})()
-        executor._stop_follow_motion = AsyncMock()
-        executor._quick_search_track_follow = AsyncMock(return_value=ActionResult(
-            "quick", "follow_action", "failed", reason_code="NOT_FOUND"
-        ))
-        executor._find_track_and_approach = AsyncMock(return_value=ActionResult(
-            "full", "find_object", "succeeded", target="person"
+        executor.track_action.stop_tracking = AsyncMock()
+        executor.approach_action = type("Approach", (), {"active": False})()
+        executor._fresh_distance = Mock(return_value=None)
+        executor._acquire_target = AsyncMock(return_value=ActionResult(
+            "acquire", "follow_action", "succeeded", target="person"
         ))
 
-        recovered = await executor._recover_follow("FOLLOW_INTERRUPTED")
+        recovered = await executor._recover_tracking()
 
         self.assertTrue(recovered)
-        executor._quick_search_track_follow.assert_awaited_once()
-        executor._find_track_and_approach.assert_awaited_once()
-        self.assertEqual(
-            executor._stop_follow_motion.await_args_list,
-            [call("FOLLOW_INTERRUPTED"), call("QUICK_RECOVERY_FAILED")],
+        executor.track_action.stop_tracking.assert_awaited_once_with(
+            "TRACKING_RECOVERY_TIMEOUT"
         )
+        executor._acquire_target.assert_awaited_once_with("reacquire:1")
+
+    def test_approach_standoff_is_inside_follow_radius(self):
+        executor = FollowExecutor.__new__(FollowExecutor)
+        executor.config = FollowConfig(approach_standoff_ratio=0.8)
+        executor.radius_m = 1.25
+
+        self.assertEqual(executor._approach_standoff_m(), 1.0)
 
 
 class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
@@ -1106,6 +1107,56 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         robot_state["pose"] = self.saved_pose
         robot_state["camera"].clear()
         robot_state["camera"].update(self.saved_camera)
+
+    def test_person_stability_uses_pose_mask_and_bounded_map_motion(self):
+        tracker = TrackAction.__new__(TrackAction)
+        tracker.camera = Mock()
+        tracker.camera.snapshot.return_value = type("Frame", (), {
+            "tracking_bgr": np.zeros((360, 640, 3), dtype=np.uint8),
+        })()
+        tracker.stable = False
+        tracker.person_stable = False
+        tracker.person_stable_tick = 0
+        tracker._last_valid_person_point = None
+        tracker._last_valid_person_timestamp = None
+
+        person = {
+            "bbox": {"x1": 240, "y1": 80, "x2": 400, "y2": 340},
+            "keypoints": {
+                "left_shoulder": {
+                    "x": 275, "y": 130, "confidence": 0.9,
+                },
+                "right_shoulder": {
+                    "x": 365, "y": 130, "confidence": 0.9,
+                },
+                "left_hip": {"x": 290, "y": 230, "confidence": 0.9},
+                "right_hip": {"x": 350, "y": 230, "confidence": 0.9},
+            },
+        }
+        now = time.monotonic()
+        robot_state["camera"].update({
+            "camera_tof_range": 2.0,
+            "object_x": 2.0,
+            "object_y": 0.0,
+            "object_map_x": 3.0,
+            "object_map_y": 4.0,
+            "timestamp": now - 0.2,
+        })
+
+        self.assertFalse(tracker._update_person_stability(person))
+        robot_state["camera"].update({
+            "object_map_x": 3.1,
+            "timestamp": now - 0.1,
+        })
+        self.assertTrue(tracker._update_person_stability(person))
+        self.assertFalse(tracker.stable)
+
+        robot_state["camera"].update({
+            "object_map_x": 5.0,
+            "timestamp": now,
+        })
+        self.assertFalse(tracker._update_person_stability(person))
+        self.assertFalse(tracker.person_stable)
 
     async def test_stable_tracking_saves_map_location_without_semantic_memory(self):
         tracker = TrackAction.__new__(TrackAction)
@@ -1201,8 +1252,11 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         tracker = type("Tracker", (), {
             "active": True,
             "target": "person",
-            "stable": True,
+            "stable": False,
+            "person_stable": True,
         })()
+        tracker.wait_until_person_stable = AsyncMock(return_value=True)
+        tracker.wait_until_stable = AsyncMock(return_value=True)
         send_robot_command = AsyncMock(return_value={
             "status": "accepted",
             "destination": {"x": 1.0, "y": 0.0, "frame_id": "map"},
@@ -1238,6 +1292,35 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             send_robot_command.await_args_list[1].args[0]["x"], 2.5
         )
+        tracker.wait_until_person_stable.assert_not_awaited()
+        tracker.wait_until_stable.assert_not_awaited()
+
+    async def test_follow_waits_for_quick_person_stability_not_strict_stability(self):
+        tracker = type("Tracker", (), {
+            "active": True,
+            "target": "person",
+            "stable": False,
+            "person_stable": False,
+        })()
+        tracker.wait_until_person_stable = AsyncMock(return_value=True)
+        tracker.wait_until_stable = AsyncMock(return_value=False)
+        approach = ApproachAction(
+            AsyncMock(return_value={"status": "accepted"}), tracker
+        )
+        robot_state["camera"].update({
+            "object_x": 2.0,
+            "object_y": 0.0,
+            "object_angle": 0.0,
+            "camera_tof_range": 2.0,
+        })
+
+        result = await approach.start_approaching(
+            "person", "follow-quick", standoff_m=0.8, follow=True
+        )
+
+        self.assertEqual(result.status, "running")
+        tracker.wait_until_person_stable.assert_awaited_once_with(timeout=2.0)
+        tracker.wait_until_stable.assert_not_awaited()
 
     async def test_goal_executor_starts_follow_without_waiting_for_completion(self):
         executor = GoalExecutor.__new__(GoalExecutor)

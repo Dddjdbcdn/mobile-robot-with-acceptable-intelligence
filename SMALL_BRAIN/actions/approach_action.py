@@ -60,7 +60,26 @@ class ApproachAction:
                 retryable=True,
             )
 
-        if not self.track_action.stable:
+        quick_person_stability = follow and normalized_target == "person"
+        if (
+            quick_person_stability
+            and not self.track_action.person_stable
+        ):
+            stable = await self.track_action.wait_until_person_stable(
+                timeout=2.0
+            )
+            if not stable:
+                return ActionResult(
+                    action_id=action_id,
+                    action_type="approach_action",
+                    status="failed",
+                    target=target,
+                    outcome="precondition_failed",
+                    reason_code="PERSON_TRACKING_STABILITY_TIMEOUT",
+                    retryable=True,
+                    data={"person_tracking_stable": False},
+                )
+        elif not quick_person_stability and not self.track_action.stable:
             stable = await self.track_action.wait_until_stable(timeout=10.0)
             if not stable:
                 return ActionResult(
@@ -157,7 +176,10 @@ class ApproachAction:
                 "following" if follow else "approaching"
             ),
             data={
-                "tracking_stable": True,
+                "tracking_stable": self.track_action.stable,
+                "person_tracking_stable": getattr(
+                    self.track_action, "person_stable", False
+                ),
                 "raw_destination": dict(raw_destination),
                 "destination": dict(self._last_destination or raw_destination),
             },

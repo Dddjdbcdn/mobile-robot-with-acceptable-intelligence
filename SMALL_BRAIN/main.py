@@ -120,6 +120,10 @@ async def background_status_monitor(cognitive_manager):
                     "tracking_stable": (
                         active_tracker.stable if active_tracker is not None else False
                     ),
+                    "person_tracking_stable": (
+                        getattr(active_tracker, "person_stable", False)
+                        if active_tracker is not None else False
+                    ),
                     "tracked_target": (
                         active_tracker.target if active_tracker is not None else None
                     ),
@@ -325,6 +329,7 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
                 display_frame,
                 tracking=track_action.active,
                 tracking_stable=track_action.stable,
+                person_tracking_stable=track_action.person_stable,
             )
 
             tracking_update = csrt_tracker.tracking_update

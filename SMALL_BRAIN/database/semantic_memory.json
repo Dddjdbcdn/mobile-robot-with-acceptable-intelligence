@@ -1,4 +1,20 @@
 {
-  "objects": {},
+  "objects": {
+    "person": {
+      "confidence": 0.963,
+      "consecutive_misses": 0,
+      "map_x": 1.5360298221460054,
+      "map_y": -0.6891841001906099,
+      "observations": 1,
+      "observed_at": 1790158531.6602032,
+      "observer_pose": {
+        "x": 3.334157894259125e-08,
+        "y": -6.648575676649455e-12,
+        "yaw": -0.003647605794754318
+      },
+      "range_m": 1.7799999713897705,
+      "target": "person"
+    }
+  },
   "version": 1
 }

@@ -12,11 +12,11 @@ from cognition.state import robot_state
 
 @dataclass(frozen=True, slots=True)
 class FollowConfig:
-    default_radius_m: float = 1.0
+    default_radius_m: float = 0.3
     poll_seconds: float = 0.20
     target_max_age_seconds: float = 1.0
-    max_recovery_attempts: int = 3
-    recovery_delay_seconds: float = 0.75
+    tracking_recovery_seconds: float = 3.0
+    approach_standoff_ratio: float = 0.8
 
 
 class FollowExecutor:
@@ -82,10 +82,7 @@ class FollowExecutor:
 
     async def _run(self):
         try:
-            acquired = await self._quick_search_track_follow("initial")
-            if acquired.status != "succeeded":
-                await self._stop_follow_motion("QUICK_ACQUISITION_FAILED")
-                acquired = await self._find_track_and_approach("initial_find")
+            acquired = await self._acquire_target("initial")
             if acquired.status != "succeeded":
                 await self._stop_follow_motion("FOLLOW_ACQUISITION_FAILED")
                 self._finish(
@@ -96,38 +93,41 @@ class FollowExecutor:
                 return
 
             while self.active and not self._stop_requested:
-                following = (
-                    self.approach_action.active
-                    and getattr(self.approach_action, "following", False)
-                )
                 distance = self._fresh_distance()
-                if not self.track_action.active or not following or distance is None:
-                    recovered = await self._recover_follow("FOLLOW_INTERRUPTED")
+                if not self.track_action.active or distance is None:
+                    recovered = await self._recover_tracking()
                     if not recovered:
                         await self._stop_follow_motion(
-                            "FOLLOW_RECOVERY_EXHAUSTED"
+                            "FOLLOW_REACQUISITION_FAILED"
                         )
                         self._finish(
                             "failed", "target_lost",
-                            "FOLLOW_RECOVERY_EXHAUSTED",
-                            {"recovery_attempts": self._recovery_count},
+                            "FOLLOW_REACQUISITION_FAILED",
+                            {"reacquisition_attempts": self._recovery_count},
                         )
                         return
                     continue
 
+                if distance <= self.radius_m:
+                    if self.approach_action.active:
+                        await self.approach_action.stop_approaching(
+                            "FOLLOW_RADIUS_REACHED"
+                        )
+                    await asyncio.sleep(self.config.poll_seconds)
+                    continue
+
+                was_approaching = self.approach_action.active
                 result = await self.approach_action.start_approaching(
                     target="person",
                     action_id=f"{self.action_id}:follow",
-                    standoff_m=self.radius_m,
+                    standoff_m=self._approach_standoff_m(),
                     follow=True,
                 )
                 if result.status != "running":
-                    recovered = await self._recover_follow(
-                        result.reason_code or "FOLLOW_UPDATE_FAILED"
-                    )
+                    recovered = await self._recover_tracking()
                     if not recovered:
                         await self._stop_follow_motion(
-                            "FOLLOW_RECOVERY_EXHAUSTED"
+                            "FOLLOW_REACQUISITION_FAILED"
                         )
                         self._finish(
                             "failed", "approach_failed",
@@ -135,6 +135,8 @@ class FollowExecutor:
                             {"failed_step": "follow_update"},
                         )
                         return
+                elif not was_approaching:
+                    self._approach_count += 1
                 await asyncio.sleep(self.config.poll_seconds)
         except asyncio.CancelledError:
             return
@@ -146,7 +148,8 @@ class FollowExecutor:
                     {"error": f"{type(error).__name__}: {error}"},
                 )
 
-    async def _quick_search_track_follow(self, step):
+    async def _acquire_target(self, step):
+        """Best-effort search followed by tracking; never invokes find_object."""
         search_result = await self.search_action.start_searching(
             target="person",
             action_id=f"{self.action_id}:{step}:search",
@@ -166,62 +169,44 @@ class FollowExecutor:
         )
         if track_result.status != "running":
             return track_result
-        if not await self.track_action.wait_until_stable(timeout=10.0):
-            await self.track_action.stop_tracking("FOLLOW_TRACKING_UNSTABLE")
-            return ActionResult(
-                f"{self.action_id}:{step}", "follow_action", "failed",
-                target="person", outcome="tracking_unstable",
-                reason_code="FOLLOW_TRACKING_UNSTABLE", retryable=True,
-            )
 
-        follow_result = await self.approach_action.start_approaching(
-            target="person",
-            action_id=f"{self.action_id}:{step}:follow",
-            standoff_m=self.radius_m,
-            follow=True,
-        )
-        if follow_result.status != "running":
-            return follow_result
-        self._approach_count += 1
         return ActionResult(
             f"{self.action_id}:{step}", "follow_action", "succeeded",
-            target="person", outcome="quick_search_tracking_and_following",
+            target="person", outcome="target_acquired_and_tracking",
             data={"radius_m": self.radius_m},
         )
 
-    async def _find_track_and_approach(self, step):
-        result = await self.goal_executor.start(
-            goal="find_object",
-            target="person",
-            action_id=f"{self.action_id}:{step}",
-            approach_standoff_m=self.radius_m,
-            approach_follow=True,
-        )
-        result = await self._terminal_result(self.goal_executor, result)
-        if result.status == "succeeded":
-            self._approach_count += 1
-        return result
+    async def _recover_tracking(self):
+        """Give live tracking time to recover, then reacquire once if needed."""
+        if self.approach_action.active:
+            await self.approach_action.stop_approaching("TRACKING_LOST")
 
-    async def _recover_follow(self, reason_code):
-        await self._stop_follow_motion(reason_code)
-        self._recovery_count += 1
-        quick = await self._quick_search_track_follow(
-            f"quick_recover:{self._recovery_count}"
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.config.tracking_recovery_seconds
         )
-        if quick.status == "succeeded":
-            return True
-
-        await self._stop_follow_motion("QUICK_RECOVERY_FAILED")
-        for attempt in range(1, self.config.max_recovery_attempts + 1):
-            if self._stop_requested:
-                return False
-            result = await self._find_track_and_approach(
-                f"recover:{self._recovery_count}:{attempt}"
-            )
-            if result.status == "succeeded" and self.track_action.active:
+        while self.track_action.active and not self._stop_requested:
+            if self._fresh_distance() is not None:
                 return True
-            await asyncio.sleep(self.config.recovery_delay_seconds)
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(self.config.poll_seconds)
+
+        if self._stop_requested:
+            return False
+        if self.track_action.active:
+            await self.track_action.stop_tracking("TRACKING_RECOVERY_TIMEOUT")
+
+        self._recovery_count += 1
+        result = await self._acquire_target(
+            f"reacquire:{self._recovery_count}"
+        )
+        if result.status == "succeeded" and self.track_action.active:
+            return True
         return False
+
+    def _approach_standoff_m(self):
+        return self.radius_m * self.config.approach_standoff_ratio
 
     async def _stop_follow_motion(self, reason_code):
         if self.approach_action.active:

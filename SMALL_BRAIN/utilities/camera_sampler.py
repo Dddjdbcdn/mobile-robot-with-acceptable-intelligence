@@ -105,6 +105,7 @@ def draw_tof_overlay(
     stale_after_s: float = 0.5,
     tracking: bool = False,
     tracking_stable: bool = False,
+    person_tracking_stable: bool = False,
 ) -> np.ndarray:
     d = robot_state["camera"]
     distance = d["camera_tof_range"]
@@ -158,6 +159,10 @@ def draw_tof_overlay(
 
     if tracking:
         lines.append(f"Stable: {'YES' if tracking_stable else 'NO'}")
+        lines.append(
+            "Person stable: "
+            f"{'YES' if person_tracking_stable else 'NO'}"
+        )
 
     for i, text in enumerate(lines):
         cv2.putText(
@@ -185,6 +190,88 @@ def draw_csrt_overlay(frame,target,bbox):
     cv2.putText(frame,target.upper(),(x, max(15, y - 10)),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0, 255, 0),2)
 
     return frame
+
+
+def pose_body_mask(frame_shape, projected, bbox):
+    """Build the same permissive body area used by display and tracking."""
+    x1, y1, x2, y2 = bbox
+    person_width = max(1, x2 - x1)
+    person_height = max(1, y2 - y1)
+    limb_width = max(6, int(round(min(person_width, person_height) * 0.08)))
+    joint_radius = max(4, limb_width // 2)
+
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    body_segments = [
+        ("left_shoulder", "right_shoulder"),
+        ("left_shoulder", "left_elbow"),
+        ("left_elbow", "left_wrist"),
+        ("right_shoulder", "right_elbow"),
+        ("right_elbow", "right_wrist"),
+        ("left_shoulder", "left_hip"),
+        ("right_shoulder", "right_hip"),
+        ("left_hip", "right_hip"),
+        ("left_hip", "left_knee"),
+        ("left_knee", "left_ankle"),
+        ("right_hip", "right_knee"),
+        ("right_knee", "right_ankle"),
+    ]
+
+    torso_names = (
+        "left_shoulder", "right_shoulder", "right_hip", "left_hip"
+    )
+    if all(name in projected for name in torso_names):
+        torso = np.asarray(
+            [projected[name] for name in torso_names], dtype=np.int32
+        )
+        cv2.fillConvexPoly(mask, torso, 255, lineType=cv2.LINE_AA)
+
+    for start_name, end_name in body_segments:
+        start = projected.get(start_name)
+        end = projected.get(end_name)
+        if start is not None and end is not None:
+            cv2.line(
+                mask, start, end, 255, limb_width, cv2.LINE_AA
+            )
+
+    for point in projected.values():
+        cv2.circle(mask, point, joint_radius, 255, -1, cv2.LINE_AA)
+
+    head_points = [
+        projected[name]
+        for name in ("nose", "left_eye", "right_eye", "left_ear", "right_ear")
+        if name in projected
+    ]
+    if head_points:
+        center = np.mean(head_points, axis=0)
+        head_radius = max(
+            limb_width,
+            int(max(
+                np.linalg.norm(np.asarray(point) - center)
+                for point in head_points
+            ))
+            + joint_radius,
+        )
+        cv2.circle(
+            mask,
+            tuple(int(round(value)) for value in center),
+            head_radius,
+            255,
+            -1,
+            cv2.LINE_AA,
+        )
+
+    return mask
+
+
+def _draw_pose_body_mask(frame, projected, bbox):
+    """Draw a translucent visualization of the pose body area."""
+    mask = pose_body_mask(frame.shape, projected, bbox)
+    if not np.any(mask):
+        return
+
+    overlay = frame.copy()
+    overlay[mask > 0] = (255, 160, 80)
+    cv2.addWeighted(overlay, 0.22, frame, 0.78, 0.0, dst=frame)
 
 
 def draw_yolo_overlay(frame,yolo):
@@ -326,6 +413,12 @@ def draw_yolo_overlay(frame,yolo):
             py = max(0, min(py, frame_h - 1))
 
             projected[name] = (px, py)
+
+        _draw_pose_body_mask(
+            frame,
+            projected,
+            (x1, y1, x2, y2),
+        )
 
         # ------------------------------------------------
         # Skeleton connections

@@ -1,7 +1,9 @@
 import asyncio
 from pathlib import Path
+import time
 
 from cognition.state import robot_state
+from utilities.camera_sampler import pose_body_mask, project_tof_region
 
 HORIZONTAL_FOV_DEG = 85
 VERTICAL_FOV_DEG = 52
@@ -243,6 +245,11 @@ class TrackAction():
     OBJECT_FAILURE_GRACE_FRAMES = 3
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
+    PERSON_STABLE_FRAMES = 2
+    PERSON_POINT_BASE_TOLERANCE_M = 0.20
+    PERSON_MAX_SPEED_MPS = 2.0
+    PERSON_POINT_MAX_AGE_SECONDS = 0.50
+    PERSON_POINT_RESET_SECONDS = 0.75
 
     def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, STABLE_THRESHOLD=0.05, semantic_memory=None):
         self.csrt_tracker = csrt_tracker
@@ -256,6 +263,10 @@ class TrackAction():
         self.target = None
         self.stable = False
         self.stable_tick = 0
+        self.person_stable = False
+        self.person_stable_tick = 0
+        self._last_valid_person_point = None
+        self._last_valid_person_timestamp = None
         self.stable_threshold = STABLE_THRESHOLD
         self._tracking_task = None
         self.completion_future = None
@@ -287,6 +298,7 @@ class TrackAction():
         self.target = normalized_target
         self.stable = False
         self.stable_tick = 0
+        self._reset_person_stability(clear_point=True)
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = allow_grounding_dino
@@ -480,12 +492,17 @@ class TrackAction():
 
     async def _object_tracking_loop(self):
         failure_frames = 0
+        last_sequence = None
 
         while self.active:
             tracking_update = self.csrt_tracker.tracking_update
             if tracking_update is None:
                 await asyncio.sleep(0.05)
                 continue
+            if tracking_update.sequence == last_sequence:
+                await asyncio.sleep(0.01)
+                continue
+            last_sequence = tracking_update.sequence
 
             if tracking_update.success:
                 failure_frames = 0
@@ -497,6 +514,7 @@ class TrackAction():
                 await self.zmq_pub_socket.send_json({
                     "delta_pan_angle": delta_pan_angle,
                     "delta_tilt_angle": delta_tilt_angle,
+                    "tracking_sequence": f"csrt:{tracking_update.sequence}",
                 })
 
                 if (
@@ -668,6 +686,110 @@ class TrackAction():
                 queue.append((neighbor,path + [neighbor]))
         return None
 
+    def _reset_person_stability(self, clear_point=False):
+        self.person_stable = False
+        self.person_stable_tick = 0
+        if clear_point:
+            self._last_valid_person_point = None
+            self._last_valid_person_timestamp = None
+
+    def _update_person_stability(self, person):
+        """Validate a fresh ToF point against the pose mask and recent motion."""
+        camera_state = robot_state.get("camera") or {}
+        timestamp = camera_state.get("timestamp")
+        distance = camera_state.get("camera_tof_range")
+        if (
+            not isinstance(timestamp, (int, float))
+            or not isinstance(distance, (int, float))
+            or not math.isfinite(float(timestamp))
+            or not math.isfinite(float(distance))
+            or float(distance) <= 0.05
+            or time.monotonic() - float(timestamp)
+            > self.PERSON_POINT_MAX_AGE_SECONDS
+        ):
+            self._reset_person_stability()
+            return False
+
+        try:
+            frame_height, frame_width = self.camera.snapshot().tracking_bgr.shape[:2]
+            bbox = person["bbox"]
+            projected = {
+                name: (int(point["x"]), int(point["y"]))
+                for name, point in person["keypoints"].items()
+                if float(point.get("confidence") or 0.0) >= 0.3
+            }
+            mask = pose_body_mask(
+                (frame_height, frame_width),
+                projected,
+                (
+                    int(bbox["x1"]), int(bbox["y1"]),
+                    int(bbox["x2"]), int(bbox["y2"]),
+                ),
+            )
+            _, tof_center = project_tof_region(
+                frame_width, frame_height, max(float(distance), 0.02)
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            self._reset_person_stability()
+            return False
+
+        tof_x, tof_y = tof_center
+        if mask[tof_y, tof_x] == 0:
+            self._reset_person_stability()
+            return False
+
+        map_x = camera_state.get("object_map_x")
+        map_y = camera_state.get("object_map_y")
+        if all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in (map_x, map_y)
+        ):
+            point = ("map", float(map_x), float(map_y))
+        else:
+            object_x = camera_state.get("object_x")
+            object_y = camera_state.get("object_y")
+            if not all(
+                isinstance(value, (int, float)) and math.isfinite(float(value))
+                for value in (object_x, object_y)
+            ):
+                self._reset_person_stability()
+                return False
+            point = ("base", float(object_x), float(object_y))
+
+        timestamp = float(timestamp)
+        previous = self._last_valid_person_point
+        previous_timestamp = self._last_valid_person_timestamp
+        if previous_timestamp is not None:
+            elapsed = timestamp - previous_timestamp
+            if elapsed <= 0.0:
+                return self.person_stable
+            if elapsed > self.PERSON_POINT_RESET_SECONDS:
+                previous = None
+                self._reset_person_stability(clear_point=True)
+
+        if previous is not None and previous[0] == point[0]:
+            elapsed = timestamp - float(previous_timestamp)
+            tolerance = (
+                self.PERSON_POINT_BASE_TOLERANCE_M
+                + self.PERSON_MAX_SPEED_MPS * elapsed
+            )
+            deviation = math.hypot(
+                point[1] - previous[1], point[2] - previous[2]
+            )
+            if deviation > tolerance:
+                self._reset_person_stability()
+                return False
+        else:
+            self.person_stable_tick = 0
+
+        self._last_valid_person_point = point
+        self._last_valid_person_timestamp = timestamp
+        self.person_stable_tick += 1
+        self.person_stable = (
+            self.person_stable_tick >= self.PERSON_STABLE_FRAMES
+        )
+        return self.person_stable
+
     async def _person_tracking_loop(self):
         current_reached = False
         predicted_target = None
@@ -675,16 +797,36 @@ class TrackAction():
         missing_person_since = None
         keypoint_timeout_seconds = 2.0
         loop = asyncio.get_running_loop()
+        last_inference_sequence = None
 
         while self.active:
+            inference_sequence, inference_detections = (
+                self.yolo.detection_snapshot()
+            )
+            if inference_sequence == last_inference_sequence:
+                if (
+                    missing_person_since is not None
+                    and loop.time() - missing_person_since
+                    >= keypoint_timeout_seconds
+                ):
+                    await self.stop_tracking(
+                        reason_code="PERSON_LOST",
+                        status="failed",
+                        outcome="target_lost_after_reacquisition",
+                    )
+                    return
+                await asyncio.sleep(0.01)
+                continue
+            last_inference_sequence = inference_sequence
             detections = [
                 detection
-                for detection in self.yolo.detections
+                for detection in inference_detections
                 if detection["class"] == "person"
                 and "keypoints" in detection
             ]
 
             if not detections:
+                self._reset_person_stability()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
                 elif loop.time() - missing_person_since >= keypoint_timeout_seconds:
@@ -702,6 +844,7 @@ class TrackAction():
                 detections,
                 key=lambda detection: detection["confidence"]
             )
+            self._update_person_stability(person)
 
             current_name = self.person_path[self.person_path_index]
             current_keypoint = person["keypoints"].get(current_name)
@@ -756,7 +899,8 @@ class TrackAction():
 
             await self.zmq_pub_socket.send_json({
                 "delta_pan_angle": delta_pan_angle,
-                "delta_tilt_angle": delta_tilt_angle
+                "delta_tilt_angle": delta_tilt_angle,
+                "tracking_sequence": f"pose:{inference_sequence}",
             })
 
             if self.person_path_index == len(self.person_path) - 1:
@@ -819,6 +963,20 @@ class TrackAction():
 
         return False
 
+    async def wait_until_person_stable(self, check_interval=0.05, timeout=2.0):
+        """Wait for the quick pose/ToF stability used by person following."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while self.active:
+            if self.person_stable:
+                return True
+            if timeout is not None and loop.time() - start_time >= timeout:
+                return False
+            await asyncio.sleep(check_interval)
+
+        return False
+
 
     async def wait_until_finished(self):
         return await self.completion_future
@@ -867,6 +1025,7 @@ class TrackAction():
         action_id = self.action_id or "unassigned"
         target = self.target
         was_stable = self.stable
+        was_person_stable = self.person_stable
 
         result = ActionResult(
             action_id=action_id,
@@ -878,6 +1037,7 @@ class TrackAction():
             retryable=status == "failed",
             data={
                 "tracking_was_stable": was_stable,
+                "person_tracking_was_stable": was_person_stable,
                 **(data or {}),
             },
         )
@@ -887,6 +1047,7 @@ class TrackAction():
         self._deactivate_yolo()
         self.stable = False
         self.stable_tick = 0
+        self._reset_person_stability(clear_point=True)
         self.active = False
         self.csrt_tracker.stop_tracking()
         self.action_id = None

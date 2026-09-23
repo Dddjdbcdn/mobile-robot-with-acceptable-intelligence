@@ -41,26 +41,53 @@ class CameraServo():
 
         self.delta_pan_angle = 0.0
         self.delta_tilt_angle = 0.0
+        self.tracking_sequence = None
+        self.last_applied_tracking_sequence = None
+        self.command_lock = threading.Lock()
         self.Kp = 0.1
 
         self.deadband_degrees = 0.5
         self.max_delta_angle = 90.0
         self.max_step_degrees = 5
 
+    def set_error(self, pan, tilt, tracking_sequence=None):
+        with self.command_lock:
+            self.delta_pan_angle = float(pan)
+            self.delta_tilt_angle = float(tilt)
+            self.tracking_sequence = tracking_sequence
+
     def publish_servo_command(self,tracking=False):
         remaining_pan_angle = 0.0
 
-        if abs(self.delta_pan_angle) < self.deadband_degrees:
+        with self.command_lock:
+            if (
+                tracking
+                and self.tracking_sequence is not None
+                and self.tracking_sequence
+                == self.last_applied_tracking_sequence
+            ):
+                self.delta_pan_angle = 0.0
+                self.delta_tilt_angle = 0.0
+                return remaining_pan_angle
+
+            delta_pan_angle = self.delta_pan_angle
+            delta_tilt_angle = self.delta_tilt_angle
+            if tracking and self.tracking_sequence is not None:
+                self.last_applied_tracking_sequence = self.tracking_sequence
             self.delta_pan_angle = 0.0
-        if abs(self.delta_tilt_angle) < self.deadband_degrees:
             self.delta_tilt_angle = 0.0
 
-        step_pan = self.delta_pan_angle
-        step_tilt = self.delta_tilt_angle
+        if abs(delta_pan_angle) < self.deadband_degrees:
+            delta_pan_angle = 0.0
+        if abs(delta_tilt_angle) < self.deadband_degrees:
+            delta_tilt_angle = 0.0
+
+        step_pan = delta_pan_angle
+        step_tilt = delta_tilt_angle
 
         if tracking:
-            step_pan = self.delta_pan_angle * self.Kp
-            step_tilt = self.delta_tilt_angle * self.Kp
+            step_pan = delta_pan_angle * self.Kp
+            step_tilt = delta_tilt_angle * self.Kp
 
             step_pan = max(min(step_pan, self.max_step_degrees), -self.max_step_degrees)
             step_tilt = max(min(step_tilt, self.max_step_degrees), -self.max_step_degrees)
@@ -92,9 +119,6 @@ class CameraServo():
 
         self.servo_tilt_pub.publish(tilt_msg)
         self.servo_pan_pub.publish(pan_msg)
-
-        self.delta_pan_angle = 0.0
-        self.delta_tilt_angle = 0.0
 
         return remaining_pan_angle
         
@@ -476,8 +500,11 @@ class LLMRosBridge(Node):
         while rclpy.ok():
             try:
                 message = self.sub_socket.recv_json()
-                self.servo.delta_pan_angle = message.get("delta_pan_angle", 0.0)
-                self.servo.delta_tilt_angle = message.get("delta_tilt_angle", 0.0)
+                self.servo.set_error(
+                    message.get("delta_pan_angle", 0.0),
+                    message.get("delta_tilt_angle", 0.0),
+                    message.get("tracking_sequence"),
+                )
             except Exception as e:
                 self.get_logger().error(f"Internal Loop Error: {e}")
 
@@ -507,8 +534,10 @@ class LLMRosBridge(Node):
                 cmd = request.get("command")
 
                 if cmd == 'move_camera':
-                    self.servo.delta_pan_angle = float(request.get("delta_pan_angle", 0.0))
-                    self.servo.delta_tilt_angle = float(request.get("delta_tilt_angle", 0.0))
+                    self.servo.set_error(
+                        request.get("delta_pan_angle", 0.0),
+                        request.get("delta_tilt_angle", 0.0),
+                    )
 
                     self.servo.publish_servo_command(tracking=False)
                     self.rep_socket.send_json(
@@ -562,11 +591,9 @@ class LLMRosBridge(Node):
 
                     reset_camera = request.get("reset_camera", True) is not False
                     if reset_camera:
-                        self.servo.delta_pan_angle = (
-                            self.servo.reset_pan_angle - self.servo.pan_angle
-                        )
-                        self.servo.delta_tilt_angle = (
-                            self.servo.reset_tilt_angle - self.servo.tilt_angle
+                        self.servo.set_error(
+                            self.servo.reset_pan_angle - self.servo.pan_angle,
+                            self.servo.reset_tilt_angle - self.servo.tilt_angle,
                         )
 
                         self.servo.publish_servo_command(tracking=False)

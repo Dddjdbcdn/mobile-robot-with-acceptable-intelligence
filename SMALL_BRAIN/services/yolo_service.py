@@ -40,6 +40,11 @@ class YoloService():
         with self._state_condition:
             return bool(self._owner_modes)
 
+    def detection_snapshot(self):
+        """Return one inference generation and its detections atomically."""
+        with self._state_condition:
+            return self._inference_sequence, list(self.detections)
+
     def _effective_mode_locked(self):
         modes = set(self._owner_modes.values()) - {"none"}
         if "both" in modes or {"dj", "pose"}.issubset(modes):
