@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,13 +165,19 @@ class SeeActionCameraMovementTests(unittest.IsolatedAsyncioTestCase):
         send_robot_command = AsyncMock(return_value={"status": "accepted"})
         action = SeeAction(
             ws=AsyncMock(),
-            camera=SimpleNamespace(),
+            camera=SimpleNamespace(
+                wait_for_frame_captured_after=lambda _captured_at, _timeout: True,
+            ),
             send_robot_command=send_robot_command,
             settle_seconds=0.0,
         )
 
         try:
-            result = await action.move_to_region("upper-left", "see-1:move")
+            with patch(
+                "actions.see_action.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep:
+                result = await action.move_to_region("upper-left", "see-1:move")
         finally:
             robot_state["camera"].clear()
             robot_state["camera"].update(previous_camera_state)
@@ -179,6 +185,7 @@ class SeeActionCameraMovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.action_type, "see_action")
         self.assertEqual(result.data["region"], "upper_left")
+        self.assertEqual(sleep.await_args_list, [call(0.0)])
         send_robot_command.assert_awaited_once()
         command = send_robot_command.await_args.args[0]
         self.assertEqual(command["command"], "move_camera")

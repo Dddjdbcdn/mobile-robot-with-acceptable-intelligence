@@ -246,10 +246,20 @@ uint32_t __atomic_exchange_4(volatile uint32_t *mem, uint32_t val, int model) {
 }
 
 extern volatile uint8_t tof_data_ready; // Points to the variable in app_freertos.c
+extern volatile uint32_t tof_irq_count;
+extern volatile uint32_t tof_last_irq_ms;
+extern volatile uint32_t tof_irq_period_ms;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-    if (GPIO_Pin == INT_Pin) { 
-        tof_data_ready = 1; 
+    if (GPIO_Pin == INT_Pin) {
+        uint32_t now = HAL_GetTick();
+
+        if (tof_last_irq_ms != 0U)
+            tof_irq_period_ms = now - tof_last_irq_ms;
+
+        tof_last_irq_ms = now;
+        tof_irq_count++;
+        tof_data_ready = 1;
     }
 }
 

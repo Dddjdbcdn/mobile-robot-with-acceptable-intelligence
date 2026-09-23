@@ -125,7 +125,7 @@ class NavigateAction:
         self.map_crop_size_m = float(
             map_crop_size_m
             if map_crop_size_m is not None
-            else os.environ.get('NAVIGATION_MAP_CROP_SIZE_M', '4.0')
+            else os.environ.get('NAVIGATION_MAP_CROP_SIZE_M', '6.0')
         )
         if not 1.0 <= self.map_crop_size_m <= 20.0:
             raise ValueError('navigation map crop size must be between 1 and 20 metres')

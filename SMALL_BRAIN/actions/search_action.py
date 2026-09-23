@@ -42,7 +42,8 @@ CAMERA_HORIZONTAL_FOV_DEG = 85
 CAMERA_VERTICAL_FOV_DEG = 52
 AIM_GAIN = 1.0
 CAMERA_MOVE_TIMEOUT_SECONDS = 2.0
-CAMERA_SETTLE_SECONDS = 0.8
+CAMERA_SETTLE_SECONDS = 1.5
+CAMERA_RECOVERY_TIMEOUT_SECONDS = 3.0
 
 PAN_POSITION_ANGLE = {
     "center": 95.0,
@@ -174,6 +175,14 @@ class SearchAction:
         self.tilt_angle += delta_tilt
 
         await asyncio.sleep(CAMERA_SETTLE_SECONDS)
+        move_completed_at = time.monotonic()
+        frame_ready = await asyncio.to_thread(
+            self.camera.wait_for_frame_captured_after,
+            move_completed_at,
+            CAMERA_RECOVERY_TIMEOUT_SECONDS,
+        )
+        if not frame_ready:
+            raise RuntimeError("Camera did not recover after pan/tilt movement")
 
     async def capture_sweep_batch(self) -> None:
         if not self.active:
@@ -819,19 +828,21 @@ class SearchAction:
             "movement_limit", "movements_used", "remaining_waypoints",
             "reassessment_limit", "reassessments_used",
         }
+
         self.last_coverage_frames = [
             {
                 key: value for key, value in frame.items()
                 if key in allowed_frame_keys
             }
             for frame in self.captured_frames
+            if abs(float(frame["tilt_angle"])- TILT_POSITION_ANGLE["center"]) <= 1.0
         ]
         self.last_observation_frame = (
             {
                 key: value for key, value in clue_frame.items()
                 if key in allowed_frame_keys
             }
-            if clue_frame is not None else None
+            if clue_frame is not None and is_middle_layer(clue_frame) else None
         )
         self.last_contextual_clue = clue
         self.last_found_target = self.target if status == "succeeded" else None
@@ -858,7 +869,8 @@ def get_valid_position(position):
     elif isinstance(position, (list, tuple)) and len(position) == 2:
         x, y = position
     else: return None
-    if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0: return None
+    if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0: 
+        return {"x": 0.5, "y": 0.5}
     return {"x": float(x),"y": float(y)}
 
 def get_valid_frame(image_id, frames):
@@ -866,25 +878,6 @@ def get_valid_frame(image_id, frames):
         return None
     return next((frame for frame in frames if frame.get("image_id") == image_id), None)
 
-def get_valid_box(box):
-    if isinstance(box, dict):
-        x_min = box.get("x_min")
-        x_max = box.get("x_max")
-        y_min = box.get("y_min")
-        y_max = box.get("y_max")
-    elif isinstance(box, (list, tuple)) and len(box) == 4:
-        x_min, x_max, y_min, y_max = box
-    else:
-        return None
-
-    if (
-        not 0.0 <= x_min <= 1.0 or not 0.0 <= x_max <= 1.0
-        or not 0.0 <= y_min <= 1.0 or not 0.0 <= y_max <= 1.0
-        or not y_min < y_max or not x_min < x_max
-    ):
-        return None
-
-    return {"x_min": float(x_min),"x_max": float(x_max),"y_min": float(y_min),"y_max": float(y_max)}
 
 def save_candidate_debug_image(
     jpeg_bytes: bytes,

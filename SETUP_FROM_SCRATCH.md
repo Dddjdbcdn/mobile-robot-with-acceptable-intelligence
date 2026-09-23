@@ -654,6 +654,10 @@ source install/setup.bash
 ros2 launch robot bringup.launch.py
 ```
 
+The STM32 ramps pan and tilt in its 10 ms control loop. Tune the local
+`SERVO_SPEED_DEG_PER_SEC` value in `MICRO_ROS/Core/Src/Controller/motor.c`,
+then rebuild and flash the firmware. The default is 60 degrees per second.
+
 For live mapping and navigation:
 
 ```bash

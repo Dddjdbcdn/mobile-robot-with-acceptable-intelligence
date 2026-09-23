@@ -61,14 +61,58 @@ float error_integral_R = 0.0;
 float previous_error_R = 0.0;
 
 // Servo State
-volatile float servo_pan_angle = 95;
-volatile float servo_tilt_angle = 90;
-volatile float previous_servo_pan_angle = 95;
-volatile float previous_servo_tilt_angle = 90;
+#define SERVO_MIN_PAN_ANGLE       30.0f
+#define SERVO_MAX_PAN_ANGLE       160.0f
+#define SERVO_MIN_TILT_ANGLE      30.0f
+#define SERVO_MAX_TILT_ANGLE      120.0f
+
+// Tune this single value to change pan/tilt slew speed.
+#define SERVO_SPEED_DEG_PER_SEC    120.0f
+
+volatile float servo_pan_angle = 95.0f;
+volatile float servo_tilt_angle = 90.0f;
+static volatile float servo_pan_target_angle = 95.0f;
+static volatile float servo_tilt_target_angle = 90.0f;
+
+static float Servo_Clamp(float value, float minimum, float maximum) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+void Servo_SetPanTarget(float angle) {
+    if (isfinite(angle)) {
+        servo_pan_target_angle = Servo_Clamp(
+            angle, SERVO_MIN_PAN_ANGLE, SERVO_MAX_PAN_ANGLE);
+    }
+}
+
+void Servo_SetTiltTarget(float angle) {
+    if (isfinite(angle)) {
+        servo_tilt_target_angle = Servo_Clamp(
+            angle, SERVO_MIN_TILT_ANGLE, SERVO_MAX_TILT_ANGLE);
+    }
+}
+
+static void Servo_UpdateRamp(void) {
+    float pan_error = servo_pan_target_angle - servo_pan_angle;
+    float tilt_error = servo_tilt_target_angle - servo_tilt_angle;
+    float largest_error = fmaxf(fabsf(pan_error), fabsf(tilt_error));
+    float maximum_step = SERVO_SPEED_DEG_PER_SEC *
+        ((float)DELTA_TIME / 1000.0f);
+
+    if (largest_error <= maximum_step) {
+        servo_pan_angle = servo_pan_target_angle;
+        servo_tilt_angle = servo_tilt_target_angle;
+        return;
+    }
+
+    float scale = maximum_step / largest_error;
+    servo_pan_angle += pan_error * scale;
+    servo_tilt_angle += tilt_error * scale;
+}
 
 void Servo_Tilt_Rotate() {
-    previous_servo_tilt_angle = servo_tilt_angle;
-
     float rad_angle = servo_tilt_angle*M_PI / 180.0;
     if (rad_angle < 0.0f) rad_angle = 0.0f;
     if (rad_angle > M_PI) rad_angle = M_PI;
@@ -78,8 +122,6 @@ void Servo_Tilt_Rotate() {
     }
 }
 void Servo_Pan_Rotate() {
-    previous_servo_pan_angle = servo_pan_angle;
-
     float rad_angle = servo_pan_angle*M_PI / 180.0;
     if (rad_angle < 0.0f) rad_angle = 0.0f;
     if (rad_angle > M_PI) rad_angle = M_PI;
@@ -241,6 +283,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         // SERVO CONTROL
         // ==========================================
 
+        Servo_UpdateRamp();
         Servo_Tilt_Rotate();
         Servo_Pan_Rotate();
            

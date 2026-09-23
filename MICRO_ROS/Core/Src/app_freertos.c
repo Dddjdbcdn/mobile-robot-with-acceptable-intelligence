@@ -56,6 +56,12 @@ VL53L7CX_Configuration Dev;
 VL53L7CX_ResultsData Results;
 volatile uint8_t tof_data_ready = 0;
 volatile uint8_t tof_alive_status = 0;
+volatile uint32_t tof_irq_count = 0;
+volatile uint32_t tof_last_irq_ms = 0;
+volatile uint32_t tof_irq_period_ms = 0;
+volatile uint32_t tof_frame_count = 0;
+volatile uint32_t tof_last_frame_ms = 0;
+volatile uint8_t tof_last_read_status = 0;
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -192,8 +198,13 @@ void Hardware_Task(void *argument)
         Read_IMU();
 
         if (tof_data_ready) {
-            tof_data_ready = 0; 
-            vl53l7cx_get_ranging_data(&Dev, &Results);
+            tof_data_ready = 0;
+            tof_last_read_status = vl53l7cx_get_ranging_data(&Dev, &Results);
+
+            if (tof_last_read_status == VL53L7CX_STATUS_OK) {
+                tof_frame_count++;
+                tof_last_frame_ms = HAL_GetTick();
+            }
         }
 
         osDelay(5); 

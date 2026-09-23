@@ -75,7 +75,7 @@ if not OPENAI_API_KEY:
     print("Error: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
 
-MODEL = "gpt-realtime-2.1"
+MODEL = "gpt-realtime-2.1-mini"
 URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
 DEBUG_MODE = False
 

@@ -174,69 +174,11 @@ class GoalExecutor:
         return result
 
     async def _run(self) -> None:
-        """Repeat find/approach until the target is tracked after arrival."""
+        """Search until one candidate survives tracking and arrival checks."""
         try:
-            search_round = 0
-            while True:
-                limit_result = self._search_limit_result()
-                if limit_result is not None:
-                    raise GoalStepFailed("find", limit_result)
-
-                search_result = await self._search_environment(search_round)
-                if search_result.status != "succeeded":
-                    raise GoalStepFailed("find", search_result)
-                self._completed_steps.append(
-                    "target_found" if search_round == 0
-                    else f"target_refound_{search_round}"
-                )
-
-                if not self.track_action.active:
-                    track_result = await self._track(
-                        allow_grounding_dino=True,
-                        step=(
-                            "track" if search_round == 0
-                            else f"track_{search_round}"
-                        ),
-                    )
-                    if track_result.status != "succeeded":
-                        raise GoalStepFailed("track", track_result)
-                self._completed_steps.append(
-                    "target_tracked" if search_round == 0
-                    else f"target_retracked_{search_round}"
-                )
-
-                approach_result = await self._approach(
-                    step=(
-                        "approach" if search_round == 0
-                        else f"approach_{search_round}"
-                    )
-                )
-                if approach_result.status != "succeeded":
-                    raise GoalStepFailed("approach", approach_result)
-                if getattr(self, "_approach_follow", False):
-                    self._completed_steps.append("target_following")
-                    break
-
-                reacquired = await self._post_approach_reacquire(search_round)
-                if reacquired.status == "succeeded":
-                    self._approach_result_data.update({
-                        "verified": True,
-                        "post_approach_reacquired": True,
-                        "reacquisition": self._result_data(reacquired),
-                    })
-                    self._completed_steps.extend([
-                        "target_reacquired",
-                        "target_reached",
-                    ])
-                    break
-
-                if reacquired.reason_code in self.REACQUISITION_MISS_CODES:
-                    self._completed_steps.append(
-                        f"approach_destination_rejected_{search_round}"
-                    )
-                    search_round += 1
-                    continue
-                raise GoalStepFailed("post_approach_reacquire", reacquired)
+            result = await self._search_environment()
+            if result.status != "succeeded":
+                raise GoalStepFailed("find", result)
         except asyncio.CancelledError:
             return
         except GoalStepFailed as error:
@@ -268,37 +210,7 @@ class GoalExecutor:
             ),
         )
 
-    async def _turn_body(self, direction: str, step: str) -> ActionResult:
-        command = self.TURN_COMMANDS[direction]
-        result = await self.move_action.start_moving(
-            linear_velocity=0.0,
-            distance=0.0,
-            angular_velocity=command["angular_velocity"],
-            angle=command["angle"],
-            action_id=self._step_id(step),
-        )
-        result = await self._terminal_result(self.move_action, result)
-        if result.status == "succeeded":
-            self.search_action.last_found_target = None
-        return result
-
-    async def _move_camera_for_goal(self, region: str, step: str) -> ActionResult:
-        if self.track_action.active:
-            await self.track_action.stop_tracking(
-                reason_code="REPLACED",
-                status="cancelled",
-                outcome="replaced_by_new_goal",
-            )
-        return await self.see_action.move_to_region(
-            region=region,
-            action_id=self._step_id(step),
-        )
-
-    async def _track(
-        self,
-        allow_grounding_dino=True,
-        step="track",
-    ) -> ActionResult:
+    async def _track(self,allow_grounding_dino=True,step="track") -> ActionResult:
         result = await self.track_action.start_tracking(
             target=self.target,
             action_id=self._step_id(step),
@@ -338,8 +250,38 @@ class GoalExecutor:
             self._approach_result_data = dict(result.data)
         return result
 
-    async def _post_approach_reacquire(self, search_round) -> ActionResult:
-        """Max-effort search and stable tracking validate the destination."""
+    async def _track_approach_and_reacquire(
+        self, attempt: int
+    ) -> ActionResult:
+
+        suffix = "" if attempt == 0 else f"_{attempt}"
+        self._completed_steps.append(
+            "target_found" if attempt == 0 else f"target_refound_{attempt}"
+        )
+
+        track_result = await self._track(
+            allow_grounding_dino=True,
+            step=f"track{suffix}",
+        )
+        if track_result.status != "succeeded":
+            return track_result
+        self._completed_steps.append(
+            "target_tracked" if attempt == 0
+            else f"target_retracked_{attempt}"
+        )
+
+        approach_result = await self._approach(step=f"approach{suffix}")
+        if approach_result.status != "succeeded":
+            return approach_result
+        if getattr(self, "_approach_follow", False):
+            self._completed_steps.append("target_following")
+            return approach_result
+
+        # An approach is physical navigation and consumes the same global
+        # waypoint budget as a search navigation step.
+        self._search_waypoint_count += 1
+        self._completed_steps.append(f"approach_waypoint_{attempt}")
+
         if self.track_action.active:
             await self.track_action.stop_tracking(
                 reason_code="APPROACH_NAVIGATION_COMPLETE",
@@ -348,7 +290,7 @@ class GoalExecutor:
                 reset_camera=False,
             )
 
-        step = f"post_approach_search_{search_round}"
+        step = f"post_approach_search_{attempt}"
         search_result = await self._search(
             step,
             effort="best_effort",
@@ -360,14 +302,14 @@ class GoalExecutor:
 
         track_result = await self._track(
             allow_grounding_dino=True,
-            step=f"post_approach_track_{search_round}",
+            step=f"post_approach_track_{attempt}",
         )
         if track_result.status != "succeeded":
             return track_result
 
-        return ActionResult(
+        reacquired = ActionResult(
             action_id=self._step_id(
-                f"post_approach_track_{search_round}"
+                f"post_approach_track_{attempt}"
             ),
             action_type="track_action",
             status="succeeded",
@@ -375,6 +317,16 @@ class GoalExecutor:
             outcome="post_approach_target_reacquired",
             data={"tracking_stable": True, "search_effort": "best_effort"},
         )
+        self._approach_result_data.update({
+            "verified": True,
+            "post_approach_reacquired": True,
+            "reacquisition": self._result_data(reacquired),
+        })
+        self._completed_steps.extend([
+            "target_reacquired",
+            "target_reached",
+        ])
+        return reacquired
 
     async def _navigate_search_step(self, observation, mode, step):
         revision = await self._publish_map_overlay(
@@ -395,30 +347,150 @@ class GoalExecutor:
             self._completed_steps.append(step)
         return result
 
-    async def _search_environment(self, search_round=0) -> ActionResult:
-        root_step = "initial" if search_round == 0 else f"retry_{search_round}"
-        print("🌊 [INSPECTION] INITIAL ATTEMPT")
-        result = await self._inspect_area(
-            root_step,
-        )
-        if result is not None:
-            return result
+    async def _search_environment(self) -> ActionResult:
+        step = "initial"
+        candidate_context = None
+        pending_result = None
+        exploration_index = 0
+        candidate_attempt = 0
+        contextual_type = None
+        contextual_movements = 0
 
-        for exploration_index in range(1, self.find_loop.max_exploration_waypoints + 1):
+        while True:
             limit_result = self._search_limit_result()
             if limit_result is not None:
                 return limit_result
 
-            print(f"🌿 [EXPLORE] {exploration_index}/{self.find_loop.max_exploration_waypoints}")
-            exploration_step = (
-                f"explore_{exploration_index}"
-                if search_round == 0
-                else f"{root_step}_explore_{exploration_index}"
+            if pending_result is None:
+                if self.track_action.active:
+                    await self.track_action.stop_tracking(
+                        reason_code="REPLACED",
+                        status="cancelled",
+                        outcome="replaced_by_new_goal",
+                    )
+                centered = await self.see_action.move_to_region(
+                    region="center",
+                    action_id=self._step_id(f"{step}_center_camera"),
+                )
+
+                if centered.status != "succeeded":
+                    return centered
+                pending_result = await self._search(
+                    f"{step}_center_scan",
+                    initial_view_only=False,
+                    sweep_directions=("left", "right"),
+                    candidate_context=candidate_context,
+                )
+            candidate_context = None
+
+            observation = self.search_action.last_observation_frame
+            candidate_type = str(
+                (observation or {}).get("candidate_type") or ""
             )
+            found = pending_result.status == "succeeded"
+            if (
+                not found
+                and pending_result.reason_code
+                not in {"TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE"}
+            ):
+                return pending_result
+            pending_result = None
+
+            if found or candidate_type == "visual":
+                self.search_action.last_observation_frame = None
+                waypoint_count_before = self._search_waypoint_count
+                verified = await self._track_approach_and_reacquire(
+                    candidate_attempt
+                )
+                if verified.status == "succeeded":
+                    return verified
+                if verified.reason_code not in self.REACQUISITION_MISS_CODES:
+                    return verified
+                if self.track_action.active:
+                    await self.track_action.stop_tracking(
+                        reason_code="CANDIDATE_REJECTED",
+                        status="cancelled",
+                        outcome="candidate_not_verified",
+                        reset_camera=False,
+                    )
+
+                rejection = (
+                    "approach_destination_rejected"
+                    if self._search_waypoint_count > waypoint_count_before
+                    else "candidate_rejected"
+                )
+                self._completed_steps.append(
+                    f"{rejection}_{candidate_attempt}"
+                )
+                candidate_attempt += 1
+
+                pending_result = ActionResult(
+                    action_id=verified.action_id,
+                    action_type="search_action",
+                    status="failed",
+                    target=self.target,
+                    outcome="candidate_not_verified",
+                    reason_code="TARGET_NOT_VISIBLE",
+                )
+                step = f"approach_{candidate_attempt}_rejected"
+                continue
+
+            if candidate_type in {"local", "destination"}:
+                if candidate_type != contextual_type:
+                    contextual_type = candidate_type
+                    contextual_movements = 0
+                if candidate_type == "local":
+                    mode = "context"
+                    movement_limit = self.find_loop.max_local_waypoints
+                else:
+                    mode = "destination"
+                    movement_limit = self.find_loop.max_destination_waypoints
+
+                if contextual_movements < movement_limit:
+                    payload = dict(observation)
+                    payload.update({
+                        "movement_limit": movement_limit,
+                        "movements_used": contextual_movements,
+                        "remaining_waypoints": (
+                            movement_limit - contextual_movements
+                        ),
+                    })
+                    next_step = (
+                        f"{step}_{mode}_{contextual_movements + 1}"
+                    )
+                    navigation = await self._navigate_search_step(
+                        payload,
+                        mode=mode,
+                        step=next_step,
+                    )
+                    if navigation.status == "succeeded":
+                        contextual_movements += 1
+                        candidate_context = dict(payload)
+                        candidate_context.update({
+                            "movements_used": contextual_movements,
+                            "remaining_waypoints": (
+                                movement_limit - contextual_movements
+                            ),
+                        })
+                        step = next_step
+                        continue
+                    if navigation.reason_code not in {
+                        "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
+                    }:
+                        return navigation
+            if candidate_type == "speculative":
+                pass
+
+            contextual_type = None
+            contextual_movements = 0
+            exploration_index += 1
+            if exploration_index > self.find_loop.max_exploration_waypoints:
+                return self._search_exhausted_result()
+            next_step = f"explore_{exploration_index}"
             navigation = await self._navigate_search_step(
                 None,
                 mode="exploration",
-                step=exploration_step,
+                step=next_step,
             )
             if navigation.status != "succeeded":
                 if navigation.reason_code in {
@@ -426,185 +498,7 @@ class GoalExecutor:
                 }:
                     return self._search_exhausted_result(navigation)
                 return navigation
-
-            print(f"🌊 [INSPECTION]: {exploration_index}/{self.find_loop.max_exploration_waypoints}")
-            result = await self._inspect_area(
-                exploration_step,
-            )
-            if result is not None:
-                return result
-
-        return self._search_exhausted_result()
-
-    async def _inspect_area(self, prefix, *, candidate_context=None):
-        scan = await self._scan_area(
-            prefix,
-            candidate_context=candidate_context,
-            initial=True,
-        )
-        if scan.status == "succeeded":
-            return scan
-        if scan.reason_code not in {
-            "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
-        }:
-            return scan
-
-        observation = self.search_action.last_observation_frame
-        if observation is None:
-            print("🌊 [SEARCH]: NO CLUE")
-            return None
-        return await self._route_candidate(prefix, observation)
-
-    async def _scan_area(
-        self, step, *, candidate_context=None, initial=False
-    ) -> ActionResult:
-        centered = await self._move_camera_for_goal(
-            region="center", step=f"{step}_center_camera"
-        )
-        if centered.status != "succeeded":
-            return centered
-        return await self._search(
-            f"{step}_center_scan" if initial else f"{step}_camera_check",
-            initial_view_only=False,
-            sweep_directions=("left", "right"),
-            candidate_context=candidate_context,
-        )
-
-    async def _route_candidate(self, prefix, observation):
-        """Dispatch a search assessment to its deliberately distinct behavior."""
-        candidate_type = str(observation.get("candidate_type") or "")
-        print(f"🌊 [SEARCH]: CANDIDATE: {candidate_type or 'none'}")
-        handlers = {
-            "visual": self._handle_visual_candidate,
-            "local": self._handle_contextual_candidate,
-            "destination": self._handle_contextual_candidate,
-            "speculative": self._handle_speculative_candidate,
-        }
-        handler = handlers.get(candidate_type)
-        if handler is None:
-            return None
-        return await handler(prefix, observation)
-
-    async def _handle_visual_candidate(self, prefix, observation):
-        context = dict(observation)
-        context.update({
-            "candidate_type": "visual",
-            "reassessment_limit": 1,
-            "reassessments_used": 0,
-        })
-        reassessment = await self._search(
-            f"{prefix}_visual_reassessment",
-            initial_view_only=True,
-            sweep_directions=(),
-            candidate_context=context,
-        )
-        if reassessment.status == "succeeded":
-            return reassessment
-        if reassessment.reason_code not in {
-            "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
-        }:
-            return reassessment
-        if self.search_action.last_observation_frame is None:
-            return None
-
-        track_result = await self._track(
-            allow_grounding_dino=True,
-            step=f"{prefix}_visual_track",
-        )
-        if track_result.status != "succeeded":
-            print("🌊 [SEARCH]: VISUAL CANDIDATE REJECTED")
-            return None
-        print("🌊 [SEARCH]: VISUAL CANDIDATE ACCEPTED")
-        return ActionResult(
-            action_id=self._step_id(f"{prefix}_visual_track_confirmed"),
-            action_type="search_action",
-            status="succeeded",
-            target=self.target,
-            outcome="visual_candidate_tracked",
-            data={"tracker_result": self._result_data(track_result)},
-        )
-
-    async def _handle_contextual_candidate(self, prefix, observation):
-        """Follow local/destination clues and reset when their type changes."""
-        candidate_type = str(observation.get("candidate_type") or "")
-        movement_index = 0
-
-        while candidate_type in {"local", "destination"}:
-            if candidate_type == "local":
-                mode = "context"
-                label = "LOCAL CLUE"
-                movement_limit = self.find_loop.max_local_waypoints
-            else:
-                mode = "destination"
-                label = "DESTINATION"
-                movement_limit = self.find_loop.max_destination_waypoints
-
-            if movement_index >= movement_limit:
-                return None
-
-            limit_result = self._search_limit_result()
-            if limit_result is not None:
-                return limit_result
-
-            payload = dict(observation)
-            payload.update({
-                "movement_limit": movement_limit,
-                "movements_used": movement_index,
-                "remaining_waypoints": movement_limit - movement_index,
-            })
-            print(
-                f"🔥 [FOLLOW {label}]: {movement_index}/{movement_limit}"
-            )
-            step_kind = "context" if mode == "context" else "destination"
-            step = f"{prefix}_{step_kind}_{movement_index + 1}"
-            navigation = await self._navigate_search_step(
-                payload,
-                mode=mode,
-                step=step,
-            )
-            if navigation.status != "succeeded":
-                if navigation.reason_code in {
-                    "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
-                }:
-                    return None
-                return navigation
-
-            movement_index += 1
-            scan_context = dict(payload)
-            scan_context.update({
-                "movements_used": movement_index,
-                "remaining_waypoints": movement_limit - movement_index,
-            })
-            scan = await self._scan_area(
-                step,
-                candidate_context=scan_context,
-            )
-            if scan.status == "succeeded":
-                return scan
-            if scan.reason_code not in {
-                "TARGET_NOT_VISIBLE", "SEARCH_CONTEXTUAL_CLUE",
-            }:
-                return scan
-
-            next_observation = self.search_action.last_observation_frame
-            next_type = str(
-                (next_observation or {}).get("candidate_type") or ""
-            )
-            if next_type not in {"local", "destination"}:
-                if next_type in {"visual", "speculative"}:
-                    return await self._route_candidate(step, next_observation)
-                return None
-
-            if next_type != candidate_type:
-                prefix = step
-                movement_index = 0
-            observation = next_observation
-            candidate_type = next_type
-        return None
-
-    async def _handle_speculative_candidate(self, _prefix, _observation):
-        """Speculation is intentionally acknowledged without causing motion."""
-        return None
+            step = next_step
 
     async def _search(
         self, step, initial_view_only, sweep_directions=None, effort="center",

@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import json
+import time
 
 import cv2
 
 from actions.action_result import ActionResult
 from actions.search_action import (
+    CAMERA_RECOVERY_TIMEOUT_SECONDS,
     CAMERA_SETTLE_SECONDS,
     PAN_POSITION_ANGLE,
     TILT_POSITION_ANGLE,
@@ -184,6 +186,22 @@ class SeeAction:
                 )
 
             await asyncio.sleep(self.settle_seconds)
+            move_completed_at = time.monotonic()
+            frame_ready = await asyncio.to_thread(
+                self.camera.wait_for_frame_captured_after,
+                move_completed_at,
+                CAMERA_RECOVERY_TIMEOUT_SECONDS,
+            )
+            if not frame_ready:
+                return ActionResult(
+                    action_id=action_id,
+                    action_type="see_action",
+                    status="failed",
+                    target=normalized_region,
+                    outcome="camera_unavailable",
+                    reason_code="CAMERA_RECOVERY_TIMEOUT",
+                    retryable=True,
+                )
             return ActionResult(
                 action_id=action_id,
                 action_type="see_action",

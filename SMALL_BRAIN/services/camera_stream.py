@@ -598,3 +598,19 @@ class CameraStream:
                 lambda: (self.latest and self.latest.sequence > sequence) or self.stop_event.is_set(),
                 timeout=timeout
             )
+
+    def wait_for_frame_captured_after(self, captured_at, timeout=3.0):
+        """Wait for a live frame captured after a camera movement completed."""
+        with self.condition:
+            ready = self.condition.wait_for(
+                lambda: (
+                    self.latest is not None
+                    and self.latest.captured_at > captured_at
+                ) or self.stop_event.is_set(),
+                timeout=timeout,
+            )
+            return bool(
+                ready
+                and self.latest is not None
+                and self.latest.captured_at > captured_at
+            )

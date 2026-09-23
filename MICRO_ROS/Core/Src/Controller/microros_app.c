@@ -36,6 +36,12 @@ extern void MX_I2C1_Init(void);
 extern VL53L7CX_ResultsData Results;
 extern uint8_t tof_alive_status;
 extern uint8_t tof_data_ready;
+extern volatile uint32_t tof_irq_count;
+extern volatile uint32_t tof_last_irq_ms;
+extern volatile uint32_t tof_irq_period_ms;
+extern volatile uint32_t tof_frame_count;
+extern volatile uint32_t tof_last_frame_ms;
+extern volatile uint8_t tof_last_read_status;
 
 #define PI 3.14159265358979323846f
 #define WHEEL_RADIUS 0.0325
@@ -122,13 +128,13 @@ rcl_timer_t pwm_timer;
 void servo_tilt_callback(const void * msgin)
 {
     const std_msgs__msg__Float32 * msg = (const std_msgs__msg__Float32 *)msgin;
-    servo_tilt_angle = msg->data;
+    Servo_SetTiltTarget(msg->data);
 }
 
 void servo_pan_callback(const void * msgin)
 {
     const std_msgs__msg__Float32 * msg = (const std_msgs__msg__Float32 *)msgin;
-    servo_pan_angle = msg->data;
+    Servo_SetPanTarget(msg->data);
 }
 
 uint8_t count = 0;
@@ -203,6 +209,10 @@ void range_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 
 void tof_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
+    static uint32_t previous_irq_count = 0;
+    static uint32_t previous_frame_count = 0;
+    static uint32_t previous_report_ms = 0;
+
     if (timer == NULL) return;
 
     vTaskSuspendAll();
@@ -223,6 +233,42 @@ void tof_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 
     rcl_ret_t ret = rcl_publish(&tof_raw_publisher, &tof_raw_msg, NULL);
     (void)ret;
+
+    uint32_t now = HAL_GetTick();
+    uint32_t elapsed = now - previous_report_ms;
+
+    if (elapsed >= 1000U)
+    {
+        uint32_t irq_count = tof_irq_count;
+        uint32_t frame_count = tof_frame_count;
+        uint32_t irq_rate = ((irq_count - previous_irq_count) * 1000U) / elapsed;
+        uint32_t frame_rate = ((frame_count - previous_frame_count) * 1000U) / elapsed;
+        uint32_t irq_age = (tof_last_irq_ms == 0U) ? 0U : now - tof_last_irq_ms;
+        uint32_t frame_age = (tof_last_frame_ms == 0U) ? 0U : now - tof_last_frame_ms;
+
+        debug_print("[TOF] irq=%luHz frame=%luHz dt=%lums irq_age=%lums frame_age=%lums read=%u pin=%u",
+                    (unsigned long)irq_rate,
+                    (unsigned long)frame_rate,
+                    (unsigned long)tof_irq_period_ms,
+                    (unsigned long)irq_age,
+                    (unsigned long)frame_age,
+                    (unsigned int)tof_last_read_status,
+                    (unsigned int)HAL_GPIO_ReadPin(INT_GPIO_Port, INT_Pin));
+
+        previous_irq_count = irq_count;
+        previous_frame_count = frame_count;
+        previous_report_ms = now;
+
+        
+
+        //Interpretation:
+        //- irq=10Hz, frame=10Hz, read=0: sensor and I²C reads are healthy.
+        //- irq=0Hz, pin=1: the VL53L7CX stopped generating interrupts.
+        //- irq=0Hz, pin=0: INT is stuck low or the interrupt edge is not being detected.
+        //- irq≈10Hz, frame=0Hz, read!=0: interrupts work, but vl53l7cx_get_ranging_data() is failing.
+        //- Both rates near 10 Hz but the obstacle layer disappears: likely downstream ROS, TF, bridge, or costmap behavior.
+
+    }
 }
 
 void pwm_timer_callback(rcl_timer_t * timer, int64_t last_call_time)

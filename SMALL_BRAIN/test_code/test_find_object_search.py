@@ -740,292 +740,169 @@ class ContextualClueContractTests(unittest.TestCase):
 
 
 class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def test_inspection_and_context_navigation_repeat_until_found(self):
+    def executor(self, *, config=None):
         executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
+        executor.find_loop = config or FindLoopConfig()
         executor.action_id = "find-1"
+        executor.target = "water bottle"
+        executor._search_poses = []
+        executor._search_waypoint_count = 0
+        executor._completed_steps = []
+        executor._approach_result_data = {}
+        executor._approach_follow = False
         executor.search_action = type(
-            "Search", (), {"last_observation_frame": {
-                "jpeg_bytes": b"one-frame",
-                "contextual_clue": "A desk is visible on the right.",
-                "candidate_type": "local",
-            }}
+            "Search", (), {"last_observation_frame": None}
         )()
+        executor.track_action = type("Tracker", (), {"active": False})()
         executor._search_limit_result = lambda: None
         executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
             "camera", "see_action", "succeeded",
         ))
-        executor._search = AsyncMock(side_effect=[
-            ActionResult(
-                "scan-1", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-            ActionResult("scan-2", "search_action", "succeeded"),
-        ])
         executor._navigate_search_step = AsyncMock(return_value=ActionResult(
             "nav", "navigate_action", "succeeded",
         ))
-        result = await executor._inspect_area("initial")
+        executor._track_approach_and_reacquire = AsyncMock(return_value=ActionResult(
+            "verified", "track_action", "succeeded",
+        ))
+        return executor
+
+    @staticmethod
+    def clue(candidate_type, text="useful clue"):
+        return {
+            "jpeg_bytes": b"frame",
+            "contextual_clue": text,
+            "candidate_type": candidate_type,
+        }
+
+    async def test_context_navigation_repeats_until_found(self):
+        executor = self.executor()
+        results = [
+            (ActionResult("scan-1", "search_action", "failed",
+                          reason_code="SEARCH_CONTEXTUAL_CLUE"),
+             self.clue("local")),
+            (ActionResult("scan-2", "search_action", "succeeded"), None),
+        ]
+
+        async def search(*_args, **_kwargs):
+            result, observation = results.pop(0)
+            executor.search_action.last_observation_frame = observation
+            return result
+
+        executor._search = AsyncMock(side_effect=search)
+        result = await executor._search_environment()
 
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(executor._search.await_count, 2)
         navigation_call = executor._navigate_search_step.await_args
         self.assertEqual(navigation_call.args[0]["candidate_type"], "local")
         self.assertEqual(navigation_call.args[0]["movement_limit"], 2)
+        executor._track_approach_and_reacquire.assert_awaited_once_with(0)
 
     async def test_destination_candidate_routes_to_vision_selected_mode(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"hallway",
-                "contextual_clue": "The target is in the room down the hall.",
-                "candidate_type": "destination",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
-        executor._search = AsyncMock(side_effect=[
-            ActionResult(
-                "scan-1", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-            ActionResult("scan-2", "search_action", "succeeded"),
-        ])
-        executor._navigate_search_step = AsyncMock(return_value=ActionResult(
-            "nav", "navigate_action", "succeeded",
-        ))
+        executor = self.executor()
+        results = [
+            (ActionResult("scan-1", "search_action", "failed",
+                          reason_code="SEARCH_CONTEXTUAL_CLUE"),
+             self.clue("destination")),
+            (ActionResult("scan-2", "search_action", "succeeded"), None),
+        ]
 
-        result = await executor._inspect_area("initial")
+        async def search(*_args, **_kwargs):
+            result, observation = results.pop(0)
+            executor.search_action.last_observation_frame = observation
+            return result
 
+        executor._search = AsyncMock(side_effect=search)
+        result = await executor._search_environment()
         self.assertEqual(result.status, "succeeded")
         navigation_call = executor._navigate_search_step.await_args
         self.assertEqual(navigation_call.kwargs["mode"], "destination")
 
-    async def test_speculative_candidate_is_ignored(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"bag",
-                "contextual_clue": "A closed bag might contain the bottle.",
-                "candidate_type": "speculative",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
+    async def test_visual_candidate_is_verified_exactly_like_found(self):
+        executor = self.executor()
+        executor.search_action.last_observation_frame = self.clue("visual")
         executor._search = AsyncMock(return_value=ActionResult(
             "scan", "search_action", "failed",
             reason_code="SEARCH_CONTEXTUAL_CLUE",
         ))
-        executor._navigate_search_step = AsyncMock()
 
-        result = await executor._inspect_area("initial")
-
-        self.assertIsNone(result)
-        executor._navigate_search_step.assert_not_awaited()
-
-    async def test_visual_candidate_gets_one_same_view_reassessment_before_motion(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"possible-target",
-                "contextual_clue": "The target itself may be visible.",
-                "candidate_type": "visual",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
-        executor._search = AsyncMock(side_effect=[
-            ActionResult(
-                "scan", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-            ActionResult("reassessment", "search_action", "succeeded"),
-        ])
-        executor._navigate_search_step = AsyncMock()
-
-        result = await executor._inspect_area("initial")
+        result = await executor._search_environment()
 
         self.assertEqual(result.status, "succeeded")
-        self.assertEqual(executor._search.await_count, 2)
-        reassessment = executor._search.await_args_list[1]
-        self.assertEqual(reassessment.args[0], "initial_visual_reassessment")
-        self.assertTrue(reassessment.kwargs["initial_view_only"])
-        self.assertEqual(reassessment.kwargs["sweep_directions"], ())
-        self.assertEqual(
-            reassessment.kwargs["candidate_context"]["candidate_type"],
-            "visual",
-        )
-        executor._move_camera_for_goal.assert_awaited_once()
+        executor._track_approach_and_reacquire.assert_awaited_once_with(0)
+        executor._search.assert_awaited_once()
         executor._navigate_search_step.assert_not_awaited()
 
-    async def test_visual_candidate_still_present_starts_dino_without_navigation(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.target = "water bottle"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"possible-target",
-                "contextual_clue": "A matching bottle is partly visible.",
-                "candidate_type": "visual",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
+    async def test_speculative_candidate_is_treated_as_not_found(self):
+        executor = self.executor()
+        executor.search_action.last_observation_frame = self.clue("speculative")
+        executor._search = AsyncMock(return_value=ActionResult(
+            "scan", "search_action", "failed",
+            reason_code="SEARCH_CONTEXTUAL_CLUE",
         ))
-        executor._search = AsyncMock(side_effect=[
-            ActionResult(
-                "scan", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-            ActionResult(
-                "reassessment", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-        ])
-        executor._track = AsyncMock(return_value=ActionResult(
-            "track", "track_action", "succeeded", target="water bottle",
-        ))
-        executor._navigate_search_step = AsyncMock()
-
-        result = await executor._inspect_area("initial")
-
-        self.assertEqual(result.status, "succeeded")
-        self.assertEqual(result.outcome, "visual_candidate_tracked")
-        executor._track.assert_awaited_once_with(
-            allow_grounding_dino=True,
-            step="initial_visual_track",
+        executor._navigate_search_step.return_value = ActionResult(
+            "nav", "navigate_action", "failed",
+            reason_code="NO_NAVIGATION_CANDIDATES",
         )
-        executor._navigate_search_step.assert_not_awaited()
 
-    async def test_visual_candidate_is_rejected_when_dino_cannot_acquire_it(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.target = "water bottle"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"possible-target",
-                "contextual_clue": "A matching bottle is partly visible.",
-                "candidate_type": "visual",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
-        executor._search = AsyncMock(side_effect=[
-            ActionResult(
-                "scan", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-            ActionResult(
-                "reassessment", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
-            ),
-        ])
-        executor._track = AsyncMock(return_value=ActionResult(
-            "track", "track_action", "failed", target="water bottle",
-            reason_code="OBJECT_DETECTION_FAILED",
-        ))
-        executor._navigate_search_step = AsyncMock()
+        result = await executor._search_environment()
 
-        result = await executor._inspect_area("initial")
-
-        self.assertIsNone(result)
-        executor._track.assert_awaited_once_with(
-            allow_grounding_dino=True,
-            step="initial_visual_track",
+        self.assertEqual(result.reason_code, "OBJECT_SEARCH_EXHAUSTED")
+        executor._track_approach_and_reacquire.assert_not_awaited()
+        executor._navigate_search_step.assert_awaited_once_with(
+            None, mode="exploration", step="explore_1"
         )
-        executor._navigate_search_step.assert_not_awaited()
 
     async def test_local_budget_is_consumed_by_repeated_frames(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor.action_id = "find-1"
-        executor.search_action = type("Search", (), {
-            "last_observation_frame": {
-                "jpeg_bytes": b"clue",
-                "contextual_clue": "The target is hidden behind the chair.",
-                "candidate_type": "local",
-            }
-        })()
-        executor._search_limit_result = lambda: None
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
-        executor._search = AsyncMock(return_value=ActionResult(
-            "scan", "search_action", "failed",
-            reason_code="SEARCH_CONTEXTUAL_CLUE",
-        ))
-        executor._navigate_search_step = AsyncMock(return_value=ActionResult(
-            "nav", "navigate_action", "succeeded",
-        ))
+        executor = self.executor()
 
-        result = await executor._inspect_area("initial")
+        async def search(*_args, **_kwargs):
+            executor.search_action.last_observation_frame = self.clue("local")
+            return ActionResult(
+                "scan", "search_action", "failed",
+                reason_code="SEARCH_CONTEXTUAL_CLUE",
+            )
 
-        self.assertIsNone(result)
-        self.assertEqual(executor._navigate_search_step.await_count, 2)
-        observations = [item.args[0] for item in
-                        executor._navigate_search_step.await_args_list]
+        executor._search = AsyncMock(side_effect=search)
+        executor._navigate_search_step.side_effect = [
+            ActionResult("nav-1", "navigate_action", "succeeded"),
+            ActionResult("nav-2", "navigate_action", "succeeded"),
+            ActionResult("nav-3", "navigate_action", "failed",
+                         reason_code="NO_NAVIGATION_CANDIDATES"),
+        ]
+
+        result = await executor._search_environment()
+
+        self.assertEqual(result.reason_code, "OBJECT_SEARCH_EXHAUSTED")
+        context_calls = [
+            item for item in executor._navigate_search_step.await_args_list
+            if item.kwargs["mode"] == "context"
+        ]
         self.assertEqual(
-            [item["remaining_waypoints"] for item in observations], [2, 1]
+            [item.args[0]["remaining_waypoints"] for item in context_calls],
+            [2, 1],
         )
 
     async def test_changed_contextual_type_resets_the_loop_budget(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig(
+        executor = self.executor(config=FindLoopConfig(
             max_local_waypoints=1,
             max_destination_waypoints=1,
-        )
-        executor._search_limit_result = lambda: None
-        executor.search_action = type(
-            "Search", (), {"last_observation_frame": None}
-        )()
-        executor._navigate_search_step = AsyncMock(return_value=ActionResult(
-            "nav", "navigate_action", "succeeded",
         ))
+        observations = [self.clue("local"), self.clue("destination"), None]
 
-        destination = {
-            "contextual_clue": "Continue through the hall.",
-            "candidate_type": "destination",
-        }
-        scans = 0
-
-        async def scan_area(*_args, **_kwargs):
-            nonlocal scans
-            scans += 1
-            executor.search_action.last_observation_frame = (
-                destination if scans == 1 else None
-            )
+        async def search(*_args, **_kwargs):
+            observation = observations.pop(0)
+            executor.search_action.last_observation_frame = observation
             return ActionResult(
-                f"scan-{scans}", "search_action", "failed",
-                reason_code="SEARCH_CONTEXTUAL_CLUE",
+                "scan", "search_action",
+                "succeeded" if observation is None else "failed",
+                reason_code=None if observation is None else "SEARCH_CONTEXTUAL_CLUE",
             )
 
-        executor._scan_area = AsyncMock(side_effect=scan_area)
-        result = await executor._handle_contextual_candidate(
-            "initial",
-            {
-                "contextual_clue": "Inspect beside the chair.",
-                "candidate_type": "local",
-            },
-        )
+        executor._search = AsyncMock(side_effect=search)
+        result = await executor._search_environment()
 
-        self.assertIsNone(result)
+        self.assertEqual(result.status, "succeeded")
         self.assertEqual(
             [call.kwargs["mode"] for call in
              executor._navigate_search_step.await_args_list],
@@ -1038,14 +915,10 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_blocked_exploration_exhausts_search(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig(max_exploration_waypoints=1)
-        executor.action_id = "find-1"
-        executor.target = "bottle"
-        executor._search_poses = []
-        executor._search_waypoint_count = 0
-        executor._search_limit_result = lambda: None
-        executor._inspect_area = AsyncMock(return_value=None)
+        executor = self.executor(config=FindLoopConfig(max_exploration_waypoints=1))
+        executor._search = AsyncMock(return_value=ActionResult(
+            "scan", "search_action", "failed", reason_code="TARGET_NOT_VISIBLE",
+        ))
         blocked = ActionResult(
             "nav", "navigate_action", "failed",
             reason_code="NO_NAVIGATION_CANDIDATES",
@@ -1063,19 +936,18 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_exploration_does_not_forward_a_stale_clue_frame(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig(max_exploration_waypoints=1)
-        executor.search_action = type(
-            "Search", (), {"last_observation_frame": {"contextual_clue": "old"}}
-        )()
-        executor._inspect_area = AsyncMock(side_effect=[
-            None,
+        executor = self.executor(config=FindLoopConfig(max_exploration_waypoints=1))
+        results = [
+            ActionResult("miss", "search_action", "failed",
+                         reason_code="TARGET_NOT_VISIBLE"),
             ActionResult("found", "search_action", "succeeded"),
-        ])
-        executor._search_limit_result = lambda: None
-        executor._navigate_search_step = AsyncMock(return_value=ActionResult(
-            "nav", "navigate_action", "succeeded",
-        ))
+        ]
+
+        async def search(*_args, **_kwargs):
+            executor.search_action.last_observation_frame = None
+            return results.pop(0)
+
+        executor._search = AsyncMock(side_effect=search)
 
         result = await executor._search_environment()
 
@@ -1085,16 +957,11 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
             mode="exploration",
             step="explore_1",
         )
-        self.assertEqual(
-            executor._inspect_area.await_args_list[1].args[0], "explore_1"
-        )
+        self.assertEqual(executor._search.await_args_list[1].args[0],
+                         "explore_1_center_scan")
 
     async def test_inspection_propagates_operational_scan_failure(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.find_loop = FindLoopConfig()
-        executor._move_camera_for_goal = AsyncMock(return_value=ActionResult(
-            "camera", "see_action", "succeeded",
-        ))
+        executor = self.executor()
         failure = ActionResult(
             "scan", "search_action", "failed",
             reason_code="CAMERA_FAILURE",
@@ -1102,11 +969,47 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
         executor._search = AsyncMock(return_value=failure)
         executor._navigate_search_step = AsyncMock()
 
-        result = await executor._inspect_area("initial")
+        result = await executor._search_environment()
 
         self.assertIs(result, failure)
         executor._navigate_search_step.assert_not_awaited()
 
+    async def test_failed_reacquisition_navigates_without_rescanning_arrival(self):
+        executor = self.executor()
+        scans = [
+            ActionResult("found-1", "search_action", "succeeded"),
+            ActionResult("found-2", "search_action", "succeeded"),
+        ]
+
+        async def search(*_args, **_kwargs):
+            executor.search_action.last_observation_frame = None
+            return scans.pop(0)
+
+        attempts = 0
+
+        async def verify(_attempt):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                executor.search_action.last_observation_frame = self.clue("local")
+                return ActionResult(
+                    "reacquire", "search_action", "failed",
+                    reason_code="TARGET_NOT_VISIBLE",
+                )
+            return ActionResult("verified", "track_action", "succeeded")
+
+        executor._search = AsyncMock(side_effect=search)
+        executor._track_approach_and_reacquire = AsyncMock(side_effect=verify)
+
+        result = await executor._search_environment()
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(executor._search.await_count, 2)
+        self.assertEqual(executor._move_camera_for_goal.await_count, 2)
+        executor._navigate_search_step.assert_awaited_once()
+        self.assertEqual(
+            executor._navigate_search_step.await_args.kwargs["mode"], "context"
+        )
 
 
 class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -1364,25 +1267,32 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
             follow=True,
         )
 
-    async def test_post_approach_uses_max_effort_and_requires_stable_track(self):
+    async def test_track_approach_and_reacquire_uses_max_effort(self):
         executor = GoalExecutor.__new__(GoalExecutor)
         executor.action_id = "find-1"
         executor.target = "bottle"
+        executor._completed_steps = []
+        executor._approach_result_data = {}
+        executor._search_waypoint_count = 3
+        executor._approach_follow = False
         executor.track_action = type("Tracker", (), {})()
         executor.track_action.active = True
         executor.track_action.stop_tracking = AsyncMock()
-        executor.track_action.wait_until_stable = AsyncMock(return_value=True)
-        executor.track_action.completion_future = None
+        executor._approach = AsyncMock(return_value=ActionResult(
+            "approach", "approach_action", "succeeded", target="bottle",
+        ))
         executor._search = AsyncMock(return_value=ActionResult(
             "search", "search_action", "succeeded", target="bottle"
         ))
-        executor._track = AsyncMock(return_value=ActionResult(
-            "track", "track_action", "succeeded", target="bottle"
-        ))
+        executor._track = AsyncMock(side_effect=[
+            ActionResult("track", "track_action", "succeeded", target="bottle"),
+            ActionResult("retrack", "track_action", "succeeded", target="bottle"),
+        ])
 
-        result = await executor._post_approach_reacquire(0)
+        result = await executor._track_approach_and_reacquire(0)
 
         self.assertEqual(result.status, "succeeded")
+        executor._approach.assert_awaited_once_with(step="approach")
         executor.track_action.stop_tracking.assert_awaited_once_with(
             reason_code="APPROACH_NAVIGATION_COMPLETE",
             status="succeeded",
@@ -1395,72 +1305,27 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
             initial_view_only=False,
             sweep_directions=None,
         )
-        executor._track.assert_awaited_once_with(
-            allow_grounding_dino=True,
-            step="post_approach_track_0",
-        )
-
-    async def test_failed_reacquisition_restarts_find_cycle(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor._completed_steps = []
-        executor._approach_result_data = {}
-        executor.track_action = type("Tracker", (), {"active": False})()
-        executor._search_limit_result = Mock(return_value=None)
-        executor._search_environment = AsyncMock(side_effect=[
-            ActionResult("find-0", "search_action", "succeeded"),
-            ActionResult("find-1", "search_action", "succeeded"),
-        ])
-        executor._track = AsyncMock(return_value=ActionResult(
-            "track", "track_action", "succeeded"
-        ))
-        executor._approach = AsyncMock(return_value=ActionResult(
-            "approach", "approach_action", "succeeded"
-        ))
-        executor._post_approach_reacquire = AsyncMock(side_effect=[
-            ActionResult(
-                "check-0", "search_action", "failed",
-                reason_code="TARGET_NOT_VISIBLE",
-            ),
-            ActionResult("check-1", "track_action", "succeeded"),
-        ])
-        executor._complete = Mock()
-
-        await executor._run()
-
         self.assertEqual(
-            executor._search_environment.await_args_list,
-            [call(0), call(1)],
+            executor._track.await_args_list,
+            [
+                call(allow_grounding_dino=True, step="track"),
+                call(allow_grounding_dino=True, step="post_approach_track_0"),
+            ],
         )
-        self.assertIn("approach_destination_rejected_0", executor._completed_steps)
-        executor._complete.assert_called_once_with(
-            status="succeeded",
-            outcome="found_reached_and_reacquired",
-        )
+        self.assertEqual(executor._search_waypoint_count, 4)
+        self.assertTrue(executor._approach_result_data["verified"])
 
-    async def test_run_approaches_with_tracker_started_by_visual_candidate(self):
+    async def test_run_delegates_the_complete_goal_to_search_environment(self):
         executor = GoalExecutor.__new__(GoalExecutor)
-        executor._completed_steps = []
-        executor._approach_result_data = {}
-        executor.track_action = type("Tracker", (), {"active": True})()
-        executor._search_limit_result = Mock(return_value=None)
+        executor._approach_follow = False
         executor._search_environment = AsyncMock(return_value=ActionResult(
-            "visual-track", "search_action", "succeeded",
-            outcome="visual_candidate_tracked",
-        ))
-        executor._track = AsyncMock()
-        executor._approach = AsyncMock(return_value=ActionResult(
-            "approach", "approach_action", "succeeded"
-        ))
-        executor._post_approach_reacquire = AsyncMock(return_value=ActionResult(
-            "check", "track_action", "succeeded"
+            "verified", "track_action", "succeeded",
         ))
         executor._complete = Mock()
 
         await executor._run()
 
-        executor._track.assert_not_awaited()
-        executor._approach.assert_awaited_once_with(step="approach")
-        self.assertIn("target_tracked", executor._completed_steps)
+        executor._search_environment.assert_awaited_once_with()
         executor._complete.assert_called_once_with(
             status="succeeded",
             outcome="found_reached_and_reacquired",
@@ -1520,6 +1385,55 @@ class CenterFirstSearchTests(unittest.IsolatedAsyncioTestCase):
         )
         search.capture_sweep_batch.assert_awaited_once()
         search.complete_searching.assert_not_awaited()
+
+
+class SearchFrameExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_best_effort_exports_only_middle_layer_frames(self):
+        search = SearchAction.__new__(SearchAction)
+        search.active = True
+        search.action_id = "search-1"
+        search.target = "bottle"
+        search.effort = "best_effort"
+        search.initial_view_only = False
+        search.sweep_tilt_order = ("center", "upmost", "downmost")
+        search.batch_results = []
+        search.first_frame_result = None
+        search.pan_angle = 95.0
+        search.tilt_angle = 30.0
+        search.last_detection_source = None
+        search._yolo_owner = None
+        search.completion_future = asyncio.get_running_loop().create_future()
+        pose = {"x": 1.0, "y": 2.0, "yaw": 0.0, "frame_id": "map"}
+        middle = {
+            "jpeg_bytes": b"middle", "pan_angle": 95.0, "tilt_angle": 90.0,
+            "tilt_position": "center", "robot_pose": pose,
+        }
+        upper = {
+            "jpeg_bytes": b"upper", "pan_angle": 95.0, "tilt_angle": 30.0,
+            "tilt_position": "upmost", "robot_pose": pose,
+        }
+        lower = {
+            "jpeg_bytes": b"lower", "pan_angle": 95.0, "tilt_angle": 120.0,
+            "tilt_position": "downmost", "robot_pose": pose,
+        }
+        search.captured_frames = [middle, upper, lower]
+        search.current_candidate = {
+            "assessment": {
+                "contextual_clue": "possible bottle above",
+                "candidate_type": "visual",
+            },
+            "frame": upper,
+        }
+
+        await search.complete_searching(
+            "failed", "contextual_clue", "SEARCH_CONTEXTUAL_CLUE"
+        )
+
+        self.assertEqual(
+            [frame["jpeg_bytes"] for frame in search.last_coverage_frames],
+            [b"middle"],
+        )
+        self.assertIsNone(search.last_observation_frame)
 
 
 class CameraCoverageTests(unittest.TestCase):

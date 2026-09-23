@@ -309,6 +309,19 @@ global_costmap:
           voxel_min_points: 0
           clear_after_reading: true
           model_type: 0
+
+        # ros2 topic hz /camera/depth/points
+        # ros2 topic hz /local_costmap/voxel_grid
+        # ros2 topic hz /local_costmap/costmap
+        # ros2 topic echo /local_costmap/voxel_grid --once --field width
+        # ros2 lifecycle get /controller_server
+        # ros2 topic info /camera/depth/points --verbose
+        # ros2 service call /global_costmap/depth_mark/toggle_enabled std_srvs/srv/SetBool "{data: false}"
+        # ros2 service call /global_costmap/depth_clear/toggle_enabled std_srvs/srv/SetBool "{data: false}"
+        # ros2 service call /global_costmap/depth_mark/toggle_enabled std_srvs/srv/SetBool "{data: true}"
+        # ros2 service call /global_costmap/depth_clear/toggle_enabled std_srvs/srv/SetBool "{data: true}"
+        # ros2 service call /global_costmap/clear_entirely_global_costmap nav2_msgs/srv/ClearEntireCostmap "{}"
+
         depth_clear:
           data_type: PointCloud2
           topic: /camera/depth/points

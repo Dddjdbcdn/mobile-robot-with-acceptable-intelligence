@@ -9,6 +9,8 @@ extern volatile float position_L;
 extern volatile float position_R;
 extern volatile float servo_pan_angle;
 extern volatile float servo_tilt_angle;
+void Servo_SetPanTarget(float angle);
+void Servo_SetTiltTarget(float angle);
 extern volatile float Kf;
 extern volatile float Kp;
 extern volatile float Ki;

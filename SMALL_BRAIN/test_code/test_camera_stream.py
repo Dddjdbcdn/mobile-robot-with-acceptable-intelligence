@@ -1,6 +1,8 @@
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -152,6 +154,43 @@ class UsbCameraRecoveryTests(unittest.TestCase):
         recovered_camera.release.assert_called_once()
         self.assertEqual(stream.sequence, 1)
         stream._zmq_context.term()
+
+
+    def test_wait_for_frame_captured_after_ignores_pre_move_frame(self):
+        stream = CameraStream()
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        stream._record_frame("usb", frame)
+        move_completed_at = time.monotonic()
+
+        def publish_new_frame():
+            time.sleep(0.02)
+            stream._record_frame("usb", frame)
+
+        publisher = threading.Thread(target=publish_new_frame)
+        publisher.start()
+        try:
+            self.assertTrue(stream.wait_for_frame_captured_after(
+                move_completed_at,
+                timeout=0.5,
+            ))
+        finally:
+            publisher.join()
+            stream._zmq_context.term()
+
+    def test_wait_for_frame_captured_after_times_out_on_stale_frame(self):
+        stream = CameraStream()
+        stream._record_frame(
+            "usb",
+            np.zeros((4, 4, 3), dtype=np.uint8),
+        )
+
+        try:
+            self.assertFalse(stream.wait_for_frame_captured_after(
+                time.monotonic(),
+                timeout=0.01,
+            ))
+        finally:
+            stream._zmq_context.term()
 
 
 if __name__ == "__main__":
