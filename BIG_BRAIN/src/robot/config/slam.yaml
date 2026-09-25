@@ -13,7 +13,9 @@ slam_toolbox:
     odom_frame: odom
     map_frame: map
     base_frame: base_footprint
-    scan_topic: /scan
+    # The person tracker removes only the actively tracked person from this
+    # stream. Nav2 still uses raw /scan for dynamic collision avoidance.
+    scan_topic: /scan_slam
     use_map_saver: true
     mode: mapping 
 

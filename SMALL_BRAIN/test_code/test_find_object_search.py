@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 from pathlib import Path
 import sys
@@ -28,7 +29,7 @@ from cognition.goal_executor import (
     FindLoopConfig,
     GoalExecutor,
 )
-from cognition.follow_executor import FollowConfig, FollowExecutor
+from cognition.follow_executor import FollowExecutor
 from cognition.state import robot_state
 from robot.map_logic import LogicConfig, MapLogic
 from robot.map_renderer import MapRenderer
@@ -108,8 +109,77 @@ class FindObjectCandidateTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "local" for item in selected))
         self.assertEqual(
             len([item for item in selected if item["kind"] == "rotation"]),
-            3,
+            1,
         )
+        self.assertEqual(
+            [item["id"] for item in selected if item["kind"] == "rotation"],
+            ["H"],
+        )
+
+    def test_nearby_candidates_are_deduplicated_with_semantic_priority(self):
+        self.prepared["frontiers"] = [{
+            "id": "F1", "kind": "frontier",
+            "x": 0.6, "y": 0.0, "yaw": 0.0,
+        }]
+
+        selected = self.logic.plan_candidates(self.prepared, self.pose)
+        ids = {item["id"] for item in selected}
+
+        self.assertIn("F1", ids)
+        self.assertNotIn("1", ids)
+        self.assertIn("H", ids)
+
+    def test_candidate_deduplication_uses_thirty_centimetres(self):
+        candidates = [
+            candidate("1", "local", 0.0, 0.0),
+            candidate("2", "local", 0.29, 0.0),
+            candidate("3", "local", 0.61, 0.0),
+        ]
+
+        selected = self.logic._deduplicate_candidates(candidates)
+
+        self.assertEqual([item["id"] for item in selected], ["1", "3"])
+
+    def test_connectivity_uses_nearest_valid_cell_when_robot_cell_is_blocked(self):
+        mask = np.zeros((7, 7), dtype=bool)
+        mask[2:5, 3:5] = True
+        mask[0, 0] = True
+
+        connected = self.logic._connected(mask, robot_col=2, robot_row=3)
+
+        self.assertTrue(connected[3, 3])
+        self.assertTrue(connected[4, 4])
+        self.assertFalse(connected[0, 0])
+
+    def test_clearance_does_not_erase_robot_egress(self):
+        costs = np.zeros_like(self.grid.data, dtype=np.int16)
+        robot_col, robot_row = self.grid.cells(0.0, 0.0)
+        self.grid.data[int(robot_row), int(robot_col) + 1] = 100
+
+        reachable = self.logic._reachable(
+            self.grid, costs, self.pose, clearance=0.15
+        )
+        candidates = self.logic._local_candidates(
+            self.grid, reachable, self.pose
+        )
+
+        self.assertTrue(reachable[int(robot_row), int(robot_col)])
+        self.assertTrue(any(item["kind"] == "local" for item in candidates))
+        self.assertTrue(any(item["id"] == "H" for item in candidates))
+
+    def test_pose_marker_scale_is_relative_to_crop_pixels(self):
+        renderer = MapRenderer()
+        grid = self.Grid()
+        view_4m = renderer._make_view(grid, self.pose, view_size_m=4.0)
+        view_6m = renderer._make_view(grid, self.pose, view_size_m=6.0)
+
+        scale_4m = renderer.pose_marker_scale_for_crop(view_4m, 4.0)
+        scale_6m = renderer.pose_marker_scale_for_crop(view_6m, 6.0)
+
+        self.assertAlmostEqual(scale_4m, 1024 / 768)
+        self.assertAlmostEqual(scale_6m, scale_4m)
+        self.assertEqual((view_6m["width"], view_6m["height"]), (1024, 1024))
+        self.assertEqual(renderer._pixel(view_6m, 0.0, 0.0), (512, 512))
 
     def test_context_samples_the_clue_cone_and_one_backup(self):
         selected = self.logic.plan_candidates(
@@ -130,7 +200,7 @@ class FindObjectCandidateTests(unittest.TestCase):
         logic = MapLogic(LogicConfig(
             context_radius_samples=1,
             context_bearing_fractions=(0.0,),
-            context_backup_distance_m=0.25,
+            context_backup_distance_m=0.30,
         ))
 
         selected = logic.plan_candidates(
@@ -144,7 +214,7 @@ class FindObjectCandidateTests(unittest.TestCase):
         self.assertEqual(len(cone), 1)
         self.assertAlmostEqual(cone[0]["x"], 0.0)
         self.assertAlmostEqual(cone[0]["y"], 0.0)
-        self.assertAlmostEqual(selected[-1]["x"], -0.25)
+        self.assertAlmostEqual(selected[-1]["x"], -0.30)
         self.assertAlmostEqual(selected[-1]["y"], 0.0)
 
     def approach_destination(self, target_x, target_y, **overrides):
@@ -478,14 +548,23 @@ class NavigationSearchPoseTests(unittest.IsolatedAsyncioTestCase):
                     "search_overlay": {"action_id": "find-1", "revision": 2},
                 },
             }
+        frame = type("Frame", (), {
+            "captured_at": float("inf"),
+            "tracking_bgr": np.zeros((4, 4, 3), dtype=np.uint8),
+        })()
         camera = Mock()
+        camera.snapshot.return_value = frame
         navigation = self._navigation_for_capture(camera, request_snapshot)
+        navigation.see_action = Mock()
+        navigation.see_action.move_to_region = AsyncMock(
+            return_value=ActionResult("camera", "move_camera", "succeeded")
+        )
 
         captured, camera_jpeg = await navigation._capture()
 
         self.assertEqual(captured["metadata"]["snapshot_id"], "snapshot-1")
-        self.assertIsNone(camera_jpeg)
-        camera.snapshot.assert_not_called()
+        self.assertTrue(camera_jpeg)
+        camera.snapshot.assert_called_once_with()
         navigation._save_map_snapshot.assert_called_once_with(captured)
 
     async def test_two_pose_exploration_centers_and_captures_camera(self):
@@ -554,10 +633,20 @@ class NavigationSearchPoseTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-        navigation = self._navigation_for_capture(Mock(), request_snapshot)
+        frame = type("Frame", (), {
+            "captured_at": float("inf"),
+            "tracking_bgr": np.zeros((4, 4, 3), dtype=np.uint8),
+        })()
+        camera = Mock()
+        camera.snapshot.return_value = frame
+        navigation = self._navigation_for_capture(camera, request_snapshot)
         navigation._overlay_action_id = None
         navigation.action_id = "navigate-1"
         navigation.request_map_snapshot = request_snapshot
+        navigation.see_action = Mock()
+        navigation.see_action.move_to_region = AsyncMock(
+            return_value=ActionResult("camera", "move_camera", "succeeded")
+        )
 
         captured, camera_jpeg = await navigation._capture()
 
@@ -568,7 +657,7 @@ class NavigationSearchPoseTests(unittest.IsolatedAsyncioTestCase):
             captured["metadata"]["snapshot_request_id"],
             request["request_id"],
         )
-        self.assertIsNone(camera_jpeg)
+        self.assertTrue(camera_jpeg)
 
     async def test_goal_capture_publishes_observed_pose_and_refreshes_map(self):
         requests = []
@@ -607,6 +696,10 @@ class NavigationSearchPoseTests(unittest.IsolatedAsyncioTestCase):
         navigation._overlay_revision = 0
         navigation.map_crop_size_m = 4.0
         navigation.send_map_overlay = AsyncMock()
+        navigation.see_action = Mock()
+        navigation.see_action.move_to_region = AsyncMock(
+            return_value=ActionResult("camera", "move_camera", "succeeded")
+        )
 
         captured, camera_jpeg = await navigation._capture()
 
@@ -671,22 +764,170 @@ class NavigationSearchPoseTests(unittest.IsolatedAsyncioTestCase):
         executor._remember_search_pose.assert_not_called()
 
 
-class DeterministicNavigationSelectionTests(unittest.TestCase):
-    def test_navigation_consumes_map_planner_winner_without_reranking(self):
+class SemanticNavigationHeadingTests(unittest.TestCase):
+    def test_goal_guidance_prefers_decisive_navigation(self):
+        guidance = MODE_GUIDANCE["goal"]
+        normalized = " ".join(guidance.split())
+
+        self.assertIn("frontier is a last resort", normalized)
+        self.assertIn("at most one purposeful H rotation", normalized)
+        self.assertIn("residual uncertainty is not such a reason", normalized)
+        self.assertIn(
+            "uncertainty alone is not a reason", " ".join(MAP_GUIDANCE.split())
+        )
+
+    def test_semantic_heading_is_relative_to_the_upright_robot_map(self):
         navigation = NavigateAction.__new__(NavigateAction)
         navigation._candidates = {
-            "7": {
-                **candidate("7", "local", 1.0, 0.0),
-                "selection_reason": "uncovered_local_view",
-                "ranking_score": 2.4,
-            }
+            "7": candidate("7", "local", 1.0, 2.0)
         }
-        selection = navigation._deterministic_selection({
-            "metadata": {"selected_pose_id": "7"}
+        destination = navigation._resolve_destination(
+            {"pose_id": "7", "heading": "right"},
+            {"metadata": {"robot_pose": {"yaw": math.pi / 2.0}}},
+        )
+
+        self.assertAlmostEqual(destination["yaw"], 0.0)
+        self.assertEqual(destination["heading"], "right")
+        self.assertIn("sampled_yaw", destination)
+
+    def test_goal_navigation_uses_one_move_and_two_assessments(self):
+        self.assertEqual(NavigateAction.MAX_STEPS, 1)
+        self.assertEqual(NavigateAction.MAX_ASSESSMENTS, 2)
+
+    def test_second_call_tool_is_terminal_only(self):
+        navigation = NavigateAction.__new__(NavigateAction)
+        definitions = json.loads(
+            (ROOT / "tools" / "vision_oob_tools.json").read_text()
+        )
+        navigation.selection_tool_template = next(
+            tool for tool in definitions
+            if tool["name"] == "select_navigation_pose"
+        )
+        navigation._stop_after_first_move = False
+        navigation._max_steps = 1
+        navigation._navigation_history = [{"pose_id": "7"}]
+        navigation._candidates = {
+            "7": candidate("7", "local", 1.0, 0.0)
+        }
+
+        tool = navigation._build_selection_tool()
+        properties = tool["parameters"]["properties"]
+
+        self.assertEqual(properties["decision"]["enum"], [
+            "goal_reached", "blocked",
+        ])
+        self.assertEqual(properties["pose_id"]["enum"], [None])
+        self.assertEqual(properties["heading"]["enum"], [None])
+
+    def test_later_request_keeps_original_and_current_evidence(self):
+        navigation = NavigateAction.__new__(NavigateAction)
+        navigation._initial_map_jpeg = None
+        navigation._initial_vision_jpeg = None
+
+        first = navigation._build_selection_content(
+            "prompt", b"map-one", b"vision-one", 1
+        )
+        later = navigation._build_selection_content(
+            "prompt", b"map-two", b"vision-two", 2
+        )
+
+        self.assertEqual(
+            [item["text"] for item in first if item["type"] == "input_text"],
+            ["prompt", "CURRENT MAP (Image 1)", "CURRENT VISION (Image 2)"],
+        )
+        self.assertEqual(
+            [item["text"] for item in later if item["type"] == "input_text"],
+            [
+                "prompt", "ORIGINAL MAP (Image 1)",
+                "ORIGINAL VISION (Image 2)", "CURRENT MAP (Image 3)",
+                "CURRENT VISION (Image 4)",
+            ],
+        )
+        urls = [
+            item["image_url"] for item in later
+            if item["type"] == "input_image"
+        ]
+        self.assertTrue(urls[0].endswith("bWFwLW9uZQ=="))
+        self.assertTrue(urls[1].endswith("dmlzaW9uLW9uZQ=="))
+
+    def test_single_move_prompt_requires_one_shot_completion(self):
+        navigation = NavigateAction.__new__(NavigateAction)
+        navigation.target = "Nudge forward slightly"
+        navigation._mode = "goal"
+        navigation._stop_after_first_move = True
+        navigation._max_steps = 1
+        navigation._navigation_history = []
+        navigation._candidates = {
+            "1": candidate("1", "local", 0.5, 0.0)
+        }
+        navigation._observation = None
+
+        context = navigation._build_selection_context(1)
+        prompt = navigation._build_selection_prompt(context, 1)
+
+        self.assertEqual(context["completion_mode"], "single_move")
+        self.assertIn("use move_and_finish", prompt)
+        self.assertIn("do not plan a later reassessment", prompt)
+
+
+class SemanticNavigationResponseTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def navigation():
+        navigation = NavigateAction.__new__(NavigateAction)
+        navigation.active = True
+        navigation._stop_requested = False
+        navigation._mode = "goal"
+        navigation._stop_after_first_move = True
+        navigation._max_steps = 1
+        navigation._navigation_history = []
+        navigation.action_id = "navigate-1"
+        navigation._request_id = "request-1"
+        navigation._snapshot_id = "snapshot-1"
+        navigation._candidates = {
+            "7": candidate("7", "local", 1.0, 0.0)
+        }
+        navigation._selection_future = asyncio.get_running_loop().create_future()
+        return navigation
+
+    async def test_move_and_finish_accepts_one_shot_motion(self):
+        navigation = self.navigation()
+        await navigation.select_navigation_pose({
+            "decision": "move_and_finish",
+            "pose_id": "7",
+            "heading": "forward_left",
+            "reasoning": "One short diagonal move fulfills the bounded command.",
+            "next_intent": "No further assessment is needed after arrival.",
+        }, {
+            "kind": "navigation_selection",
+            "action_id": "navigate-1",
+            "request_id": "request-1",
+            "snapshot_id": "snapshot-1",
         })
-        self.assertEqual(selection["pose_id"], "7")
-        self.assertEqual(selection["source"], "map_planner")
-        self.assertEqual(selection["ranking_score"], 2.4)
+
+        selection = navigation._selection_future.result()
+        self.assertEqual(selection["decision"], "move_and_finish")
+        self.assertEqual(selection["heading"], "forward_left")
+        self.assertIn("No further", selection["next_intent"])
+
+    async def test_move_and_finish_is_rejected_for_verified_goal_mode(self):
+        navigation = self.navigation()
+        navigation._stop_after_first_move = False
+
+        await navigation.select_navigation_pose({
+            "decision": "move_and_finish",
+            "pose_id": "7",
+            "heading": "forward",
+            "reasoning": "Arrival might complete the semantic goal.",
+            "next_intent": "Stop without checking the arrival.",
+        }, {
+            "kind": "navigation_selection",
+            "action_id": "navigate-1",
+            "request_id": "request-1",
+            "snapshot_id": "snapshot-1",
+        })
+
+        with self.assertRaises(NavigationError):
+            navigation._selection_future.result()
 
 
 class ContextualClueContractTests(unittest.TestCase):
@@ -749,7 +990,6 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
         executor._search_waypoint_count = 0
         executor._completed_steps = []
         executor._approach_result_data = {}
-        executor._approach_follow = False
         executor.search_action = type(
             "Search", (), {"last_observation_frame": None}
         )()
@@ -1013,26 +1253,37 @@ class ContextualClueLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.saved_camera = dict(robot_state.get("camera") or {})
-
-    def tearDown(self):
-        robot_state["camera"].clear()
-        robot_state["camera"].update(self.saved_camera)
-
-    def test_distance_uses_object_xy_instead_of_raw_tof(self):
-        executor = FollowExecutor.__new__(FollowExecutor)
-        executor.config = FollowConfig(target_max_age_seconds=1.0)
-        robot_state["camera"].update({
-            "object_x": 3.0,
-            "object_y": 4.0,
-            "camera_tof_range": 0.2,
-            "timestamp": time.monotonic(),
+    async def test_visual_failure_preserves_lidar_session_for_follow(self):
+        tracker = TrackAction.__new__(TrackAction)
+        tracker.active = True
+        tracker.target = "torso_center"
+        tracker.action_id = "follow-1:track"
+        tracker._tracking_task = None
+        tracker._continuous_person_reacquisition = True
+        tracker.send_robot_command = AsyncMock(return_value={
+            "status": "accepted"
         })
+        tracker._publish_person_tracking_state = AsyncMock()
+        expected = ActionResult(
+            "follow-1:track", "track_action", "failed", target="person"
+        )
+        tracker.complete_tracking = Mock(return_value=expected)
 
-        self.assertEqual(executor._fresh_distance(), 5.0)
+        result = await tracker.stop_tracking(
+            reason_code="PERSON_LOST",
+            status="failed",
+            outcome="target_lost_after_reacquisition",
+        )
 
-    async def test_acquisition_searches_then_tracks_without_approaching(self):
+        self.assertIs(result, expected)
+        tracker.send_robot_command.assert_awaited_once_with({
+            "command": "stop_tracking",
+            "action_id": "follow-1:track",
+            "reset_camera": False,
+        })
+        tracker._publish_person_tracking_state.assert_not_awaited()
+
+    async def test_acquisition_searches_then_starts_camera_tracking(self):
         search = type("Search", (), {"active": False})()
         search.start_searching = AsyncMock(return_value=ActionResult(
             "search", "search_action", "succeeded", target="person"
@@ -1043,59 +1294,177 @@ class FollowExecutorTests(unittest.IsolatedAsyncioTestCase):
         ))
         tracker.wait_until_stable = AsyncMock(return_value=True)
         tracker.stop_tracking = AsyncMock()
-        approach = type("Approach", (), {"active": False})()
-        approach.start_approaching = AsyncMock(return_value=ActionResult(
-            "follow", "approach_action", "running", target="person"
-        ))
         goal_executor = type("Goal", (), {"search_action": search})()
-        goal_executor.start = AsyncMock()
-        executor = FollowExecutor(goal_executor, tracker, approach)
+        send_robot_command = AsyncMock()
+        executor = FollowExecutor(
+            goal_executor, tracker, send_robot_command
+        )
         executor.action_id = "follow-1"
-        executor.radius_m = 1.25
-        executor._approach_count = 0
 
-        result = await executor._acquire_target("initial")
+        result = await executor._acquire_target()
 
         self.assertEqual(result.status, "succeeded")
         search.start_searching.assert_awaited_once_with(
             target="person",
-            action_id="follow-1:initial:search",
+            action_id="follow-1:search",
             effort="best_effort",
             initial_view_only=False,
         )
-        tracker.start_tracking.assert_awaited_once()
-        approach.start_approaching.assert_not_awaited()
-        goal_executor.start.assert_not_awaited()
-
-    async def test_recovery_reacquires_without_running_find_object(self):
-        executor = FollowExecutor.__new__(FollowExecutor)
-        executor.config = FollowConfig(
-            tracking_recovery_seconds=0.0
+        tracker.start_tracking.assert_awaited_once_with(
+            target="torso center",
+            action_id="follow-1:track",
+            allow_grounding_dino=True,
+            continuous_person_reacquisition=True,
         )
+        send_robot_command.assert_not_awaited()
+
+    async def test_run_requests_one_explicit_bridge_follow(self):
+        executor = FollowExecutor.__new__(FollowExecutor)
+        executor.active = True
+        executor.action_id = "follow-1"
         executor._stop_requested = False
-        executor._recovery_count = 0
-        executor.track_action = type("Tracker", (), {"active": True})()
-        executor.track_action.stop_tracking = AsyncMock()
-        executor.approach_action = type("Approach", (), {"active": False})()
-        executor._fresh_distance = Mock(return_value=None)
+        executor._lidar_lost = False
         executor._acquire_target = AsyncMock(return_value=ActionResult(
             "acquire", "follow_action", "succeeded", target="person"
         ))
-
-        recovered = await executor._recover_tracking()
-
-        self.assertTrue(recovered)
-        executor.track_action.stop_tracking.assert_awaited_once_with(
-            "TRACKING_RECOVERY_TIMEOUT"
+        tracking_finished = asyncio.Event()
+        executor.track_action = type("Tracker", (), {})()
+        executor.track_action.wait_until_finished = AsyncMock(
+            side_effect=tracking_finished.wait
         )
-        executor._acquire_target.assert_awaited_once_with("reacquire:1")
+        executor.send_robot_command = AsyncMock(return_value={
+            "status": "accepted",
+            "message": "Waiting for lidar person pose",
+        })
 
-    def test_approach_standoff_is_inside_follow_radius(self):
+        task = asyncio.create_task(executor._run())
+        while executor.send_robot_command.await_count == 0:
+            await asyncio.sleep(0)
+
+        executor.send_robot_command.assert_awaited_once_with({
+            "command": "follow_action",
+            "action_id": "follow-1",
+        })
+        self.assertTrue(executor.active)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_stop_uses_explicit_bridge_stop(self):
+        search = type("Search", (), {"active": False})()
+        tracker = type("Tracker", (), {"active": True})()
+        tracker.stop_tracking = AsyncMock()
+        goal_executor = type("Goal", (), {"search_action": search})()
+        send_robot_command = AsyncMock(return_value={"status": "accepted"})
+        executor = FollowExecutor(
+            goal_executor, tracker, send_robot_command
+        )
+        executor.active = True
+        executor.action_id = "follow-1"
+        executor.target = "person"
+        executor.completion_future = asyncio.get_running_loop().create_future()
+        executor._runner = None
+        executor._stop_requested = False
+
+        result = await executor.stop()
+
+        self.assertEqual(result.status, "cancelled")
+        send_robot_command.assert_awaited_once_with({
+            "command": "stop_follow_action",
+            "action_id": "follow-1",
+        })
+        tracker.stop_tracking.assert_awaited_once_with("USER_REQUESTED")
+
+    async def test_camera_tracking_end_restarts_camera_without_stopping_follow(self):
         executor = FollowExecutor.__new__(FollowExecutor)
-        executor.config = FollowConfig(approach_standoff_ratio=0.8)
-        executor.radius_m = 1.25
+        executor.active = True
+        executor.action_id = "follow-1"
+        executor.target = "person"
+        executor._stop_requested = False
+        executor._lidar_lost = False
+        executor.completion_future = asyncio.get_running_loop().create_future()
+        executor._acquire_target = AsyncMock(return_value=ActionResult(
+            "acquire", "follow_action", "succeeded", target="person"
+        ))
+        visual_restarted = asyncio.Event()
+        executor.track_action = type("Tracker", (), {})()
+        wait_calls = 0
 
-        self.assertEqual(executor._approach_standoff_m(), 1.0)
+        async def wait_until_finished():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                return ActionResult(
+                "track", "track_action", "failed", target="person",
+                outcome="target_lost_after_reacquisition",
+                reason_code="PERSON_LOST",
+                )
+            await visual_restarted.wait()
+
+        executor.track_action.wait_until_finished = AsyncMock(
+            side_effect=wait_until_finished
+        )
+        executor.track_action.keep_person_tracker_alive = AsyncMock()
+        executor.track_action.start_tracking = AsyncMock(return_value=ActionResult(
+            "track", "track_action", "running", target="person"
+        ))
+        executor.send_robot_command = AsyncMock(return_value={
+            "status": "accepted"
+        })
+
+        task = asyncio.create_task(executor._run())
+        while executor.track_action.start_tracking.await_count == 0:
+            await asyncio.sleep(0)
+
+        self.assertEqual(
+            [call.args[0]["command"] for call in
+             executor.send_robot_command.await_args_list],
+            ["follow_action"],
+        )
+        executor.track_action.keep_person_tracker_alive.assert_awaited_once_with(
+            "follow-1:track"
+        )
+        executor.track_action.start_tracking.assert_awaited_once_with(
+            target="torso center",
+            action_id="follow-1:track",
+            allow_grounding_dino=True,
+            continuous_person_reacquisition=True,
+        )
+        self.assertTrue(executor.active)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_lidar_lost_ends_follow_action(self):
+        executor = FollowExecutor.__new__(FollowExecutor)
+        executor.active = True
+        executor.action_id = "follow-1"
+        executor.target = "person"
+        executor._stop_requested = False
+        executor._lidar_lost = False
+        executor.completion_future = asyncio.get_running_loop().create_future()
+        executor.track_action = type("Tracker", (), {"active": True})()
+        executor.track_action.stop_tracking = AsyncMock()
+        executor.send_robot_command = AsyncMock(return_value={
+            "status": "accepted"
+        })
+
+        handled = await executor.handle_navigation_event({
+            "type": "event",
+            "event": "person_tracker",
+            "status": "lost",
+            "action_id": "follow-1",
+        })
+
+        self.assertTrue(handled)
+        executor.send_robot_command.assert_awaited_once_with({
+            "command": "stop_follow_action",
+            "action_id": "follow-1",
+        })
+        executor.track_action.stop_tracking.assert_awaited_once_with(
+            "LIDAR_TRACK_LOST"
+        )
+        result = executor.completion_future.result()
+        self.assertEqual(result.outcome, "target_lost")
+        self.assertEqual(result.reason_code, "LIDAR_TRACK_LOST")
 
 
 class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
@@ -1248,108 +1617,6 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_follow_starts_once_then_updates_the_same_navigation(self):
-        tracker = type("Tracker", (), {
-            "active": True,
-            "target": "person",
-            "stable": False,
-            "person_stable": True,
-        })()
-        tracker.wait_until_person_stable = AsyncMock(return_value=True)
-        tracker.wait_until_stable = AsyncMock(return_value=True)
-        send_robot_command = AsyncMock(return_value={
-            "status": "accepted",
-            "destination": {"x": 1.0, "y": 0.0, "frame_id": "map"},
-        })
-        approach = ApproachAction(send_robot_command, tracker)
-        robot_state["camera"].update({
-            "object_x": 2.0,
-            "object_y": 0.0,
-            "object_angle": 0.0,
-            "camera_tof_range": 2.0,
-        })
-
-        started = await approach.start_approaching(
-            "person", "follow-1", standoff_m=1.0, follow=True
-        )
-        robot_state["camera"]["object_x"] = 2.5
-        updated = await approach.start_approaching(
-            "person", "ignored-update-id", standoff_m=1.0, follow=True
-        )
-
-        self.assertEqual(started.outcome, "following")
-        self.assertEqual(updated.outcome, "follow_goal_updated")
-        self.assertTrue(approach.active)
-        self.assertTrue(approach.following)
-        self.assertEqual(
-            [item.args[0]["command"] for item in send_robot_command.await_args_list],
-            ["navigate_to_follow", "navigate_to_follow"],
-        )
-        self.assertEqual(
-            [item.args[0]["action_id"] for item in send_robot_command.await_args_list],
-            ["follow-1", "follow-1"],
-        )
-        self.assertEqual(
-            send_robot_command.await_args_list[1].args[0]["x"], 2.5
-        )
-        tracker.wait_until_person_stable.assert_not_awaited()
-        tracker.wait_until_stable.assert_not_awaited()
-
-    async def test_follow_waits_for_quick_person_stability_not_strict_stability(self):
-        tracker = type("Tracker", (), {
-            "active": True,
-            "target": "person",
-            "stable": False,
-            "person_stable": False,
-        })()
-        tracker.wait_until_person_stable = AsyncMock(return_value=True)
-        tracker.wait_until_stable = AsyncMock(return_value=False)
-        approach = ApproachAction(
-            AsyncMock(return_value={"status": "accepted"}), tracker
-        )
-        robot_state["camera"].update({
-            "object_x": 2.0,
-            "object_y": 0.0,
-            "object_angle": 0.0,
-            "camera_tof_range": 2.0,
-        })
-
-        result = await approach.start_approaching(
-            "person", "follow-quick", standoff_m=0.8, follow=True
-        )
-
-        self.assertEqual(result.status, "running")
-        tracker.wait_until_person_stable.assert_awaited_once_with(timeout=2.0)
-        tracker.wait_until_stable.assert_not_awaited()
-
-    async def test_goal_executor_starts_follow_without_waiting_for_completion(self):
-        executor = GoalExecutor.__new__(GoalExecutor)
-        executor.target = "person"
-        executor.action_id = "follow-root"
-        executor._approach_standoff_m = 1.0
-        executor._approach_follow = True
-        executor._approach_result_data = {}
-        executor._step_id = lambda step: f"follow-root:{step}"
-        executor.approach_action = type("Approach", (), {})()
-        executor.approach_action.start_approaching = AsyncMock(
-            return_value=ActionResult(
-                "follow-root:approach", "approach_action", "running",
-                target="person", outcome="following",
-                data={"destination": {"x": 1.0, "y": 0.0}},
-            )
-        )
-
-        result = await executor._approach()
-
-        self.assertEqual(result.status, "succeeded")
-        self.assertEqual(result.outcome, "follow_navigation_started")
-        executor.approach_action.start_approaching.assert_awaited_once_with(
-            target="person",
-            action_id="follow-root:approach",
-            standoff_m=1.0,
-            follow=True,
-        )
-
     async def test_track_approach_and_reacquire_uses_max_effort(self):
         executor = GoalExecutor.__new__(GoalExecutor)
         executor.action_id = "find-1"
@@ -1357,7 +1624,6 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         executor._completed_steps = []
         executor._approach_result_data = {}
         executor._search_waypoint_count = 3
-        executor._approach_follow = False
         executor.track_action = type("Tracker", (), {})()
         executor.track_action.active = True
         executor.track_action.stop_tracking = AsyncMock()
@@ -1400,7 +1666,6 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_delegates_the_complete_goal_to_search_environment(self):
         executor = GoalExecutor.__new__(GoalExecutor)
-        executor._approach_follow = False
         executor._search_environment = AsyncMock(return_value=ActionResult(
             "verified", "track_action", "succeeded",
         ))
@@ -1585,6 +1850,11 @@ class CameraCoverageTests(unittest.TestCase):
         rows, cols = np.indices(grid.data.shape)
         view = {
             "height": 201, "width": 201,
+            "xmin": -2.0, "xmax": 2.0,
+            "ymin": -2.0, "ymax": 2.0,
+            "ppm": 50.25,
+            "origin_x": 0.0, "origin_y": 0.0,
+            "heading_yaw": 0.0,
             "map_inside": np.ones((201, 201), dtype=bool),
             "map_rows": rows, "map_cols": cols,
         }
@@ -1598,6 +1868,13 @@ class CameraCoverageTests(unittest.TestCase):
 
 
 class LiveCameraFovTests(unittest.TestCase):
+    def test_normal_navigation_uses_full_camera_fov(self):
+        live_fov = MapLogic().live_camera_fov(
+            CameraCoverageTests.pose, camera_pan_angle=95.0
+        )
+
+        self.assertEqual(live_fov["horizontal_fov_deg"], 85.0)
+
     def test_live_view_rotates_with_servo_pan(self):
         grid = CameraCoverageTests.Grid(wall=False)
         logic = MapLogic()
@@ -1613,6 +1890,22 @@ class LiveCameraFovTests(unittest.TestCase):
         self.assertTrue(visible[aimed])
         self.assertFalse(visible[straight])
 
+    def test_robot_heading_is_always_rendered_up(self):
+        grid = FindObjectCandidateTests.Grid()
+        renderer = MapRenderer()
+        pose = {
+            "x": 0.0, "y": 0.0, "yaw": math.pi / 2.0,
+            "frame_id": "map",
+        }
+        view = renderer._make_view(grid, pose)
+        robot = renderer._pixel(view, 0.0, 0.0)
+        forward = renderer._pixel(view, 0.0, 1.0)
+        left = renderer._pixel(view, -1.0, 0.0)
+
+        self.assertLess(forward[1], robot[1])
+        self.assertAlmostEqual(forward[0], robot[0], delta=1)
+        self.assertLess(left[0], robot[0])
+        self.assertAlmostEqual(left[1], robot[1], delta=1)
 
 class DetectorFirstTests(unittest.TestCase):
     def test_search_uses_best_matching_yolo_box(self):
@@ -1679,8 +1972,13 @@ class FoundTransitionTests(unittest.IsolatedAsyncioTestCase):
 
 class LocalDistanceCandidateTests(unittest.TestCase):
     class Grid:
+        resolution = 1.0
+
         def cells(self, x, y):
             return int(round(x)) + 5, int(round(y)) + 5
+
+        def world(self, col, row):
+            return float(col - 5), float(row - 5)
 
         def inside(self, col, row):
             return 0 <= col < 11 and 0 <= row < 11
@@ -1705,10 +2003,36 @@ class LocalDistanceCandidateTests(unittest.TestCase):
             item for item in candidates if item["kind"] == "rotation"
         ]
         self.assertEqual(len(translations), 32)
-        self.assertEqual(len(rotations), 3)
+        self.assertEqual(len(rotations), 1)
+        self.assertEqual(rotations[0]["id"], "H")
         radii = sorted({round(math.hypot(item["x"], item["y"]), 1)
                         for item in translations})
         self.assertEqual(radii, [0.5, 1.0, 2.0, 3.0])
+
+    def test_blocked_ray_offers_its_furthest_safe_point(self):
+        grid = FindObjectCandidateTests.Grid()
+        reachable = np.ones_like(grid.data, dtype=bool)
+        wall_col, _ = grid.cells(1.3, 0.0)
+        reachable[:, int(wall_col):] = False
+        logic = MapLogic(LogicConfig(
+            sample_radius=3.0,
+            sample_distances=(0.5, 1.0, 2.0, 3.0),
+            sample_angle_deg=45.0,
+            include_rotations=False,
+        ))
+
+        choices = logic._local_candidates(
+            grid, reachable,
+            {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        )
+        clipped = next(item for item in choices if item["id"] == "B1")
+
+        self.assertLess(clipped["x"], 1.3)
+        self.assertGreater(clipped["x"], 1.0)
+        self.assertEqual(
+            clipped["selection_reason"],
+            "furthest_safe_point_on_blocked_ray",
+        )
 
 
 if __name__ == "__main__":

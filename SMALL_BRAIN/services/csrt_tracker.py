@@ -96,8 +96,10 @@ class CSRTTrackingManager:
         self.target = ""
         self.current_sequence = -1
 
-        self.current_fps = 0.0 
-        self._last_track_time = time.monotonic() 
+        self.current_fps = 0.0
+        self._fps_window_started = time.monotonic()
+        self._fps_frame_count = 0
+
     def start_worker(self):
         if self._thread and self._thread.is_alive(): return
         self._stop_event.clear()
@@ -161,6 +163,8 @@ class CSRTTrackingManager:
         self.target = command.target
         self.current_sequence = command.detection_sequence
         self.active = True
+        self._fps_window_started = time.monotonic()
+        self._fps_frame_count = 0
 
         # Fast-forward through the history buffer to catch up
         buffered = self.camera.history_frames_after(self.current_sequence)
@@ -182,19 +186,27 @@ class CSRTTrackingManager:
     # ==========================================
     # HELPER 2: LIVE TRACKING BLOCK
     # ==========================================
+    def _record_fps(self):
+        self._fps_frame_count += 1
+        now = time.monotonic()
+        elapsed = now - self._fps_window_started
+        if elapsed < 1.0:
+            return
+
+        self.current_fps = self._fps_frame_count / elapsed
+        print(f"[FPS] CSRT: {self.current_fps:.1f}", flush=True)
+        self._fps_window_started = now
+        self._fps_frame_count = 0
+
     def _track_live_frame(self):
         tracker = self.tracker
         if not self.camera.wait_for_frame_after(self.current_sequence, timeout=0.2):
             return
 
-        now = time.monotonic()
-        dt = now - self._last_track_time
-        if dt > 0: self.current_fps = 1.0 / dt
-        self._last_track_time = now
-
         newest = self.camera.snapshot()
         ok, bbox = tracker.update(newest.tracking_bgr)
         self.current_sequence = newest.sequence
+        self._record_fps()
 
         if not ok:
             self.tracking_update = TrackingUpdate(

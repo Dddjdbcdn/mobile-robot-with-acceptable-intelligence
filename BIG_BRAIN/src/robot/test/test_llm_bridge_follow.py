@@ -1,0 +1,159 @@
+import math
+import time
+from unittest.mock import Mock
+
+import pytest
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
+
+from robot.llm_bridge import LLMRosBridge
+from robot.follow_goal_generator import FollowGoalGenerator, FollowGoalSettings
+
+
+class FakeClock:
+    class Now:
+        @staticmethod
+        def to_msg():
+            return Time(sec=12, nanosec=34)
+
+    def now(self):
+        return self.Now()
+
+
+def bridge_for_pose_callback():
+    bridge = LLMRosBridge.__new__(LLMRosBridge)
+    bridge.get_clock = lambda: FakeClock()
+    bridge.goal_update_pub = Mock()
+    bridge.latest_person_pose_map = None
+    bridge.latest_person_pose_at = None
+    bridge.pending_person_pose = None
+    bridge.robot_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+    bridge.robot_pose_at = time.monotonic()
+    bridge.follow_goal_generator = FollowGoalGenerator(
+        FollowGoalSettings(standoff_m=0.9)
+    )
+    bridge.last_follow_goal = None
+    bridge.last_follow_goal_at = None
+    bridge.servo = Mock()
+    bridge.servo.reset_pan_angle = 95.0
+    bridge.servo.min_pan_angle = 30.0
+    bridge.servo.max_pan_angle = 160.0
+    bridge.servo.tracking_snapshot.return_value = {
+        "pan_angle": 95.0,
+        "pan_error": 0.0,
+        "observed_at": time.monotonic(),
+    }
+    bridge.follow_enabled = True
+    bridge.navigation_active = True
+    bridge.navigation_mode = "follow"
+    bridge.start_follow_navigation = Mock()
+    bridge.get_logger = Mock(return_value=Mock())
+    return bridge
+
+
+def test_active_follow_generates_standoff_goal_update():
+    bridge = bridge_for_pose_callback()
+    pose = PoseStamped()
+    pose.header.frame_id = "map"
+    pose.pose.position.x = 2.0
+
+    bridge.person_pose_callback(pose)
+    bridge.update_follow_goal()
+
+    published = bridge.goal_update_pub.publish.call_args.args[0]
+    assert published.pose.position.x == 1.1
+    assert bridge.latest_person_pose_map is pose
+    assert pose.header.stamp == Time(sec=12, nanosec=34)
+    bridge.start_follow_navigation.assert_not_called()
+
+
+def test_first_person_pose_starts_a_waiting_follow_action():
+    bridge = bridge_for_pose_callback()
+    bridge.navigation_active = False
+    pose = PoseStamped()
+    pose.header.frame_id = "map"
+    pose.pose.position.x = 2.0
+
+    bridge.person_pose_callback(pose)
+    bridge.update_follow_goal()
+
+    started_goal = bridge.start_follow_navigation.call_args.args[0]
+    assert started_goal.pose.position.x == 1.1
+    bridge.goal_update_pub.publish.assert_not_called()
+
+
+def test_person_pose_is_retried_until_tf_catches_up():
+    bridge = bridge_for_pose_callback()
+    pose_odom = PoseStamped()
+    pose_odom.header.frame_id = "odom"
+    pose_map = PoseStamped()
+    pose_map.header.frame_id = "map"
+    pose_map.pose.position.x = 2.0
+    bridge.tf_buffer = Mock()
+    bridge.tf_buffer.transform.side_effect = [
+        Exception("future extrapolation"),
+        pose_map,
+    ]
+
+    bridge.person_pose_callback(pose_odom)
+
+    assert bridge.pending_person_pose is pose_odom
+    bridge.goal_update_pub.publish.assert_not_called()
+
+    bridge.process_pending_person_pose()
+    bridge.update_follow_goal()
+
+    assert bridge.pending_person_pose is None
+    assert bridge.latest_person_pose_map is pose_map
+    published = bridge.goal_update_pub.publish.call_args.args[0]
+    assert published.pose.position.x == 1.1
+
+
+def test_lost_event_is_sent_only_after_lidar_track_existed():
+    bridge = LLMRosBridge.__new__(LLMRosBridge)
+    bridge.follow_enabled = True
+    bridge.follow_action_id = "follow-1"
+    bridge.person_tracker_state = None
+    bridge.follow_had_person_track = False
+    bridge.send_event = Mock()
+
+    initial_lost = String()
+    initial_lost.data = '{"state":"lost"}'
+    bridge.person_tracker_status_callback(initial_lost)
+    bridge.send_event.assert_not_called()
+
+    tracking = String()
+    tracking.data = '{"state":"tracking"}'
+    bridge.person_tracker_status_callback(tracking)
+
+    lost = String()
+    lost.data = '{"state":"lost"}'
+    bridge.person_tracker_status_callback(lost)
+
+    bridge.send_event.assert_called_once_with(
+        "person_tracker", "lost", "follow-1"
+    )
+
+
+def test_stale_vision_uses_lidar_bearing_to_guide_camera():
+    bridge = bridge_for_pose_callback()
+    bridge.servo.tracking_snapshot.return_value = {
+        "pan_angle": 95.0,
+        "pan_error": 0.0,
+        "observed_at": None,
+    }
+    bearing = 0.5
+    pose = PoseStamped()
+    pose.header.frame_id = "map"
+    pose.pose.position.x = 2.0 * math.cos(bearing)
+    pose.pose.position.y = 2.0 * math.sin(bearing)
+
+    bridge.person_pose_callback(pose)
+    bridge.update_follow_goal()
+
+    bridge.servo.set_error.assert_called_once()
+    pan_error, tilt_error = bridge.servo.set_error.call_args.args
+    assert pan_error == pytest.approx(math.degrees(bearing))
+    assert tilt_error == 0.0
+    bridge.servo.publish_servo_command.assert_called_once_with(tracking=True)

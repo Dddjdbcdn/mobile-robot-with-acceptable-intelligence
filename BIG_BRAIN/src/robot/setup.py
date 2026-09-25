@@ -34,7 +34,8 @@ setup(
             'llm_bridge.py = robot.llm_bridge:main',
             'trajectory.py = robot.trajectory:main',
             'ring_bridge.py = robot.ring_bridge:main',
-            'servo_teleop.py = robot.servo_teleop:main'
+            'servo_teleop.py = robot.servo_teleop:main',
+            'person_lidar_tracker.py = robot.person_lidar_tracker:main',
         ],
     },
 )

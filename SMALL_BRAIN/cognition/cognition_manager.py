@@ -139,6 +139,7 @@ class CognitionManager:
         if self.astra_action is not None:
             self.astra_action.handle_navigation_event(message)
         self.approach_action.handle_navigation_event(message)
+        await self.follow_executor.handle_navigation_event(message)
         if self.navigate_action is not None:
             self.navigate_action.handle_navigation_event(message)
         self.move_action.handle_moving_event(message)
@@ -292,7 +293,10 @@ class CognitionManager:
                     reason_code="NAVIGATION_UNAVAILABLE",
                 )
             return await self.navigate_action.start(
-                args.get("query"), request.action_id
+                args.get("query"), request.action_id,
+                stop_after_first_move=(
+                    args.get("completion_mode") == "single_move"
+                ),
             )
 
         if name == "find_object":
@@ -305,7 +309,6 @@ class CognitionManager:
         if name == "follow_action":
             return await self.follow_executor.start(
                 target=args.get("target"),
-                radius_m=args.get("radius_m"),
                 action_id=request.action_id,
             )
 

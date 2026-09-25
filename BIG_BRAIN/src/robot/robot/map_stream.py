@@ -19,6 +19,9 @@ ANALYSIS_HZ = 0.5
 # an encoded snapshot warm at FIXED_HZ and returns it to requesters.
 DELIVERY_MODE = "on_request"
 FIXED_HZ = 2.0
+# The navigation model only consumes the robot-centred crop. Keep the costly
+# second full-map render disabled unless a debugging session explicitly needs it.
+INCLUDE_FULL_IMAGE = False
 
 
 class MapImageStream:
@@ -32,6 +35,7 @@ class MapImageStream:
         self.analysis_hz = ANALYSIS_HZ
         self.delivery_mode = DELIVERY_MODE
         self.fixed_hz = FIXED_HZ
+        self.include_full_image = INCLUDE_FULL_IMAGE
         if self.delivery_mode not in {"on_request", "fixed_hz"}:
             raise ValueError(f"Unknown map delivery mode: {self.delivery_mode}")
         if self.fixed_hz <= 0.0:
@@ -233,9 +237,6 @@ class MapImageStream:
         started_at = time.monotonic()
         try:
             prepared = self.logic.prepare(map_msg, cost_msg, pose)
-            prepared["background"], prepared["view"] = (
-                self.renderer.render_background(prepared, pose)
-            )
         except Exception as error:
             self._not_ready_reason = (
                 f"Map analysis failed: {type(error).__name__}: {error}"
@@ -339,7 +340,9 @@ class MapImageStream:
                 "retryable": False,
             })
 
-    def _compose_snapshot(self, prepared, pose, camera_pan_angle):
+    def _compose_snapshot(
+        self, prepared, pose, camera_pan_angle, crop_size_m=None
+    ):
         """Coordinate planning, visibility analysis, rendering, and metadata."""
         overlay = self.search_overlay
         grid = prepared["grid"]
@@ -379,16 +382,35 @@ class MapImageStream:
             )
             if observation is not None else None
         )
-        image = self.renderer.render_snapshot(
-            prepared, pose, candidates, coverage_counts,
-            search_overlay=overlay,
-            live_fov_mask=live_mask,
-            observation=observation,
-            observation_mask=observation_mask,
-        )
+        def render_view(view_size_m):
+            # Render directly into the requested robot-relative view. This
+            # keeps a crop crisp even when the global explored map is large.
+            rendered = dict(prepared)
+            rendered["background"], rendered["view"] = (
+                self.renderer.render_background(
+                    prepared, pose, view_size_m=view_size_m
+                )
+            )
+            marker_scale = self.renderer.pose_marker_scale_for_crop(
+                rendered["view"], view_size_m
+            )
+            image = self.renderer.render_snapshot(
+                rendered, pose, candidates, coverage_counts,
+                search_overlay=overlay,
+                live_fov_mask=live_mask,
+                observation=observation,
+                observation_mask=observation_mask,
+                pose_marker_scale=marker_scale,
+            )
+            return image, rendered["view"]
+
+        image, image_view = render_view(crop_size_m)
+        full_image = None
+        full_image_view = None
+        if crop_size_m is not None and self.include_full_image:
+            full_image, full_image_view = render_view(None)
 
         mode = str((overlay or {}).get("mode") or "goal")
-        deterministic = mode == "exploration" and len(candidates) == 1
         search_poses = (overlay or {}).get("search_poses") or []
         metadata = {
             "schema_version": 1,
@@ -402,13 +424,8 @@ class MapImageStream:
             "rooms": prepared["rooms"],
             "sample_radius_m": self.logic.cfg.sample_radius,
             "selection_mode": mode,
-            "selection_policy": (
-                "deterministic" if deterministic else "vision"
-            ),
-            "selected_pose_id": (
-                candidates[0]["id"]
-                if deterministic and len(candidates) == 1 else None
-            ),
+            "selection_policy": "vision",
+            "selected_pose_id": None,
             "live_camera_fov": live_fov,
             "observation_fov": observation,
             "search_overlay": (
@@ -430,26 +447,56 @@ class MapImageStream:
                 "camera_reliable_range_m",
                 self.logic.cfg.camera_fov_max_range_m,
             )),
-            "image_world_bounds": {
-                key: prepared["view"][key]
-                for key in ("xmin", "xmax", "ymin", "ymax")
+            "image_robot_view": {
+                key: image_view[key]
+                for key in (
+                    "xmin", "xmax", "ymin", "ymax", "origin_x",
+                    "origin_y", "heading_yaw",
+                )
             },
         }
-        return image, metadata
+        if crop_size_m is not None:
+            size = float(crop_size_m)
+            half = size / 2.0
+            yaw = float(pose["yaw"])
+
+            def inside_robot_crop(item):
+                dx = float(item["x"]) - float(pose["x"])
+                dy = float(item["y"]) - float(pose["y"])
+                right = dx * math.sin(yaw) - dy * math.cos(yaw)
+                forward = dx * math.cos(yaw) + dy * math.sin(yaw)
+                return abs(right) <= half and abs(forward) <= half
+
+            metadata["candidates"] = [
+                item for item in metadata["candidates"]
+                if inside_robot_crop(item)
+            ]
+            metadata["map_crop_size_m"] = size
+            if full_image_view is not None:
+                metadata["full_image_robot_view"] = {
+                    key: full_image_view[key]
+                    for key in (
+                        "xmin", "xmax", "ymin", "ymax", "origin_x",
+                        "origin_y", "heading_yaw",
+                    )
+                }
+        return image, metadata, full_image
+
     @staticmethod
     def _crop_snapshot(image, metadata, crop_size_m):
+        """Legacy pixel crop retained for callers outside the snapshot path."""
         size = float(crop_size_m)
         if not math.isfinite(size) or size <= 0.0:
             raise ValueError("crop_size_m must be a positive finite number")
         pose = metadata["robot_pose"]
-        bounds = metadata["image_world_bounds"]
+        view = metadata["image_robot_view"]
         height, width = image.shape[:2]
-        ppm_x = width / (bounds["xmax"] - bounds["xmin"])
-        ppm_y = height / (bounds["ymax"] - bounds["ymin"])
+        ppm_x = width / (view["xmax"] - view["xmin"])
+        ppm_y = height / (view["ymax"] - view["ymin"])
         crop_width = max(1, round(size * ppm_x))
         crop_height = max(1, round(size * ppm_y))
-        center_x = round((pose["x"] - bounds["xmin"]) * ppm_x)
-        center_y = round((bounds["ymax"] - pose["y"]) * ppm_y)
+        center_x = round(-view["xmin"] * ppm_x)
+        center_y = round(view["ymax"] * ppm_y)
         x0 = center_x - crop_width // 2
         y0 = center_y - crop_height // 2
         x1, y1 = x0 + crop_width, y0 + crop_height
@@ -462,22 +509,31 @@ class MapImageStream:
             source_x0 - x0, x1 - source_x1,
             cv2.BORDER_CONSTANT, value=(62, 62, 62),
         )
+        MapRenderer._draw_orientation_legend(cropped)
         half = size / 2.0
-        crop_bounds = {
-            "xmin": float(pose["x"]) - half,
-            "xmax": float(pose["x"]) + half,
-            "ymin": float(pose["y"]) - half,
-            "ymax": float(pose["y"]) + half,
-        }
         metadata = dict(metadata)
-        metadata["full_image_world_bounds"] = bounds
-        metadata["image_world_bounds"] = crop_bounds
+        metadata["full_image_robot_view"] = view
+        metadata["image_robot_view"] = {
+            **view,
+            "xmin": -half,
+            "xmax": half,
+            "ymin": -half,
+            "ymax": half,
+        }
         metadata["map_crop_size_m"] = size
         if metadata.get("selection_policy") == "vision":
+            yaw = float(pose["yaw"])
+
+            def inside_robot_crop(item):
+                dx = float(item["x"]) - float(pose["x"])
+                dy = float(item["y"]) - float(pose["y"])
+                right = dx * math.sin(yaw) - dy * math.cos(yaw)
+                forward = dx * math.cos(yaw) + dy * math.sin(yaw)
+                return abs(right) <= half and abs(forward) <= half
+
             metadata["candidates"] = [
                 item for item in metadata["candidates"]
-                if crop_bounds["xmin"] <= item["x"] <= crop_bounds["xmax"]
-                and crop_bounds["ymin"] <= item["y"] <= crop_bounds["ymax"]
+                if inside_robot_crop(item)
             ]
         return cropped, metadata
 
@@ -500,21 +556,16 @@ class MapImageStream:
         captured_at_unix_ns = time.time_ns()
         try:
             camera_pan_angle = self.logic.cfg.camera_center_pan_deg
-            image, metadata = self._compose_snapshot(
-                prepared, pose, camera_pan_angle
+            image, metadata, full_image = self._compose_snapshot(
+                prepared, pose, camera_pan_angle, crop_size_m=crop_size_m
             )
-            full_image = image
-            if crop_size_m is not None:
-                image, metadata = self._crop_snapshot(
-                    image, metadata, crop_size_m
-                )
             ok, jpeg = cv2.imencode(
                 ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]
             )
             if not ok:
                 raise RuntimeError("OpenCV failed to encode the map JPEG")
             full_jpeg = None
-            if crop_size_m is not None:
+            if full_image is not None:
                 full_ok, full_encoded = cv2.imencode(
                     ".jpg", full_image, [cv2.IMWRITE_JPEG_QUALITY, 85]
                 )

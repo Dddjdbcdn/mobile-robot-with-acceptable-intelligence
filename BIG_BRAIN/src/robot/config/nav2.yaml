@@ -245,13 +245,16 @@ global_costmap:
       always_send_full_costmap: True
       update_frequency: 1.0
       publish_frequency: 1.0
-      global_frame: map
+      global_frame: odom
+      rolling_window: true
+      width: 10
+      height: 10
       robot_base_frame: base_footprint
       footprint: "[ [0.12, 0.12], [0.12, -0.12], [-0.12, -0.12], [-0.12, 0.12] ]"
       footprint_padding: 0.05
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer","range_layer","obstacle_layer","stvl_layer","inflation_layer"]
+      plugins: ["range_layer","obstacle_layer","stvl_layer","inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True

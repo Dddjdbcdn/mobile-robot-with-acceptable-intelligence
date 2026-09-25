@@ -40,8 +40,8 @@ from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
-from cognition.follow_executor import FollowConfig, FollowExecutor
-from cognition.goal_executor import FindLoopConfig, GoalExecutor
+from cognition.follow_executor import FollowExecutor
+from cognition.goal_executor import GoalExecutor
 from cognition.state import robot_state,update_state
 from cognition.semantic_memory import SemanticMemory
 
@@ -56,6 +56,12 @@ zmq_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
 zmq_pub_socket = context.socket(zmq.PUB)
 zmq_pub_socket.connect("tcp://localhost:5557")
+
+person_tracker_pub_socket = context.socket(zmq.PUB)
+person_tracker_pub_socket.setsockopt(zmq.SNDHWM, 10)
+person_tracker_pub_socket.connect(
+    os.environ.get("PERSON_TRACKER_ENDPOINT", "tcp://localhost:5560")
+)
 
 
 zmq_req_lock = asyncio.Lock()
@@ -474,6 +480,7 @@ async def main():
                 yolo=yolo,
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
+                person_tracker_pub_socket=person_tracker_pub_socket,
                 send_robot_command=send_robot_command,
                 semantic_memory=semantic_memory,
             )
@@ -487,9 +494,6 @@ async def main():
                 yolo=yolo,
                 camera=camera,
                 send_robot_command=send_robot_command,
-                standoff_m=float(
-                    os.environ.get("ASTRA_APPROACH_STANDOFF_M", "0.65")
-                ),
             )
             move_action = MoveAction(send_robot_command=send_robot_command)
             see_action = SeeAction(
@@ -516,12 +520,7 @@ async def main():
             follow_executor = FollowExecutor(
                 goal_executor=goal_executor,
                 track_action=track_action,
-                approach_action=approach_action,
-                config=FollowConfig(
-                    default_radius_m=float(
-                        os.environ.get("FOLLOW_RADIUS_M", "1.0")
-                    )
-                ),
+                send_robot_command=send_robot_command,
             )
 
             cognitive_manager = CognitionManager(

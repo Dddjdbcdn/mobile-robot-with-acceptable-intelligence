@@ -9,14 +9,14 @@
         default_planner="GridBased" topic_name="planner_selector"/>
       <RateController hz="2.0">
         <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
-          <ComputePathToPose goal="{updated_goal}" path="{path}"
+          <ComputePathToPose goal="{updated_goal}" path="{follow_path}"
             planner_id="{selected_planner}"
             error_code_id="{compute_path_error_code}"
           />
         </GoalUpdater>
       </RateController>
       <KeepRunningUntilFailure>
-        <FollowPath path="{path}" controller_id="{selected_controller}"
+        <FollowPath path="{follow_path}" controller_id="{selected_controller}"
           error_code_id="{follow_path_error_code}"/>
       </KeepRunningUntilFailure>
     </PipelineSequence>

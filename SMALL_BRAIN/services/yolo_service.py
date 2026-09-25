@@ -16,7 +16,7 @@ class YoloService():
             / "vision_models"
             / "yolo_tools"
         )
-        pose_model_path = model_dir / "yolo11m-pose_openvino_model"
+        pose_model_path = model_dir / "yolo11n-pose_openvino_model"
         DJ_custom_model_path = model_dir / "yoloe-11m_openvino_model"
 
         self.DJ_custom_model = YOLO(DJ_custom_model_path, task="detect")
@@ -28,12 +28,19 @@ class YoloService():
         self.detections = []
         self.inference_thread = threading.Thread(target=self.timer_callback, daemon=True)
         self.running = False
-        self.fps = 10.0
+        self.fps = 20.0
+        self.current_fps = 0.0
+        self._fps_window_started = time.monotonic()
+        self._fps_frame_count = 0
+        self._fps_mode_revision = -1
         self._active_event = threading.Event()
         self._state_condition = threading.Condition()
         self._owner_modes = {}
         self._mode_revision = 0
         self._inference_sequence = 0
+        self._inference_source_captured_at = None
+        self._inference_started_at = None
+        self._inference_completed_at = None
 
     @property
     def active(self):
@@ -44,6 +51,19 @@ class YoloService():
         """Return one inference generation and its detections atomically."""
         with self._state_condition:
             return self._inference_sequence, list(self.detections)
+
+    def detection_snapshot_with_timing(self):
+        """Return detections and monotonic timestamps from the same inference."""
+        with self._state_condition:
+            return (
+                self._inference_sequence,
+                list(self.detections),
+                {
+                    "source_captured_at": self._inference_source_captured_at,
+                    "inference_started_at": self._inference_started_at,
+                    "inference_completed_at": self._inference_completed_at,
+                },
+            )
 
     def _effective_mode_locked(self):
         modes = set(self._owner_modes.values()) - {"none"}
@@ -139,6 +159,18 @@ class YoloService():
         while not self.running:
             await asyncio.sleep(0.05)
 
+    def _record_fps(self, mode):
+        self._fps_frame_count += 1
+        now = time.monotonic()
+        elapsed = now - self._fps_window_started
+        if elapsed < 1.0:
+            return
+
+        self.current_fps = self._fps_frame_count / elapsed
+        print(f"[FPS] YOLO ({mode}): {self.current_fps:.1f}", flush=True)
+        self._fps_window_started = now
+        self._fps_frame_count = 0
+
     def timer_callback(self):
         while self.running:
             if not self._active_event.wait(timeout=0.1):
@@ -148,6 +180,10 @@ class YoloService():
                 mode_revision = self._mode_revision
             if mode == "none":
                 continue
+            if mode_revision != self._fps_mode_revision:
+                self._fps_window_started = time.monotonic()
+                self._fps_frame_count = 0
+                self._fps_mode_revision = mode_revision
             loop_start = time.perf_counter()
 
             latest = self.camera.latest
@@ -158,6 +194,8 @@ class YoloService():
 
             frame = latest.tracking_bgr
             source_generation = latest.source_generation
+            source_captured_at = latest.captured_at
+            inference_started_at = time.monotonic()
 
             detections = []
 
@@ -181,6 +219,7 @@ class YoloService():
                     self.parse_pose(pose_results[0])
                 )
 
+            inference_completed_at = time.monotonic()
             current = self.camera.latest
             with self._state_condition:
                 if (
@@ -190,8 +229,13 @@ class YoloService():
                     and self._effective_mode_locked() != "none"
                 ):
                     self.detections = detections
+                    self._inference_source_captured_at = source_captured_at
+                    self._inference_started_at = inference_started_at
+                    self._inference_completed_at = inference_completed_at
                     self._inference_sequence += 1
                     self._state_condition.notify_all()
+
+            # self._record_fps(mode)
 
             elapsed = time.perf_counter() - loop_start
             remaining = 1/self.fps - elapsed
@@ -261,6 +305,7 @@ class YoloService():
         ]
 
         detections = []
+        frame_height, frame_width = result.orig_shape
 
         for i, box in enumerate(result.boxes):
             conf = float(box.conf[0])
@@ -303,6 +348,12 @@ class YoloService():
                     "y1": round(y1, 1),
                     "x2": round(x2, 1),
                     "y2": round(y2, 1),
+                    "normalized_center_x": round(
+                        ((x1 + x2) * 0.5) / frame_width, 4
+                    ),
+                    "normalized_center_y": round(
+                        ((y1 + y2) * 0.5) / frame_height, 4
+                    ),
                 },
 
                 "keypoints": human_keypoints,

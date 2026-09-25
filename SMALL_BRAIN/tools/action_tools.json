@@ -66,31 +66,30 @@
         "query": {
           "type": "string",
           "description": "The complete destination or roaming goal, including any visual arrival condition."
+        },
+        "completion_mode": {
+          "type": "string",
+          "enum": ["single_move", "verify_goal"],
+          "description": "Use single_move when one bounded displacement or turn directly completes the request, such as nudge forward, move slightly, back up a little, or turn left. Use verify_goal for destinations, roaming, and goals requiring fresh visual confirmation after waypoints."
         }
       },
-      "required": ["query"],
+      "required": ["query", "completion_mode"],
       "additionalProperties": false
     }
   },
   {
     "type": "function",
     "name": "follow_action",
-    "description": "Continuously find and track a person, approaching again whenever they move beyond the requested radius. This remains active until stopped and includes target-loss recovery.",
+    "description": "Find a person, initialize camera/ToF-assisted lidar tracking, then continuously follow the lidar-estimated person pose with Nav2. This remains active until stopped.",
     "parameters": {
       "type": "object",
       "properties": {
         "target": {
           "type": "string",
           "description": "The person to follow. Use person for an unspecified person."
-        },
-        "radius_m": {
-          "type": ["number", "null"],
-          "minimum": 0.4,
-          "maximum": 5.0,
-          "description": "Desired following distance in metres; null uses the configured default."
         }
       },
-      "required": ["target", "radius_m"],
+      "required": ["target"],
       "additionalProperties": false
     }
   }

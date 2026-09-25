@@ -1,158 +1,109 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-import math
-import time
 
 from actions.action_result import ActionResult
 from actions.track_action import normalize_human_target
-from cognition.state import robot_state
-
-
-@dataclass(frozen=True, slots=True)
-class FollowConfig:
-    default_radius_m: float = 0.3
-    poll_seconds: float = 0.20
-    target_max_age_seconds: float = 1.0
-    tracking_recovery_seconds: float = 3.0
-    approach_standoff_ratio: float = 0.8
 
 
 class FollowExecutor:
-    """Continuously find, track, and safely approach one person."""
+    """Acquire a person, then hand continuous following to the ROS bridge."""
 
-    def __init__(self, goal_executor, track_action, approach_action, config=None):
+    def __init__(self, goal_executor, track_action, send_robot_command):
         self.goal_executor = goal_executor
         self.search_action = goal_executor.search_action
         self.track_action = track_action
-        self.approach_action = approach_action
-        self.config = config or FollowConfig()
+        self.send_robot_command = send_robot_command
         self.active = False
         self.action_id: str | None = None
         self.target: str | None = None
-        self.radius_m = self.config.default_radius_m
         self.completion_future: asyncio.Future[ActionResult] | None = None
         self._runner: asyncio.Task | None = None
         self._stop_requested = False
-        self._approach_count = 0
-        self._recovery_count = 0
+        self._lidar_lost = False
 
-    async def start(self, target, action_id, radius_m=None) -> ActionResult:
+    async def start(self, target, action_id) -> ActionResult:
         if self.active:
             return ActionResult(
                 action_id, "follow_action", "already_running", target=self.target,
                 outcome="already_running", reason_code="FOLLOW_BUSY", retryable=True,
                 data={"active_action_id": self.action_id},
             )
+
         normalized_target = normalize_human_target(target or "person")
         if normalized_target != "person":
             return ActionResult(
                 action_id, "follow_action", "failed", target=target,
                 outcome="invalid_request", reason_code="FOLLOW_PERSON_REQUIRED",
             )
-        try:
-            radius = float(
-                self.config.default_radius_m if radius_m is None else radius_m
-            )
-        except (TypeError, ValueError):
-            radius = math.nan
-        if not math.isfinite(radius) or not 0.4 <= radius <= 5.0:
-            return ActionResult(
-                action_id, "follow_action", "failed", target="person",
-                outcome="invalid_request", reason_code="FOLLOW_RADIUS_INVALID",
-                data={"minimum_m": 0.4, "maximum_m": 5.0},
-            )
 
         self.active = True
         self.action_id = action_id
         self.target = "person"
-        self.radius_m = radius
         self._stop_requested = False
-        self._approach_count = 0
-        self._recovery_count = 0
+        self._lidar_lost = False
         self.completion_future = asyncio.get_running_loop().create_future()
         self._runner = asyncio.create_task(
             self._run(), name=f"follow-person-{action_id}"
         )
         return ActionResult(
             action_id, "follow_action", "running", target="person",
-            outcome="finding_and_following", data={"radius_m": radius},
+            outcome="acquiring_person",
         )
 
     async def _run(self):
         try:
-            acquired = await self._acquire_target("initial")
+            acquired = await self._acquire_target()
             if acquired.status != "succeeded":
-                await self._stop_follow_motion("FOLLOW_ACQUISITION_FAILED")
+                await self._stop_tracking("FOLLOW_ACQUISITION_FAILED")
                 self._finish(
                     "failed", "follow_failed",
                     acquired.reason_code or "FOLLOW_ACQUISITION_FAILED",
-                    {"failed_step": "initial_acquisition"},
+                    {"failed_step": "person_acquisition"},
+                )
+                return
+
+            feedback = await self.send_robot_command({
+                "command": "follow_action",
+                "action_id": self.action_id,
+            })
+            if not isinstance(feedback, dict) or feedback.get("status") != "accepted":
+                message = (
+                    feedback.get("message", "follow_rejected")
+                    if isinstance(feedback, dict)
+                    else "invalid_follow_feedback"
+                )
+                await self._stop_tracking("FOLLOW_REJECTED")
+                self._finish(
+                    "failed", "follow_rejected", "FOLLOW_REJECTED",
+                    {"message": message},
                 )
                 return
 
             while self.active and not self._stop_requested:
-                distance = self._fresh_distance()
-                if not self.track_action.active or distance is None:
-                    recovered = await self._recover_tracking()
-                    if not recovered:
-                        await self._stop_follow_motion(
-                            "FOLLOW_REACQUISITION_FAILED"
-                        )
-                        self._finish(
-                            "failed", "target_lost",
-                            "FOLLOW_REACQUISITION_FAILED",
-                            {"reacquisition_attempts": self._recovery_count},
-                        )
-                        return
-                    continue
-
-                if distance <= self.radius_m:
-                    if self.approach_action.active:
-                        await self.approach_action.stop_approaching(
-                            "FOLLOW_RADIUS_REACHED"
-                        )
-                    await asyncio.sleep(self.config.poll_seconds)
-                    continue
-
-                was_approaching = self.approach_action.active
-                result = await self.approach_action.start_approaching(
-                    target="person",
-                    action_id=f"{self.action_id}:follow",
-                    standoff_m=self._approach_standoff_m(),
-                    follow=True,
-                )
-                if result.status != "running":
-                    recovered = await self._recover_tracking()
-                    if not recovered:
-                        await self._stop_follow_motion(
-                            "FOLLOW_REACQUISITION_FAILED"
-                        )
-                        self._finish(
-                            "failed", "approach_failed",
-                            result.reason_code or "FOLLOW_APPROACH_FAILED",
-                            {"failed_step": "follow_update"},
-                        )
-                        return
-                elif not was_approaching:
-                    self._approach_count += 1
-                await asyncio.sleep(self.config.poll_seconds)
+                await self.track_action.wait_until_finished()
+                if not self.active or self._stop_requested or self._lidar_lost:
+                    return
+                if not await self._reacquire_camera_tracking():
+                    return
         except asyncio.CancelledError:
             return
         except Exception as error:
             if self.active and not self._stop_requested:
-                await self._stop_follow_motion("FOLLOW_EXECUTION_ERROR")
+                await self.send_robot_command({
+                    "command": "stop_follow_action",
+                    "action_id": self.action_id,
+                })
+                await self._stop_tracking("FOLLOW_EXECUTION_ERROR")
                 self._finish(
                     "failed", "execution_error", "FOLLOW_EXECUTION_ERROR",
                     {"error": f"{type(error).__name__}: {error}"},
                 )
 
-    async def _acquire_target(self, step):
-        """Best-effort search followed by tracking; never invokes find_object."""
+    async def _acquire_target(self):
         search_result = await self.search_action.start_searching(
             target="person",
-            action_id=f"{self.action_id}:{step}:search",
+            action_id=f"{self.action_id}:search",
             effort="best_effort",
             initial_view_only=False,
         )
@@ -163,56 +114,39 @@ class FollowExecutor:
             return search_result
 
         track_result = await self.track_action.start_tracking(
-            target="person",
-            action_id=f"{self.action_id}:{step}:track",
+            target="torso center",
+            action_id=f"{self.action_id}:track",
             allow_grounding_dino=True,
+            continuous_person_reacquisition=True,
         )
         if track_result.status != "running":
             return track_result
 
         return ActionResult(
-            f"{self.action_id}:{step}", "follow_action", "succeeded",
-            target="person", outcome="target_acquired_and_tracking",
-            data={"radius_m": self.radius_m},
+            self.action_id, "follow_action", "succeeded", target="person",
+            outcome="person_acquired",
         )
 
-    async def _recover_tracking(self):
-        """Give live tracking time to recover, then reacquire once if needed."""
-        if self.approach_action.active:
-            await self.approach_action.stop_approaching("TRACKING_LOST")
+    async def _reacquire_camera_tracking(self):
+        """Retry vision indefinitely while lidar still owns a valid track."""
+        tracking_action_id = f"{self.action_id}:track"
+        while self.active and not self._stop_requested and not self._lidar_lost:
+            keep_alive = getattr(
+                self.track_action, "keep_person_tracker_alive", None
+            )
+            if keep_alive is not None:
+                await keep_alive(tracking_action_id)
 
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self.config.tracking_recovery_seconds
-        )
-        while self.track_action.active and not self._stop_requested:
-            if self._fresh_distance() is not None:
+            result = await self.track_action.start_tracking(
+                target="torso center",
+                action_id=tracking_action_id,
+                allow_grounding_dino=True,
+                continuous_person_reacquisition=True,
+            )
+            if result.status == "running":
                 return True
-            if asyncio.get_running_loop().time() >= deadline:
-                break
-            await asyncio.sleep(self.config.poll_seconds)
-
-        if self._stop_requested:
-            return False
-        if self.track_action.active:
-            await self.track_action.stop_tracking("TRACKING_RECOVERY_TIMEOUT")
-
-        self._recovery_count += 1
-        result = await self._acquire_target(
-            f"reacquire:{self._recovery_count}"
-        )
-        if result.status == "succeeded" and self.track_action.active:
-            return True
+            await asyncio.sleep(0.25)
         return False
-
-    def _approach_standoff_m(self):
-        return self.radius_m * self.config.approach_standoff_ratio
-
-    async def _stop_follow_motion(self, reason_code):
-        if self.approach_action.active:
-            await self.approach_action.stop_approaching(reason_code)
-        if self.track_action.active:
-            await self.track_action.stop_tracking(reason_code)
 
     @staticmethod
     async def _terminal_result(action, result):
@@ -220,21 +154,42 @@ class FollowExecutor:
             return await action.wait_until_finished()
         return result
 
-    def _fresh_distance(self):
-        camera = robot_state.get("camera") or {}
-        x = camera.get("object_x")
-        y = camera.get("object_y")
-        timestamp = camera.get("timestamp")
-        if not all(isinstance(value, (int, float)) for value in (x, y)):
-            return None
-        if not all(math.isfinite(float(value)) for value in (x, y)):
-            return None
-        if not isinstance(timestamp, (int, float)):
-            return None
-        if time.monotonic() - float(timestamp) > self.config.target_max_age_seconds:
-            return None
-        distance = math.hypot(float(x), float(y))
-        return distance if distance > 0.05 else None
+    async def _stop_tracking(self, reason_code):
+        if self.track_action.active:
+            await self.track_action.stop_tracking(reason_code)
+
+    async def handle_navigation_event(self, payload):
+        if not self.active:
+            return False
+        if payload.get("action_id") not in {None, self.action_id}:
+            return False
+
+        if (
+            payload.get("event") == "person_tracker"
+            and payload.get("status") == "lost"
+        ):
+            self._lidar_lost = True
+            await self.send_robot_command({
+                "command": "stop_follow_action",
+                "action_id": self.action_id,
+            })
+            await self._stop_tracking("LIDAR_TRACK_LOST")
+            self._finish(
+                "failed", "target_lost", "LIDAR_TRACK_LOST",
+                {"tracker_state": "lost"},
+            )
+            return True
+
+        if payload.get("event") != "navigation":
+            return False
+
+        status = str(payload.get("status", ""))
+        await self._stop_tracking("FOLLOW_NAVIGATION_ENDED")
+        self._finish(
+            "failed", "navigation_ended", "FOLLOW_NAVIGATION_ENDED",
+            {"robot_status": status or "unknown"},
+        )
+        return True
 
     async def wait_until_finished(self):
         return await asyncio.shield(self.completion_future)
@@ -242,18 +197,18 @@ class FollowExecutor:
     async def stop(self, reason_code="USER_REQUESTED"):
         if not self.active:
             return None
+
         self._stop_requested = True
         runner = self._runner
         if runner is not None and runner is not asyncio.current_task():
             runner.cancel()
-        if self.goal_executor.active:
-            await self.goal_executor.stop(reason_code)
         if self.search_action.active:
             await self.search_action.stop_searching(reason_code)
-        if self.approach_action.active:
-            await self.approach_action.stop_approaching(reason_code)
-        if self.track_action.active:
-            await self.track_action.stop_tracking(reason_code)
+        await self.send_robot_command({
+            "command": "stop_follow_action",
+            "action_id": self.action_id,
+        })
+        await self._stop_tracking(reason_code)
         result = self._finish("cancelled", "stopped", reason_code)
         if runner is not None and runner is not asyncio.current_task():
             await asyncio.gather(runner, return_exceptions=True)
@@ -263,13 +218,7 @@ class FollowExecutor:
         result = ActionResult(
             self.action_id or "unassigned", "follow_action", status,
             target=self.target, outcome=outcome, reason_code=reason_code,
-            retryable=status == "failed",
-            data={
-                "radius_m": self.radius_m,
-                "approach_count": self._approach_count,
-                "recovery_count": self._recovery_count,
-                **(data or {}),
-            },
+            retryable=status == "failed", data=data or {},
         )
         self.active = False
         future = self.completion_future

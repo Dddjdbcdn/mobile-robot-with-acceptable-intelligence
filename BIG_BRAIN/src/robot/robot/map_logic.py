@@ -24,6 +24,7 @@ class LogicConfig:
     sample_distances: tuple = (0.5, 1.0, 2.0, 3.0)
     sample_angle_deg: float = 45.0
     include_rotations: bool = True
+    candidate_min_separation_m: float = 0.30
 
     # Frontiers
     frontier_hole_min_area: float = 0.5
@@ -47,7 +48,7 @@ class LogicConfig:
 
     # Search views
     camera_center_pan_deg: float = 95.0
-    camera_horizontal_fov_deg: float = 60.0
+    camera_horizontal_fov_deg: float = 85.0
     camera_fov_max_range_m: float = 2.0
     context_radius_samples: int = 3
     context_bearing_fractions: tuple = (-0.75, 0.0, 0.75)
@@ -357,25 +358,66 @@ class MapLogic:
         mode = str(overlay.get("mode") or "goal")
 
         if mode == "context":
-            return self._context_candidates(prepared, pose, overlay)
+            candidates = self._context_candidates(prepared, pose, overlay)
         elif mode == "destination":
-            return self._context_candidates(
+            candidates = self._context_candidates(
                 prepared, pose, overlay,
                 max_range_m=self.cfg.destination_context_radius_m,
             )
         elif mode == "exploration":
             if coverage is None:
                 coverage = self.coverage_counts(prepared["grid"], overlay) > 0
-            return self._exploration_candidates(
+            candidates = self._exploration_candidates(
                 prepared, pose, overlay, coverage
             )
         elif mode == "goal":
             candidates = self._local_candidates(
                 prepared["grid"], prepared["reachable"], pose
             ) + [dict(item) for item in prepared["frontiers"]]
-            return [self._describe(item, pose) for item in candidates]
+            candidates = [self._describe(item, pose) for item in candidates]
         else:
             return []
+        return self._deduplicate_candidates(candidates)
+
+    def _deduplicate_candidates(self, candidates):
+        """Keep one useful marker per 30 cm cluster; H remains independent."""
+        separation = max(0.0, float(self.cfg.candidate_min_separation_m))
+        if separation == 0.0:
+            return candidates
+
+        def priority(item):
+            if item.get("kind") == "frontier":
+                return 4
+            if (
+                item.get("id") in {"CB", "CF", "EF"}
+                or "furthest" in str(item.get("selection_reason") or "")
+            ):
+                return 3
+            if item.get("uncovered_cell_count") is not None:
+                return 2
+            return 1
+
+        indexed = list(enumerate(candidates))
+        translations = [
+            pair for pair in indexed if pair[1].get("kind") != "rotation"
+        ]
+        translations.sort(key=lambda pair: (-priority(pair[1]), pair[0]))
+        kept = []
+        for index, candidate in translations:
+            if any(
+                math.hypot(
+                    candidate["x"] - other["x"],
+                    candidate["y"] - other["y"],
+                ) < separation
+                for _, other in kept
+            ):
+                continue
+            kept.append((index, candidate))
+
+        kept.extend(
+            pair for pair in indexed if pair[1].get("kind") == "rotation"
+        )
+        return [item for _, item in sorted(kept)]
 
     @staticmethod
     def _describe(candidate, pose):
@@ -678,29 +720,51 @@ class MapLogic:
         return int(col), int(row)
     @staticmethod
     def _connected(mask, robot_col, robot_row):
-        if not (
-            0 <= robot_row < mask.shape[0]
-            and 0 <= robot_col < mask.shape[1]
-        ):
+        """Return the component nearest the robot without trusting one cell."""
+        valid_rows, valid_cols = np.nonzero(mask)
+        if not valid_rows.size:
             return np.zeros_like(mask, bool)
-        if not mask[robot_row, robot_col]:
-            return np.zeros_like(mask, bool)
+
+        distance_sq = (
+            (valid_rows - int(robot_row)) ** 2
+            + (valid_cols - int(robot_col)) ** 2
+        )
+        nearest = int(np.argmin(distance_sq))
+        seed_row = int(valid_rows[nearest])
+        seed_col = int(valid_cols[nearest])
         _, labels = cv2.connectedComponents(
             mask.astype(np.uint8), connectivity=4
         )
-        return labels == labels[robot_row, robot_col]
+        return labels == labels[seed_row, seed_col]
 
     def _reachable(self, grid, costs, pose, clearance=0.0):
-        free = (
+        traversable = (
             (grid.data >= 0)
             & (grid.data < self.cfg.occupied)
             & (costs >= 0)
             & (costs < self.cfg.cost_limit)
         )
-        if clearance > 0:
-            dist = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 5)
-            free &= dist * grid.resolution >= clearance
-        return self._connected(free, *self._robot_cell(grid, pose))
+        robot_col, robot_row = self._robot_cell(grid, pose)
+        connected = self._connected(traversable, robot_col, robot_row)
+        if clearance <= 0 or not connected.any():
+            return connected
+
+        distance = cv2.distanceTransform(
+            traversable.astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
+        safe = distance >= clearance
+
+        # The robot may legitimately occupy a cell rejected by endpoint
+        # clearance. Preserve a small traversable egress around its pose so
+        # rays can reach safe cells instead of failing at distance zero.
+        rows, cols = np.indices(traversable.shape)
+        egress_radius = clearance + grid.resolution
+        egress = (
+            ((rows - robot_row) * grid.resolution) ** 2
+            + ((cols - robot_col) * grid.resolution) ** 2
+            <= egress_radius ** 2
+        )
+        return connected & (safe | egress)
 
     # ------------------------------------------------------------------
     # Local samples
@@ -714,34 +778,61 @@ class MapLogic:
             if 0.0 < float(distance) <= self.cfg.sample_radius
         ]
 
-        # Preserve meaningful near, medium and far choices on every direction.
-        # Nav2 owns path planning; this stage only requires a reachable endpoint.
-        for ring_index, radius in enumerate(distances):
-            for angle_index in range(angles):
-                yaw = pose["yaw"] + angle_index * angle_step
+        # Sample straight visual rays. A ray stops at the first unsafe cell so
+        # the rendered choices never appear to pass through a wall. When the
+        # obstacle falls between configured rings, add its furthest safe point.
+        for angle_index in range(angles):
+            yaw = pose["yaw"] + angle_index * angle_step
+            furthest = self._furthest_reachable_on_ray(
+                grid, reachable, pose, yaw,
+                max_distance=self.cfg.sample_radius,
+            )
+            if furthest is None:
+                continue
+            furthest_x, furthest_y, _ = furthest
+            ray_limit = math.hypot(
+                furthest_x - pose["x"], furthest_y - pose["y"]
+            )
+            ray_candidates = []
+            for ring_index, radius in enumerate(distances):
+                if radius > ray_limit + grid.resolution / 2.0:
+                    continue
                 x = pose["x"] + radius * math.cos(yaw)
                 y = pose["y"] + radius * math.sin(yaw)
-                col, row = grid.cells(x, y)
-                if not (grid.inside(col, row) and reachable[row, col]):
+                if not self._valid_endpoint(grid, reachable, x, y):
                     continue
-                out.append({
+                candidate = {
                     "id": str(ring_index * angles + angle_index + 1),
                     "kind": "local",
                     "x": float(x), "y": float(y), "yaw": float(yaw),
-                })
+                }
+                out.append(candidate)
+                ray_candidates.append(candidate)
 
+            blocked = ray_limit < self.cfg.sample_radius - grid.resolution / 2.0
+            duplicate = any(
+                math.hypot(
+                    item["x"] - furthest_x, item["y"] - furthest_y
+                ) < grid.resolution
+                for item in ray_candidates
+            )
+            if blocked and ray_limit >= grid.resolution and not duplicate:
+                out.append({
+                    "id": f"B{angle_index + 1}",
+                    "kind": "local",
+                    "x": furthest_x,
+                    "y": furthest_y,
+                    "yaw": float(yaw),
+                    "selection_reason": "furthest_safe_point_on_blocked_ray",
+                })
 
         if self.cfg.include_rotations and reachable.any():
-            for relative in (math.pi / 2.0, -math.pi / 2.0, math.pi):
-                degrees = math.degrees(math.atan2(math.sin(relative), math.cos(relative)))
-                if math.isclose(abs(degrees), 180.0):
-                    degrees = 180.0
-                yaw = pose["yaw"] + relative
-                out.append({
-                    "id": f"R{degrees:+g}",
-                    "kind": "rotation",
-                    "x": pose["x"], "y": pose["y"], "yaw": float(yaw),
-                })
+            out.append({
+                "id": "H",
+                "kind": "rotation",
+                "x": pose["x"], "y": pose["y"], "yaw": float(pose["yaw"]),
+                "selection_reason": "hold_position_and_choose_heading",
+            })
         return out
 
     # ------------------------------------------------------------------

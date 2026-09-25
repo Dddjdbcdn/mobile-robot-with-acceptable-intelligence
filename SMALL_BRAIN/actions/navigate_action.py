@@ -3,6 +3,7 @@ import asyncio
 import base64
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -20,36 +21,70 @@ FIND_OBJECT_QUERY = (
     "contextual evidence, camera coverage, and unvisited map space."
 )
 
+SEMANTIC_HEADINGS = {
+    "forward": 0.0,
+    "forward_left": math.pi / 4.0,
+    "left": math.pi / 2.0,
+    "back_left": 3.0 * math.pi / 4.0,
+    "backward": math.pi,
+    "back_right": -3.0 * math.pi / 4.0,
+    "right": -math.pi / 2.0,
+    "forward_right": -math.pi / 4.0,
+}
+
+
 MAP_GUIDANCE = """GENERAL MAP GUIDANCE
-Image 1 is the occupancy and camera-coverage map. Map +X points right and +Y
-points up. Black cells are occupied, light cells are known traversable space,
-and gray cells are unknown or unavailable. Light-blue tint means one camera
-observation; pink tint means repeated observations; untinted traversable space
-has not been viewed.
+The map is robot-relative: the red robot always points UP. UP is forward in
+the current camera view, LEFT/RIGHT match the image, and DOWN is behind the
+robot. Black cells are occupied, light cells are known traversable space,
+and gray cells are unknown or unavailable. For object finding mode, light-blue tint
+means one camera observation; pink tint means repeated observations;
+untinted traversable space has not been viewed.
 
-The red circle and arrow are the robot pose and heading. Yellow S is the start
-of this search and the magenta line is its traveled trace. Blue labeled circles
-are selectable local poses; green F diamonds are selectable frontiers between
-known free and unknown space. A marker's tick shows the camera heading after
-arrival. For a clue observation, the orange cone outlines the reliable
-close-range map region associated with Image 2; its direction continues beyond
-the drawn range.
+For normal navigation mode, The cyan CURRENT VIEW cone is the obstacle-clipped center field of view that
+corresponds to the current camera image. Yellow S is the start and the magenta
+line is the traveled trace. Blue labeled circles are selectable local poses;
+green F diamonds are frontiers; H means hold position and only rotate. A ray
+that meets an obstacle ends at its furthest safe rendered candidate. For a clue
+observation, the orange outline is the reliable map region of that clue frame.
 
-Choose the listed pose whose position and final heading best satisfy the query.
-Use visual evidence, the observation cone, coverage, frontiers, distance, and
-the existing trace together. Prefer meaningful progress over revisiting covered
-space or moving only to reassess. Choose the best position without worrying about obstacles.
-Nav2 handles path planning and obstacle avoidance.
-Only IDs in valid_candidate_ids may be selected. For move, return
-exactly one listed ID; for a terminal decision, return pose_id=null."""
+Choose both a listed pose and a semantic final heading. Heading names use the
+displayed map: forward=UP, left=LEFT, right=RIGHT, backward=DOWN, with diagonal
+combinations between them. The heading controls where the base and centered
+camera face after arrival; Nav2 still chooses the path.
+
+Use visual evidence, the observation cone, distance, and the existing trace to
+make direct goal progress. This is navigation, not active mapping: uncertainty
+alone is not a reason to move, rotate, inspect frontiers, or gather extra views.
+Do not trade task completion for greater confidence when the current map already
+supports a reasonable choice. Explicitly compare the current evidence with the
+original evidence and prior intent. Follow the prior intent unless concrete new
+evidence proves the goal is reached, blocked, or a different move is necessary.
+Only IDs in the tool enum may be selected. A move requires pose_id and heading;
+terminal decisions require both to be null. Use move_and_finish when reaching
+the selected pose directly completes a bounded command such as nudge, move
+slightly, back up, or rotate. Use ordinary move only when the goal genuinely
+requires another decision after arrival, not merely to gain confidence."""
 
 MODE_GUIDANCE = {
     "goal": """MODE: goal
-Image 2 is the current camera view. Choose between the local poses and
-frontiers to best complete the user's navigation query. R+90, R-90, and R+180
-rotate in place; use them only when looking in another direction is itself the
-best next step. Return goal_reached when the complete semantic goal is already
-satisfied, or blocked when no listed pose can help.""",
+Choose between local poses and frontiers to best complete the user's navigation
+query. For geometric goals such as the middle, side, or corner of a room, trust
+the known free-space layout and choose the most direct plausible local pose;
+the camera need not prove geometric symmetry. A frontier is a last resort only
+when the requested destination clearly lies beyond known space or no local pose
+can make direct goal progress. Never visit a frontier merely to estimate the
+room more precisely.
+
+H holds the current position. Use it only when the requested final heading is
+itself the goal or one new view can resolve concrete contradictory evidence.
+Do not perform a multi-heading verification scan. If the user explicitly asks
+for visual confirmation, use the arrival view and at most one purposeful H
+rotation. After reaching the intended goal pose, return goal_reached unless the
+new evidence shows a specific reason that it is wrong; residual uncertainty is
+not such a reason. For a bounded displacement that one listed pose fulfills,
+return move_and_finish so the robot stops after that Nav2 goal. Return blocked
+when no listed pose can make useful progress.""",
     "context": """MODE: context
 Image 2 is the clue frame selected by search. The orange outline shows the
 reliable close-range portion of that observation; its angular direction
@@ -97,7 +132,9 @@ class NavigateAction:
     NAVIGATION_TIMEOUT = 90.0
     CAMERA_MAX_AGE = 2.0
     JPEG_QUALITY = 75
-    MAX_STEPS = 20
+    # One planning assessment, one Nav2 movement, then one terminal assessment.
+    MAX_STEPS = 1
+    MAX_ASSESSMENTS = 2
     MAX_DURATION = 300.0
 
     def __init__(
@@ -147,6 +184,9 @@ class NavigateAction:
         self._observation = None
         self._max_steps = self.MAX_STEPS
         self._stop_after_first_move = False
+        self._initial_map_jpeg = None
+        self._initial_vision_jpeg = None
+        self._navigation_history = []
 
     async def start(
         self,
@@ -189,10 +229,15 @@ class NavigateAction:
             0 if self._owns_goal_overlay else int(overlay_revision or 0)
         )
         self._goal_search_poses = []
+        self._initial_map_jpeg = None
+        self._initial_vision_jpeg = None
+        self._navigation_history = []
         self._max_steps = max(
             1, min(self.MAX_STEPS, int(max_steps or self.MAX_STEPS))
         )
         self._stop_after_first_move = stop_after_first_move is True
+        if self._stop_after_first_move:
+            self._max_steps = 1
         self.stage = 'selecting'
         self._stop_requested = self._command_sent = False
         self.completion_future = asyncio.get_running_loop().create_future()
@@ -231,7 +276,13 @@ class NavigateAction:
             if self._owns_goal_overlay:
                 await self._publish_goal_overlay()
 
-            for step_number in range(1, self._max_steps + 1):
+            # A normal semantic action gets exactly one planning call and one
+            # terminal arrival call. One-shot bounded/search moves finish after
+            # the first call and never enter the verification phase.
+            assessment_limit = (
+                1 if self._stop_after_first_move else self.MAX_ASSESSMENTS
+            )
+            for assessment_number in range(1, assessment_limit + 1):
                 if time.monotonic() - started_at > self.MAX_DURATION:
                     raise NavigationError(
                         'NAVIGATION_DURATION_LIMIT',
@@ -241,12 +292,8 @@ class NavigateAction:
                 self.stage = 'selecting'
                 self._command_sent = False
                 snapshot, camera_jpeg = await self._capture()
-                selection = (
-                    self._deterministic_selection(snapshot)
-                    if self._mode == 'exploration' and len(self._candidates) == 1
-                    else await self._select_pose(
-                        snapshot, camera_jpeg, step_number
-                    )
+                selection = await self._select_pose(
+                    snapshot, camera_jpeg, assessment_number
                 )
                 decision = selection['decision']
                 self._result_data.update(
@@ -260,8 +307,13 @@ class NavigateAction:
                     return
                 if decision == 'blocked':
                     raise NavigationError('NAVIGATION_BLOCKED', selection['reason'])
+                if len(completed_steps) >= self._max_steps:
+                    raise NavigationError(
+                        'NAVIGATION_STEP_LIMIT',
+                        'The terminal arrival assessment requested another move',
+                    )
                 # Resolve the ID against the exact snapshot shown to vision.
-                destination = dict(self._candidates[selection['pose_id']])
+                destination = self._resolve_destination(selection, snapshot)
                 self._navigation_future = asyncio.get_running_loop().create_future()
                 async with self._command_lock:
                     if self._stop_requested:
@@ -289,14 +341,31 @@ class NavigateAction:
                 if event.get('status') != 'Goal Reached':
                     raise NavigationError('NAVIGATION_FAILED', str(event.get('status')))
                 completed_steps.append({
-                    'step': step_number,
+                    'step': len(completed_steps) + 1,
+                    'assessment': assessment_number,
                     'snapshot_id': self._snapshot_id,
                     'selection': selection,
                     'destination': destination,
                     'robot_status': event.get('status'),
                 })
+                self._navigation_history.append({
+                    'step': len(completed_steps),
+                    'assessment': assessment_number,
+                    'pose_id': selection['pose_id'],
+                    'heading': selection['heading'],
+                    'reasoning': selection['reasoning'],
+                    'next_intent': selection['next_intent'],
+                    'destination': {
+                        key: destination[key]
+                        for key in ('x', 'y', 'yaw')
+                    },
+                    'result': 'waypoint_reached',
+                })
                 self._result_data['step_count'] = len(completed_steps)
                 self._result_data['destination'] = dict(destination)
+                if decision == 'move_and_finish':
+                    self._finish('succeeded', 'goal_reached')
+                    return
                 if self._stop_after_first_move:
                     self._finish('succeeded', 'waypoint_reached')
                     return
@@ -380,19 +449,16 @@ class NavigateAction:
         if not self._candidates:
             raise NavigationError('NO_NAVIGATION_CANDIDATES', 'No reachable map candidates')
 
-        # Contextual modes already carry the exact clue frame. A single
-        # exploration candidate is map-ranked and needs no vision request.
+        # Contextual modes already carry the exact clue frame.
         if self._mode in {'context', 'destination'}:
             return snapshot, None
-        if self._mode == 'exploration' and len(self._candidates) == 1:
-            return snapshot, None
 
-        if self._mode == 'exploration':
+        if self._mode in {'goal', 'exploration'}:
             camera_mover = getattr(self, 'see_action', None)
             if camera_mover is None:
                 raise NavigationError(
                     'CAMERA_CENTER_UNAVAILABLE',
-                    'Exploration pose comparison requires camera centering',
+                    'Navigation map/camera comparison requires camera centering',
                 )
             centered = await camera_mover.move_to_region(
                 region='center',
@@ -466,36 +532,56 @@ class NavigateAction:
             'revision': self._overlay_revision,
         }))
 
-    def _deterministic_selection(self, snapshot):
-        metadata = snapshot.get('metadata') or {}
-        pose_id = metadata.get('selected_pose_id')
-        if not isinstance(pose_id, str) or pose_id not in self._candidates:
+    @staticmethod
+    def _normalize_yaw(yaw):
+        return math.atan2(math.sin(yaw), math.cos(yaw))
+
+    def _resolve_destination(self, selection, snapshot):
+        """Combine a sampled position with the model's robot-relative heading."""
+        destination = dict(self._candidates[selection['pose_id']])
+        robot_pose = (snapshot.get('metadata') or {}).get('robot_pose') or {}
+        try:
+            robot_yaw = float(robot_pose['yaw'])
+            offset = SEMANTIC_HEADINGS[selection['heading']]
+        except (KeyError, TypeError, ValueError) as error:
             raise NavigationError(
-                'INVALID_DETERMINISTIC_SELECTION',
-                'Map planner did not provide one valid selected pose',
-            )
-        candidate = self._candidates[pose_id]
+                'INVALID_NAVIGATION_HEADING',
+                'Map snapshot cannot resolve the selected semantic heading',
+            ) from error
+        destination['sampled_yaw'] = destination.get('yaw')
+        destination['heading'] = selection['heading']
+        destination['yaw'] = self._normalize_yaw(robot_yaw + offset)
+        return destination
+
+    def _build_selection_context(self, step_number):
+        observation = None
+        if self._observation is not None:
+            observation = {
+                key: self._observation.get(key)
+                for key in (
+                    'contextual_clue', 'candidate_type', 'movement_limit',
+                    'movements_used', 'remaining_waypoints',
+                    'reassessment_limit', 'reassessments_used',
+                )
+            }
         return {
-            'decision': 'move',
-            'pose_id': pose_id,
-            'reason': str(
-                candidate.get('selection_reason')
-                or 'map planner deterministic ranking'
-            ),
-            'ranking_score': candidate.get('ranking_score'),
-            'source': 'map_planner',
-        }
-
-    async def _select_pose(self, snapshot, camera_jpeg, step_number):
-        self._request_id = uuid.uuid4().hex
-        self._selection_future = asyncio.get_running_loop().create_future()
-        tool = self._build_selection_tool()
-        map_jpeg = snapshot['jpeg_bytes']
-
-        context = {
             'query': self.target,
             'mode': self._mode,
-            'step': step_number,
+            'completion_mode': (
+                'single_move' if self._stop_after_first_move else 'verify_goal'
+            ),
+            'assessment': step_number,
+            'maximum_assessments': (
+                1 if self._stop_after_first_move else self.MAX_ASSESSMENTS
+            ),
+            'maximum_moves': self._max_steps,
+            'moves_completed': len(self._navigation_history),
+            'moves_remaining': self._max_steps - len(self._navigation_history),
+            'history': list(self._navigation_history),
+            'previous_intent': (
+                self._navigation_history[-1]['next_intent']
+                if self._navigation_history else None
+            ),
             'candidates': {
                 pose_id: {
                     key: candidate.get(key)
@@ -510,32 +596,90 @@ class NavigateAction:
                 }
                 for pose_id, candidate in self._candidates.items()
             },
-            'observation': (
-                {
-                    'contextual_clue': self._observation.get('contextual_clue'),
-                    'candidate_type': self._observation.get('candidate_type'),
-                    'movement_limit': self._observation.get('movement_limit'),
-                    'movements_used': self._observation.get('movements_used'),
-                    'remaining_waypoints': self._observation.get(
-                        'remaining_waypoints'
-                    ),
-                    'reassessment_limit': self._observation.get(
-                        'reassessment_limit'
-                    ),
-                    'reassessments_used': self._observation.get(
-                        'reassessments_used'
-                    ),
-                }
-                if self._observation is not None else None
-            ),
+            'observation': observation,
         }
-        prompt = (
+
+    def _build_selection_prompt(self, context, step_number):
+        if context['completion_mode'] == 'single_move':
+            sequence_guidance = (
+                'This is a one-shot bounded movement. Select the one pose and '
+                'heading that fulfills it, use move_and_finish, and do not plan '
+                'a later reassessment.'
+            )
+        elif context['moves_remaining'] == 0:
+            sequence_guidance = (
+                'This is call 2 of 2: the final arrival assessment. Images 1 '
+                'and 2 are the original state; Images 3 and 4 are the state '
+                'after the one permitted movement. Compare them against the '
+                'recorded arrival condition. Return goal_reached when the goal '
+                'is reasonably satisfied; otherwise return blocked with the '
+                'specific contradiction. This call is terminal: do not request '
+                'another move, correction, rotation, or exploratory view.'
+            )
+        elif step_number == 1:
+            sequence_guidance = (
+                'This is call 1 of 2 and the only planning call. Choose the one '
+                'pose and heading most likely to fulfill the complete goal. '
+                'The next call can only judge the arrival; it cannot make a '
+                'correction. State a concrete arrival condition, not an '
+                'information-gathering or multi-step plan.'
+            )
+        else:
+            sequence_guidance = (
+                'Images 1 and 2 are the original state. Images 3 and 4 are the '
+                'current state after the recorded moves. Check whether the prior '
+                'intent succeeded before choosing another move. If the previous '
+                'move targeted the intended goal pose and there is no concrete '
+                'contradiction, declare goal_reached now. Do not move or rotate '
+                'again merely to become more certain.'
+            )
+        return (
             MAP_GUIDANCE
             + '\n\n'
             + MODE_GUIDANCE[self._mode]
+            + '\n\nSEQUENCE GUIDANCE\n'
+            + sequence_guidance
             + '\n\nLIVE CONTEXT\n'
             + json.dumps(context, allow_nan=False)
         )
+
+    def _build_selection_content(
+        self, prompt, map_jpeg, vision_jpeg, step_number
+    ):
+        if self._initial_map_jpeg is None:
+            self._initial_map_jpeg = bytes(map_jpeg)
+            self._initial_vision_jpeg = bytes(vision_jpeg)
+        if step_number == 1:
+            image_pairs = (
+                ('CURRENT MAP (Image 1)', map_jpeg),
+                ('CURRENT VISION (Image 2)', vision_jpeg),
+            )
+        else:
+            image_pairs = (
+                ('ORIGINAL MAP (Image 1)', self._initial_map_jpeg),
+                ('ORIGINAL VISION (Image 2)', self._initial_vision_jpeg),
+                ('CURRENT MAP (Image 3)', map_jpeg),
+                ('CURRENT VISION (Image 4)', vision_jpeg),
+            )
+        content = [{'type': 'input_text', 'text': prompt}]
+        for label, jpeg_bytes in image_pairs:
+            content.extend((
+                {'type': 'input_text', 'text': label},
+                {
+                    'type': 'input_image',
+                    'image_url': 'data:image/jpeg;base64,'
+                    + base64.b64encode(jpeg_bytes).decode('ascii'),
+                },
+            ))
+        return content
+
+    async def _select_pose(self, snapshot, camera_jpeg, step_number):
+        self._request_id = uuid.uuid4().hex
+        self._selection_future = asyncio.get_running_loop().create_future()
+        tool = self._build_selection_tool()
+        map_jpeg = snapshot['jpeg_bytes']
+        context = self._build_selection_context(step_number)
+        prompt = self._build_selection_prompt(context, step_number)
         vision_jpeg = (
             camera_jpeg
             if self._mode in {'goal', 'exploration'}
@@ -545,17 +689,9 @@ class NavigateAction:
             vision_jpeg, snapshot['metadata'], context, prompt, tool,
             step_number, self._request_id,
         )
-        content = [{'type': 'input_text', 'text': prompt}]
-        content.append({
-            'type': 'input_image',
-            'image_url': 'data:image/jpeg;base64,'
-            + base64.b64encode(map_jpeg).decode('ascii'),
-        })
-        content.append({
-            'type': 'input_image',
-            'image_url': 'data:image/jpeg;base64,'
-            + base64.b64encode(vision_jpeg).decode('ascii'),
-        })
+        content = self._build_selection_content(
+            prompt, map_jpeg, vision_jpeg, step_number
+        )
         try:
             await self.ws.send(json.dumps({
                 'event_id': f'navigate_vision_{self._request_id}', 'type': 'response.create',
@@ -578,13 +714,25 @@ class NavigateAction:
             self._selection_future = None
 
     def _build_selection_tool(self):
-        """Limit the model's pose choices to candidates in the current snapshot."""
+        """Expose only decisions valid for this phase of the two-call contract."""
         tool = copy.deepcopy(self.selection_tool_template)
-        valid_pose_ids = list(self._candidates)
-        valid_pose_ids.append(None)
-
-        pose_id_parameter = tool['parameters']['properties']['pose_id']
-        pose_id_parameter['enum'] = valid_pose_ids
+        properties = tool['parameters']['properties']
+        terminal_assessment = (
+            not self._stop_after_first_move
+            and len(self._navigation_history) >= self._max_steps
+        )
+        if terminal_assessment:
+            properties['decision']['enum'] = ['goal_reached', 'blocked']
+            properties['pose_id']['enum'] = [None]
+            properties['heading']['enum'] = [None]
+        else:
+            properties['pose_id']['enum'] = [*self._candidates, None]
+            if self._stop_after_first_move:
+                properties['decision']['enum'] = ['move_and_finish', 'blocked']
+            else:
+                properties['decision']['enum'] = [
+                    'move', 'goal_reached', 'blocked'
+                ]
         return tool
 
     async def select_navigation_pose(self, args, response_metadata):
@@ -600,35 +748,78 @@ class NavigateAction:
             return
         decision = args.get('decision')
         pose_id = args.get('pose_id')
+        heading = args.get('heading')
         if self._mode != 'goal' and decision == 'goal_reached':
             decision = 'blocked'
             pose_id = None
+            heading = None
             args = {
                 **args,
-                'reason': (
+                'reasoning': (
                     'Search target claims are verified by the detector/search action; '
-                    + str(args.get('reason') or 'no navigation waypoint selected')
+                    + str(args.get('reasoning') or 'no navigation waypoint selected')
                 ),
             }
-        if decision not in {'move', 'goal_reached', 'blocked'}:
+        move_decisions = {'move', 'move_and_finish'}
+        if decision not in move_decisions | {'goal_reached', 'blocked'}:
             future.set_exception(NavigationError(
                 'INVALID_NAVIGATION_DECISION', 'Vision returned an unknown decision'
+            ))
+            return
+        if decision == 'move_and_finish' and not self._stop_after_first_move:
+            future.set_exception(NavigationError(
+                'INVALID_NAVIGATION_DECISION',
+                'move_and_finish is only valid for a one-shot bounded movement',
+            ))
+            return
+        if (
+            decision in move_decisions
+            and not self._stop_after_first_move
+            and len(self._navigation_history) >= self._max_steps
+        ):
+            future.set_exception(NavigationError(
+                'INVALID_NAVIGATION_DECISION',
+                'The second navigation assessment must be terminal',
             ))
             return
         if 'pose_id' not in args or (pose_id is not None and (
                 not isinstance(pose_id, str) or pose_id not in self._candidates)):
             future.set_exception(NavigationError('INVALID_POSE_ID', 'Vision returned an unknown pose ID'))
             return
-        if (decision == 'move') != (pose_id is not None):
+        if (decision in move_decisions) != (pose_id is not None):
             future.set_exception(NavigationError(
                 'INVALID_NAVIGATION_DECISION',
-                'move requires a pose ID; terminal decisions require pose_id=null',
+                'move decisions require a pose ID; terminal decisions require pose_id=null',
+            ))
+            return
+        if decision in move_decisions:
+            if heading not in SEMANTIC_HEADINGS:
+                future.set_exception(NavigationError(
+                    'INVALID_NAVIGATION_HEADING',
+                    'move requires one valid semantic heading',
+                ))
+                return
+        elif heading is not None:
+            future.set_exception(NavigationError(
+                'INVALID_NAVIGATION_HEADING',
+                'terminal decisions require heading=null',
+            ))
+            return
+        reasoning = str(args.get('reasoning') or '').strip()
+        next_intent = str(args.get('next_intent') or '').strip()
+        if not reasoning or not next_intent:
+            future.set_exception(NavigationError(
+                'INVALID_NAVIGATION_RATIONALE',
+                'Every decision requires explicit reasoning and a next-intent summary',
             ))
             return
         future.set_result({
             'decision': decision,
             'pose_id': pose_id,
-            'reason': str(args.get('reason') or ''),
+            'heading': heading,
+            'reasoning': reasoning,
+            'next_intent': next_intent,
+            'reason': reasoning,
         })
 
 

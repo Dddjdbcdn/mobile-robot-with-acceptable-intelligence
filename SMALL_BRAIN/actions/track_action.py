@@ -40,23 +40,37 @@ SKELETON_GRAPH = {
     "right_eye": ["nose", "right_ear"],
     "left_ear": ["left_eye", "left_shoulder"],
     "right_ear": ["right_eye", "right_shoulder"],
-    "left_shoulder": ["left_ear", "right_shoulder", "left_elbow", "left_hip"],
-    "right_shoulder": ["right_ear", "left_shoulder", "right_elbow", "right_hip"],
+    "left_shoulder": [
+        "left_ear", "right_shoulder", "left_elbow", "left_hip",
+        "torso_center",
+    ],
+    "right_shoulder": [
+        "right_ear", "left_shoulder", "right_elbow", "right_hip",
+        "torso_center",
+    ],
     "left_elbow": ["left_shoulder", "left_wrist"],
     "right_elbow": ["right_shoulder", "right_wrist"],
     "left_wrist": ["left_elbow"],
     "right_wrist": ["right_elbow"],
-    "left_hip": ["left_shoulder", "right_hip", "left_knee"],
-    "right_hip": ["right_shoulder", "left_hip", "right_knee"],
+    "left_hip": [
+        "left_shoulder", "right_hip", "left_knee", "torso_center",
+    ],
+    "right_hip": [
+        "right_shoulder", "left_hip", "right_knee", "torso_center",
+    ],
     "left_knee": ["left_hip", "left_ankle"],
     "right_knee": ["right_hip", "right_ankle"],
     "left_ankle": ["left_knee"],
     "right_ankle": ["right_knee"],
+    "torso_center": [
+        "left_shoulder", "right_shoulder", "left_hip", "right_hip",
+    ],
 }
 
 HUMAN_RETARGETS = {
-    "person": ["nose"],
-    "human": ["nose"],
+    "person": ["torso_center"],
+    "human": ["torso_center"],
+    "torso_center": ["torso_center"],
     "face": ["nose"],
     "head": ["nose"],
 
@@ -101,7 +115,8 @@ def normalize_human_target(target):
     if "left" in words: side = "left"
     elif "right" in words: side = "right"
 
-    if "hand" in words or "wrist" in words: part = "hand"
+    if "torso" in words or "body" in words: part = "torso_center"
+    elif "hand" in words or "wrist" in words: part = "hand"
     elif "leg" in words: part = "leg"
     elif "foot" in words or "feet" in words or "ankle" in words: part = "feet"
     elif "eye" in words or "eyes" in words: part = "eye"
@@ -245,17 +260,30 @@ class TrackAction():
     OBJECT_FAILURE_GRACE_FRAMES = 3
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
-    PERSON_STABLE_FRAMES = 2
+    PERSON_STABLE_FRAMES = 5
     PERSON_POINT_BASE_TOLERANCE_M = 0.20
     PERSON_MAX_SPEED_MPS = 2.0
     PERSON_POINT_MAX_AGE_SECONDS = 0.50
     PERSON_POINT_RESET_SECONDS = 0.75
+    PERSON_STABILITY_UPDATE_HZ = 5.0
 
-    def __init__(self, csrt_tracker, yolo, grounding_dino, camera, zmq_pub_socket, send_robot_command, STABLE_THRESHOLD=0.05, semantic_memory=None):
+    def __init__(
+        self,
+        csrt_tracker,
+        yolo,
+        grounding_dino,
+        camera,
+        zmq_pub_socket,
+        send_robot_command,
+        STABLE_THRESHOLD=0.05,
+        semantic_memory=None,
+        person_tracker_pub_socket=None,
+    ):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
         self.yolo = yolo
         self.zmq_pub_socket = zmq_pub_socket
+        self.person_tracker_pub_socket = person_tracker_pub_socket
         self.send_robot_command = send_robot_command
         self.camera = camera
 
@@ -275,6 +303,7 @@ class TrackAction():
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = True
+        self._continuous_person_reacquisition = False
         self._yolo_owner = None
         # Persist across tracker loss so approach can reacquire after moving.
         self.last_stable_target_location = None
@@ -282,7 +311,13 @@ class TrackAction():
         self.person_path = []
         self.person_path_index = 0
 
-    async def start_tracking(self,target,action_id,allow_grounding_dino=True):
+    async def start_tracking(
+        self,
+        target,
+        action_id,
+        allow_grounding_dino=True,
+        continuous_person_reacquisition=False,
+    ):
         if self.active:
             await self.stop_tracking(
                 reason_code="REPLACED",
@@ -302,6 +337,9 @@ class TrackAction():
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = allow_grounding_dino
+        self._continuous_person_reacquisition = bool(
+            continuous_person_reacquisition
+        )
         self.last_stable_target_location = None
 
         yolo_sequence = None
@@ -642,6 +680,7 @@ class TrackAction():
 
         self.active = True
         self.completion_future = asyncio.get_running_loop().create_future()
+        await self._publish_person_tracking_state(True)
         self._tracking_task = asyncio.create_task(self._person_tracking_loop())
 
         return ActionResult(
@@ -686,12 +725,83 @@ class TrackAction():
                 queue.append((neighbor,path + [neighbor]))
         return None
 
+    @staticmethod
+    def _person_keypoint(person, name):
+        if name != "torso_center":
+            return person["keypoints"].get(name)
+
+        keypoints = person.get("keypoints") or {}
+        shoulders = [
+            keypoints[name]
+            for name in ("left_shoulder", "right_shoulder")
+            if name in keypoints
+        ]
+        hips = [
+            keypoints[name]
+            for name in ("left_hip", "right_hip")
+            if name in keypoints
+        ]
+        if shoulders and hips:
+            shoulder_x = sum(p["normalized_x"] for p in shoulders) / len(shoulders)
+            shoulder_y = sum(p["normalized_y"] for p in shoulders) / len(shoulders)
+            hip_x = sum(p["normalized_x"] for p in hips) / len(hips)
+            hip_y = sum(p["normalized_y"] for p in hips) / len(hips)
+            return {
+                "normalized_x": (shoulder_x + hip_x) * 0.5,
+                "normalized_y": (shoulder_y + hip_y) * 0.5,
+            }
+
+        bbox = person.get("bbox") or {}
+        center_x = bbox.get("normalized_center_x")
+        center_y = bbox.get("normalized_center_y")
+        if isinstance(center_x, (int, float)) and isinstance(
+            center_y, (int, float)
+        ):
+            return {
+                "normalized_x": float(center_x),
+                "normalized_y": float(center_y),
+            }
+        return None
+
     def _reset_person_stability(self, clear_point=False):
         self.person_stable = False
         self.person_stable_tick = 0
         if clear_point:
             self._last_valid_person_point = None
             self._last_valid_person_timestamp = None
+
+    async def _publish_stable_person_position(self):
+        if self.person_tracker_pub_socket is None:
+            return
+        camera_state = robot_state.get("camera") or {}
+        x = camera_state.get("object_x")
+        y = camera_state.get("object_y")
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in (x, y)
+        ):
+            return
+        await self.person_tracker_pub_socket.send_json({
+            "type": "person_tof_position",
+            "x": float(x),
+            "y": float(y),
+            "frame_id": "base_footprint",
+            "sent_at_unix_ns": time.time_ns(),
+            "action_id": self.action_id,
+        })
+
+    async def _publish_person_tracking_state(self, active, action_id=None):
+        if self.person_tracker_pub_socket is None:
+            return
+        await self.person_tracker_pub_socket.send_json({
+            "type": "person_tracking_state",
+            "active": bool(active),
+            "action_id": self.action_id if action_id is None else action_id,
+        })
+
+    async def keep_person_tracker_alive(self, action_id):
+        """Keep lidar tracking enabled between visual reacquisition attempts."""
+        await self._publish_person_tracking_state(True, action_id=action_id)
 
     def _update_person_stability(self, person):
         """Validate a fresh ToF point against the pose mask and recent motion."""
@@ -798,16 +908,26 @@ class TrackAction():
         keypoint_timeout_seconds = 2.0
         loop = asyncio.get_running_loop()
         last_inference_sequence = None
+        last_stability_update_at = None
+        last_lidar_heartbeat_at = loop.time()
 
         while self.active:
-            inference_sequence, inference_detections = (
-                self.yolo.detection_snapshot()
+            if loop.time() - last_lidar_heartbeat_at >= 1.0:
+                await self._publish_person_tracking_state(True)
+                last_lidar_heartbeat_at = loop.time()
+            (
+                inference_sequence,
+                inference_detections,
+                inference_timing,
+            ) = (
+                self.yolo.detection_snapshot_with_timing()
             )
             if inference_sequence == last_inference_sequence:
                 if (
                     missing_person_since is not None
                     and loop.time() - missing_person_since
                     >= keypoint_timeout_seconds
+                    and not self._continuous_person_reacquisition
                 ):
                     await self.stop_tracking(
                         reason_code="PERSON_LOST",
@@ -829,7 +949,11 @@ class TrackAction():
                 self._reset_person_stability()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
-                elif loop.time() - missing_person_since >= keypoint_timeout_seconds:
+                elif (
+                    loop.time() - missing_person_since
+                    >= keypoint_timeout_seconds
+                    and not self._continuous_person_reacquisition
+                ):
                     await self.stop_tracking(
                         reason_code="PERSON_LOST",
                         status="failed",
@@ -844,10 +968,19 @@ class TrackAction():
                 detections,
                 key=lambda detection: detection["confidence"]
             )
-            self._update_person_stability(person)
+            now = loop.time()
+            stability_update_interval = 1.0 / self.PERSON_STABILITY_UPDATE_HZ
+            if (
+                last_stability_update_at is None
+                or now - last_stability_update_at >= stability_update_interval
+            ):
+                self._update_person_stability(person)
+                if self.target in human_trackable_parts and self.person_stable:
+                    await self._publish_stable_person_position()
+                last_stability_update_at = now
 
             current_name = self.person_path[self.person_path_index]
-            current_keypoint = person["keypoints"].get(current_name)
+            current_keypoint = self._person_keypoint(person, current_name)
 
             if not current_reached:
                 if current_keypoint is None:
@@ -856,6 +989,7 @@ class TrackAction():
                     elif (
                         loop.time() - missing_keypoint_since
                         >= keypoint_timeout_seconds
+                        and not self._continuous_person_reacquisition
                     ):
                         await self.stop_tracking(
                             reason_code="PERSON_KEYPOINT_TIMEOUT",
@@ -873,7 +1007,7 @@ class TrackAction():
             if self.person_path_index < len(self.person_path) - 1:
                 if current_reached:
                     next_name = self.person_path[self.person_path_index + 1]
-                    next_keypoint = person["keypoints"].get(next_name)
+                    next_keypoint = self._person_keypoint(person, next_name)
 
                     if next_keypoint is not None:
                         self.person_path_index += 1
@@ -897,23 +1031,54 @@ class TrackAction():
 
             delta_pan_angle,delta_tilt_angle = self.target_to_angles(target_x,target_y)
 
+            command_created_at = time.monotonic()
+            captured_at = inference_timing.get("source_captured_at")
+            inference_started_at = inference_timing.get("inference_started_at")
+            inference_completed_at = inference_timing.get("inference_completed_at")
+            tracking_timing = {"sent_at_unix_ns": time.time_ns()}
+            if all(
+                isinstance(value, (int, float))
+                for value in (
+                    captured_at,
+                    inference_started_at,
+                    inference_completed_at,
+                )
+            ):
+                tracking_timing.update({
+                    "capture_to_send_ms": max(
+                        0.0, (command_created_at - captured_at) * 1000.0
+                    ),
+                    "capture_wait_ms": max(
+                        0.0, (inference_started_at - captured_at) * 1000.0
+                    ),
+                    "inference_ms": max(
+                        0.0,
+                        (inference_completed_at - inference_started_at) * 1000.0,
+                    ),
+                    "post_inference_ms": max(
+                        0.0,
+                        (command_created_at - inference_completed_at) * 1000.0,
+                    ),
+                })
+
             await self.zmq_pub_socket.send_json({
                 "delta_pan_angle": delta_pan_angle,
                 "delta_tilt_angle": delta_tilt_angle,
                 "tracking_sequence": f"pose:{inference_sequence}",
+                "tracking_timing": tracking_timing,
             })
 
             if self.person_path_index == len(self.person_path) - 1:
                 if (abs(target_x-0.5) < self.stable_threshold and abs(target_y-0.5) < self.stable_threshold):
                     self.stable_tick += 1
-                    if self.stable_tick >= 10:
+                    if self.stable_tick >= 5:
                         self.stable = True
                         await self._remember_stable_target()
                 else:
                     self.stable_tick = 0
                     self.stable = False
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
     def predict_next_keypoint(self,person):
         if self.person_path_index == 0:
@@ -992,11 +1157,21 @@ class TrackAction():
             return
 
         tracking_task = self._tracking_task
+        was_person_tracking = self.target in human_trackable_parts
+        person_action_id = self.action_id
+        preserve_person_tracker = (
+            was_person_tracking
+            and status == "failed"
+            and self._continuous_person_reacquisition
+        )
+        effective_reset_camera = (
+            reset_camera is not False and not preserve_person_tracker
+        )
 
         await self.send_robot_command({
             "command": "stop_tracking",
             "action_id": self.action_id,
-            "reset_camera": reset_camera is not False,
+            "reset_camera": effective_reset_camera,
         })
 
         result = self.complete_tracking(
@@ -1012,6 +1187,11 @@ class TrackAction():
         ):
             tracking_task.cancel()
             await asyncio.gather(tracking_task, return_exceptions=True)
+
+        if was_person_tracking and not preserve_person_tracker:
+            await self._publish_person_tracking_state(
+                False, action_id=person_action_id
+            )
 
         return result
 
@@ -1049,6 +1229,7 @@ class TrackAction():
         self.stable_tick = 0
         self._reset_person_stability(clear_point=True)
         self.active = False
+        self._continuous_person_reacquisition = False
         self.csrt_tracker.stop_tracking()
         self.action_id = None
         self.target = None

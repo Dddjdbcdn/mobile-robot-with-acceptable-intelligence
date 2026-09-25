@@ -842,7 +842,7 @@ class SearchAction:
                 key: value for key, value in clue_frame.items()
                 if key in allowed_frame_keys
             }
-            if clue_frame is not None and is_middle_layer(clue_frame) else None
+            if clue_frame is not None and abs(float(clue_frame["tilt_angle"])- TILT_POSITION_ANGLE["center"]) <= 1.0 else None
         )
         self.last_contextual_clue = clue
         self.last_found_target = self.target if status == "succeeded" else None

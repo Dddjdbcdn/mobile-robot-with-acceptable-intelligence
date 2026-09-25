@@ -21,13 +21,15 @@ import tf2_geometry_msgs
 import time
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from robot.follow_goal_generator import FollowGoalGenerator, FollowGoalSettings
 from robot.room_geometry import RoomGeometryEstimator
 from robot.map_stream import MapImageStream
 
 class CameraServo():
-    def __init__(self, pan_pub, tilt_pub):
+    def __init__(self, pan_pub, tilt_pub, logger=None):
         self.servo_pan_pub = pan_pub
         self.servo_tilt_pub = tilt_pub
+        self.logger = logger
         self.reset_pan_angle = 95.0
         self.reset_tilt_angle = 90.0
         
@@ -42,19 +44,97 @@ class CameraServo():
         self.delta_pan_angle = 0.0
         self.delta_tilt_angle = 0.0
         self.tracking_sequence = None
+        self.tracking_timing = None
+        self.tracking_received_at = None
+        self.tracking_received_unix_ns = None
+        self.last_visual_pan_error = 0.0
+        self.last_visual_at = None
         self.last_applied_tracking_sequence = None
         self.command_lock = threading.Lock()
-        self.Kp = 0.1
+        self._latency_window_started = time.monotonic()
+        self._latency_samples = []
+        self.Kp = 0.15
 
         self.deadband_degrees = 0.5
-        self.max_delta_angle = 90.0
-        self.max_step_degrees = 5
+        self.max_step_degrees = 4
 
-    def set_error(self, pan, tilt, tracking_sequence=None):
+    def set_error(self, pan, tilt, tracking_sequence=None, tracking_timing=None):
         with self.command_lock:
             self.delta_pan_angle = float(pan)
             self.delta_tilt_angle = float(tilt)
             self.tracking_sequence = tracking_sequence
+            self.tracking_timing = tracking_timing
+            self.tracking_received_at = time.monotonic()
+            self.tracking_received_unix_ns = time.time_ns()
+            if tracking_sequence is not None:
+                self.last_visual_pan_error = float(pan)
+                self.last_visual_at = self.tracking_received_at
+
+    def tracking_snapshot(self):
+        with self.command_lock:
+            return {
+                "pan_angle": self.pan_angle,
+                "pan_error": self.last_visual_pan_error,
+                "observed_at": self.last_visual_at,
+            }
+
+    @staticmethod
+    def _latency_percentile(values, fraction):
+        ordered = sorted(values)
+        index = max(0, math.ceil(len(ordered) * fraction) - 1)
+        return ordered[index]
+
+    def _record_tracking_latency(self, timing, received_at, received_unix_ns):
+        if not isinstance(timing, dict) or received_at is None:
+            return
+
+        capture_to_send_ms = timing.get("capture_to_send_ms")
+        sent_at_unix_ns = timing.get("sent_at_unix_ns")
+        if not isinstance(capture_to_send_ms, (int, float)):
+            return
+
+        published_at = time.monotonic()
+        queue_ms = max(0.0, (published_at - received_at) * 1000.0)
+        transport_ms = 0.0
+        if isinstance(sent_at_unix_ns, int) and received_unix_ns is not None:
+            transport_ms = max(
+                0.0, (received_unix_ns - sent_at_unix_ns) / 1_000_000.0
+            )
+
+        self._latency_samples.append({
+            "total": float(capture_to_send_ms) + transport_ms + queue_ms,
+            "capture_wait": float(timing.get("capture_wait_ms") or 0.0),
+            "inference": float(timing.get("inference_ms") or 0.0),
+            "post_inference": float(timing.get("post_inference_ms") or 0.0),
+            "transport": transport_ms,
+            "queue": queue_ms,
+        })
+
+        now = time.monotonic()
+        if now - self._latency_window_started < 1.0:
+            return
+
+        samples = self._latency_samples
+        self._latency_samples = []
+        self._latency_window_started = now
+        if not samples or self.logger is None:
+            return
+
+        def average(name):
+            return sum(sample[name] for sample in samples) / len(samples)
+
+        totals = [sample["total"] for sample in samples]
+        self.logger.info(
+            "[TRACK LATENCY] capture->ROS-servo-publish "
+            f"avg={average('total'):.1f}ms "
+            f"p95={self._latency_percentile(totals, 0.95):.1f}ms "
+            f"max={max(totals):.1f}ms; stage averages: "
+            f"camera-wait={average('capture_wait'):.1f}ms, "
+            f"YOLO={average('inference'):.1f}ms, "
+            f"tracking={average('post_inference'):.1f}ms, "
+            f"ZMQ={average('transport'):.1f}ms, "
+            f"timer-queue={average('queue'):.1f}ms (n={len(samples)})"
+        )
 
     def publish_servo_command(self,tracking=False):
         remaining_pan_angle = 0.0
@@ -72,10 +152,16 @@ class CameraServo():
 
             delta_pan_angle = self.delta_pan_angle
             delta_tilt_angle = self.delta_tilt_angle
+            tracking_timing = self.tracking_timing
+            tracking_received_at = self.tracking_received_at
+            tracking_received_unix_ns = self.tracking_received_unix_ns
             if tracking and self.tracking_sequence is not None:
                 self.last_applied_tracking_sequence = self.tracking_sequence
             self.delta_pan_angle = 0.0
             self.delta_tilt_angle = 0.0
+            self.tracking_timing = None
+            self.tracking_received_at = None
+            self.tracking_received_unix_ns = None
 
         if abs(delta_pan_angle) < self.deadband_degrees:
             delta_pan_angle = 0.0
@@ -119,6 +205,12 @@ class CameraServo():
 
         self.servo_tilt_pub.publish(tilt_msg)
         self.servo_pan_pub.publish(pan_msg)
+        # if tracking:
+        #     self._record_tracking_latency(
+        #         tracking_timing,
+        #         tracking_received_at,
+        #         tracking_received_unix_ns,
+        #     )
 
         return remaining_pan_angle
         
@@ -160,7 +252,28 @@ class LLMRosBridge(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.servo = CameraServo(self.servo_pan_pub,self.servo_tilt_pub)
+        self.servo = CameraServo(
+            self.servo_pan_pub,
+            self.servo_tilt_pub,
+            self.get_logger(),
+        )
+        self.declare_parameter("follow_standoff_m", 0.90)
+        self.declare_parameter("follow_heading_comfort_deg", 20.0)
+        self.declare_parameter("follow_heading_critical_deg", 45.0)
+        self.follow_goal_generator = FollowGoalGenerator(
+            FollowGoalSettings(
+                standoff_m=float(
+                    self.get_parameter("follow_standoff_m").value
+                ),
+                camera_center_deg=self.servo.reset_pan_angle,
+                heading_comfort_deg=float(
+                    self.get_parameter("follow_heading_comfort_deg").value
+                ),
+                heading_critical_deg=float(
+                    self.get_parameter("follow_heading_critical_deg").value
+                ),
+            )
+        )
         self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
 
         self.camera_tof_range = 0.0
@@ -184,7 +297,6 @@ class LLMRosBridge(Node):
             self.astra_camera_info_callback,
             qos,
         )
-        self.create_subscription(String, '/yolo/detections', self.yolo_callback, 10)
 
         map_qos = QoSProfile(
             depth=1,
@@ -193,6 +305,7 @@ class LLMRosBridge(Node):
         )
         self.map_message = None
         self.robot_pose = None
+        self.robot_pose_at = None
         self.room_geometry = None
         self.room_geometry_estimator = RoomGeometryEstimator()
         self.create_subscription(
@@ -212,9 +325,33 @@ class LLMRosBridge(Node):
         self.navigation_active = False
         self.navigation_mode = None
         self.nav_goal_generation = 0
+        self.follow_enabled = False
+        self.follow_action_id = None
+        self.person_tracker_state = None
+        self.follow_had_person_track = False
+        self.latest_person_pose_map = None
+        self.latest_person_pose_at = None
+        self.pending_person_pose = None
+        self.last_follow_goal = None
+        self.last_follow_goal_at = None
         self.moving_active = False
         self.tracking_body_active = False
         self.max_tracking_time = 10.0
+        self.create_subscription(
+            PoseStamped, "/person_pose", self.person_pose_callback, 10
+        )
+        self.create_subscription(
+            String,
+            "/person_tracker/status",
+            self.person_tracker_status_callback,
+            10,
+        )
+        self.person_pose_timer = self.create_timer(
+            0.1, self.process_pending_person_pose
+        )
+        self.follow_goal_timer = self.create_timer(
+            0.4, self.update_follow_goal
+        )
 
         self.zmq_thread = threading.Thread(target=self.listen_for_llm, daemon=True)
         self.zmq_thread.start()
@@ -287,9 +424,175 @@ class LLMRosBridge(Node):
 
         if pose is not None:
             self.robot_pose = pose
+            self.robot_pose_at = time.monotonic()
 
     def map_callback(self, msg):
         self.map_message = msg
+
+    def person_pose_callback(self, msg):
+        """Keep the newest lidar pose until its map transform is available."""
+        self.pending_person_pose = msg
+        self.process_pending_person_pose()
+
+    def person_tracker_status_callback(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+
+        state = str(status.get("state") or "")
+        previous = self.person_tracker_state
+        self.person_tracker_state = state
+        if not self.follow_enabled:
+            return
+
+        if state in {"tracking", "coasting", "recovering"}:
+            self.follow_had_person_track = True
+        if (
+            state == "lost"
+            and previous != "lost"
+            and self.follow_had_person_track
+        ):
+            self.send_event(
+                "person_tracker",
+                "lost",
+                self.follow_action_id,
+            )
+
+    def process_pending_person_pose(self):
+        msg = self.pending_person_pose
+        if msg is None:
+            return
+
+        try:
+            pose_map = (
+                msg
+                if msg.header.frame_id == "map"
+                else self.tf_buffer.transform(
+                    msg,
+                    "map",
+                    timeout=rclpy.duration.Duration(seconds=0.05),
+                )
+            )
+        except Exception as error:
+            self.get_logger().warning(
+                f"Waiting to transform /person_pose to map: {error}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        # A newer callback may have replaced this pose while TF was queried.
+        if self.pending_person_pose is not msg:
+            return
+        self.pending_person_pose = None
+        pose_map.header.stamp = self.get_clock().now().to_msg()
+        self.latest_person_pose_map = pose_map
+        self.latest_person_pose_at = time.monotonic()
+
+    @staticmethod
+    def _angle_distance(first, second):
+        return abs((first - second + math.pi) % (2.0 * math.pi) - math.pi)
+
+    @staticmethod
+    def _angle_distance_signed(first, second):
+        return (first - second + math.pi) % (2.0 * math.pi) - math.pi
+
+    def update_follow_goal(self):
+        """Publish a stable standoff goal with adaptive camera-cone yaw."""
+        if not self.follow_enabled:
+            return
+
+        now = time.monotonic()
+        if (
+            self.latest_person_pose_map is None
+            or self.latest_person_pose_at is None
+            or now - self.latest_person_pose_at > 0.75
+            or self.robot_pose is None
+            or self.robot_pose_at is None
+            or now - self.robot_pose_at > 0.50
+        ):
+            return
+
+        camera = self.servo.tracking_snapshot()
+        observed_at = camera["observed_at"]
+        camera_fresh = (
+            observed_at is not None and now - observed_at <= 0.30
+        )
+        # Include the newest image error so the goal can react before the
+        # physical camera has completed its next servo step.
+        camera_pan = camera["pan_angle"] + camera["pan_error"]
+        person = self.latest_person_pose_map.pose.position
+        if not camera_fresh:
+            lidar_deviation = self._angle_distance_signed(
+                math.atan2(
+                    float(person.y) - float(self.robot_pose["y"]),
+                    float(person.x) - float(self.robot_pose["x"]),
+                ),
+                float(self.robot_pose["yaw"]),
+            )
+            desired_pan = self.servo.reset_pan_angle + math.degrees(
+                lidar_deviation
+            )
+            desired_pan = max(
+                self.servo.min_pan_angle,
+                min(self.servo.max_pan_angle, desired_pan),
+            )
+            self.servo.set_error(
+                desired_pan - float(camera["pan_angle"]),
+                0.0,
+            )
+            self.servo.publish_servo_command(tracking=True)
+        generated = self.follow_goal_generator.generate(
+            person_x=float(person.x),
+            person_y=float(person.y),
+            robot_x=float(self.robot_pose["x"]),
+            robot_y=float(self.robot_pose["y"]),
+            robot_yaw=float(self.robot_pose["yaw"]),
+            camera_pan_deg=camera_pan,
+            camera_fresh=camera_fresh,
+        )
+        if generated is None:
+            return
+
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = generated.x
+        goal_pose.pose.position.y = generated.y
+        goal_pose.pose.orientation.z = math.sin(generated.yaw * 0.5)
+        goal_pose.pose.orientation.w = math.cos(generated.yaw * 0.5)
+
+        should_publish = self.last_follow_goal is None
+        if self.last_follow_goal is not None:
+            previous_x, previous_y, previous_yaw = self.last_follow_goal
+            position_change = math.hypot(
+                generated.x - previous_x,
+                generated.y - previous_y,
+            )
+            yaw_change = self._angle_distance(generated.yaw, previous_yaw)
+            refresh_due = (
+                self.last_follow_goal_at is None
+                or now - self.last_follow_goal_at >= 0.8
+            )
+            should_publish = (
+                position_change >= 0.10
+                or yaw_change >= math.radians(5.0)
+                or refresh_due
+            )
+
+        if not self.navigation_active:
+            self.start_follow_navigation(goal_pose)
+            should_publish = True
+        elif self.navigation_mode == "follow" and should_publish:
+            self.goal_update_pub.publish(goal_pose)
+
+        if should_publish:
+            self.last_follow_goal = (
+                generated.x,
+                generated.y,
+                generated.yaw,
+            )
+            self.last_follow_goal_at = now
 
     def update_room_geometry(self):
         pose = self.robot_pose
@@ -355,21 +658,6 @@ class LLMRosBridge(Node):
         ).encode("utf-8")
         self._publish_astra_stream(b"astra/camera_info", payload)
 
-    def yolo_callback(self, msg):
-        try:
-            payload = json.loads(msg.data)
-
-            with self.pub_lock:
-                self.pub_socket.send_json({
-                    "type": "yolo",
-                    **payload
-                })
-
-        except Exception as e:
-            self.get_logger().error(
-                f"Failed to forward YOLO detections: {e}"
-            )
-
     def send_event(self, event_name, status_msg, action_id=None):
         with self.pub_lock:
             payload = {
@@ -419,6 +707,9 @@ class LLMRosBridge(Node):
             self.navigation_active = False
             self.navigation_mode = None
             self.current_nav_action_id = None
+            if navigation_mode == "follow":
+                self.follow_enabled = False
+                self.follow_action_id = None
             self.send_event(
                 "navigation",
                 "Goal Rejected by Nav2",
@@ -438,14 +729,20 @@ class LLMRosBridge(Node):
         self, future, goal_handle, action_id, navigation_mode, generation
     ):
         status = future.result().status
-        if (
+        is_current = (
             generation == self.nav_goal_generation
             and self.current_nav_goal_handle is goal_handle
-        ):
-            self.navigation_active = False
-            self.navigation_mode = None
-            self.current_nav_goal_handle = None
-            self.current_nav_action_id = None
+        )
+        if not is_current:
+            return
+
+        self.navigation_active = False
+        self.navigation_mode = None
+        self.current_nav_goal_handle = None
+        self.current_nav_action_id = None
+        if navigation_mode == "follow":
+            self.follow_enabled = False
+            self.follow_action_id = None
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.send_event("navigation", "Goal Reached", action_id)
         else:
@@ -467,8 +764,36 @@ class LLMRosBridge(Node):
         self.current_nav_action_id = None
         self.navigation_active = False
         self.navigation_mode = None
+        self.follow_enabled = False
+        self.follow_action_id = None
+        self.follow_had_person_track = False
+        self.pending_person_pose = None
+        self.last_follow_goal = None
+        self.last_follow_goal_at = None
 
         self.publish_cmd(0.0, 0.0)
+
+    def start_follow_navigation(self, pose_map):
+        """Start one long-running Nav2 goal; GoalUpdater handles later poses."""
+        if not self.follow_enabled or self.navigation_active:
+            return
+
+        action_id = self.follow_action_id
+        self.navigation_active = True
+        self.navigation_mode = "follow"
+        self.current_nav_action_id = action_id
+        self.nav_goal_generation += 1
+        generation = self.nav_goal_generation
+
+        goal = NavigateToPose.Goal()
+        goal.pose = pose_map
+        goal.behavior_tree = self.follow_bt
+        send_goal_future = self.nav_client.send_goal_async(goal)
+        send_goal_future.add_done_callback(
+            lambda completed: self.nav_goal_response_cb(
+                completed, action_id, "follow", generation
+            )
+        )
 
     def track_action_loop(self, start_time):
         remaining_pan_angle = self.servo.publish_servo_command(
@@ -504,6 +829,7 @@ class LLMRosBridge(Node):
                     message.get("delta_pan_angle", 0.0),
                     message.get("delta_tilt_angle", 0.0),
                     message.get("tracking_sequence"),
+                    message.get("tracking_timing"),
                 )
             except Exception as e:
                 self.get_logger().error(f"Internal Loop Error: {e}")
@@ -578,7 +904,7 @@ class LLMRosBridge(Node):
                 elif cmd == "track_action":
                     start_time = self.get_clock().now()
                     if self.track_action_timer is None:
-                        self.track_action_timer = self.create_timer(0.05, lambda: self.track_action_loop(start_time))
+                        self.track_action_timer = self.create_timer(0.01, lambda: self.track_action_loop(start_time))
 
                     self.rep_socket.send_json({"status": "accepted", "message": "Object is being tracked"})
 
@@ -604,18 +930,44 @@ class LLMRosBridge(Node):
                         "camera_reset": reset_camera,
                     })
 
-                elif cmd in {
-                    "navigate_to_pose",
-                    "navigate_to_approach",
-                    "navigate_to_follow",
-                }:
+                elif cmd == "follow_action":
+                    self.stop_all_motion()
+                    if not self.nav_client.wait_for_server(timeout_sec=1.0):
+                        self.rep_socket.send_json({
+                            "status": "error", "message": "Nav2 not available"
+                        })
+                        continue
+
+                    self.follow_enabled = True
+                    self.follow_action_id = request.get("action_id")
+                    self.follow_had_person_track = False
+                    # A new follow session must wait for a pose produced after
+                    # this command, never reuse the previous person's last pose.
+                    self.latest_person_pose_map = None
+                    self.latest_person_pose_at = None
+                    self.pending_person_pose = None
+                    self.last_follow_goal = None
+                    self.last_follow_goal_at = None
+                    self.rep_socket.send_json({
+                        "status": "accepted",
+                        "message": "Waiting for fresh lidar person pose",
+                    })
+
+                elif cmd == "stop_follow_action":
+                    self.stop_all_motion()
+                    self.rep_socket.send_json({
+                        "status": "accepted",
+                        "message": "Following stopped",
+                    })
+
+                elif cmd in {"navigate_to_pose", "navigate_to_approach"}:
                     x = float(request.get("x", 0.0))
                     y = float(request.get("y", 0.0))
                     angle = float(request.get("angle", 0.0))
                     frame_id = str(request.get("frame_id", "base_footprint"))
                     destination = None
 
-                    if cmd in {"navigate_to_approach", "navigate_to_follow"}:
+                    if cmd == "navigate_to_approach":
                         with self.map_image_stream.state_lock:
                             prepared = self.map_image_stream.prepared
                         if prepared is None:
@@ -675,19 +1027,6 @@ class LLMRosBridge(Node):
                     # to decide whether an update is newer than the seed goal.
                     pose_map.header.stamp = self.get_clock().now().to_msg()
 
-                    if (
-                        cmd == "navigate_to_follow"
-                        and self.navigation_active
-                        and self.navigation_mode == "follow"
-                    ):
-                        self.goal_update_pub.publish(pose_map)
-                        self.rep_socket.send_json({
-                            "status": "accepted",
-                            "message": "Follow Goal Updated",
-                            "destination": destination,
-                        })
-                        continue
-
                     self.stop_all_motion()
                     if not self.nav_client.wait_for_server(timeout_sec=1.0):
                         self.rep_socket.send_json({
@@ -696,9 +1035,7 @@ class LLMRosBridge(Node):
                         continue
 
                     action_id = request.get("action_id")
-                    navigation_mode = (
-                        "follow" if cmd == "navigate_to_follow" else "navigate"
-                    )
+                    navigation_mode = "navigate"
                     self.navigation_active = True
                     self.navigation_mode = navigation_mode
                     self.current_nav_action_id = action_id
@@ -707,11 +1044,7 @@ class LLMRosBridge(Node):
 
                     goal = NavigateToPose.Goal()
                     goal.pose = pose_map
-                    goal.behavior_tree = (
-                        self.follow_bt
-                        if navigation_mode == "follow"
-                        else self.dj_bt
-                    )
+                    goal.behavior_tree = self.dj_bt
                     send_goal_future = self.nav_client.send_goal_async(goal)
                     send_goal_future.add_done_callback(
                         lambda completed: self.nav_goal_response_cb(
@@ -721,11 +1054,7 @@ class LLMRosBridge(Node):
 
                     response = {
                         "status": "accepted",
-                        "message": (
-                            "Nav2 Follow Goal Dispatched"
-                            if navigation_mode == "follow"
-                            else "Nav2 Goal Dispatched"
-                        ),
+                        "message": "Nav2 Goal Dispatched",
                     }
                     if destination is not None:
                         response["destination"] = destination

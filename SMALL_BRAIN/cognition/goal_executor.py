@@ -83,7 +83,6 @@ class GoalExecutor:
         self._search_waypoint_count = 0
         self._search_started_at = 0.0
         self._approach_standoff_m: float | None = None
-        self._approach_follow = False
 
     async def start(
         self,
@@ -91,7 +90,6 @@ class GoalExecutor:
         target,
         action_id,
         approach_standoff_m=None,
-        approach_follow=False,
     ) -> ActionResult:
         """Start the one supported composite goal: find, track, and approach."""
         target = str(target or "").strip()
@@ -127,7 +125,6 @@ class GoalExecutor:
             float(approach_standoff_m)
             if approach_standoff_m is not None else None
         )
-        self._approach_follow = bool(approach_follow)
         self._remember_search_pose("search_start")
         await self._publish_map_overlay()
         self._search_started_at = time.monotonic()
@@ -203,11 +200,7 @@ class GoalExecutor:
 
         self._complete(
             status="succeeded",
-            outcome=(
-                "found_tracked_and_following"
-                if getattr(self, "_approach_follow", False)
-                else "found_reached_and_reacquired"
-            ),
+            outcome="found_reached_and_reacquired",
         )
 
     async def _track(self,allow_grounding_dino=True,step="track") -> ActionResult:
@@ -233,18 +226,7 @@ class GoalExecutor:
             target=self.target,
             action_id=self._step_id(step),
             standoff_m=self._approach_standoff_m,
-            follow=getattr(self, "_approach_follow", False),
         )
-        if getattr(self, "_approach_follow", False) and result.status == "running":
-            self._approach_result_data = dict(result.data)
-            return ActionResult(
-                action_id=result.action_id,
-                action_type=result.action_type,
-                status="succeeded",
-                target=result.target,
-                outcome="follow_navigation_started",
-                data=result.data,
-            )
         result = await self._terminal_result(self.approach_action, result)
         if result.status == "succeeded":
             self._approach_result_data = dict(result.data)
@@ -273,10 +255,6 @@ class GoalExecutor:
         approach_result = await self._approach(step=f"approach{suffix}")
         if approach_result.status != "succeeded":
             return approach_result
-        if getattr(self, "_approach_follow", False):
-            self._completed_steps.append("target_following")
-            return approach_result
-
         # An approach is physical navigation and consumes the same global
         # waypoint budget as a search navigation step.
         self._search_waypoint_count += 1

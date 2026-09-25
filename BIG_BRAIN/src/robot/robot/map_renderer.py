@@ -12,13 +12,17 @@ class RenderConfig:
     image_max_size: int = 1024
     view_margin: float = 0.45
     grid_spacing: float = 1.0
-    live_fov_enabled: bool = False
+    live_fov_enabled: bool = True
     fov_alpha: float = 0.32
     coverage_color: tuple = (255, 220, 175)
     repeated_coverage_color: tuple = (220, 205, 255)
     sample_radius: float = 3.0
     occupied: int = 50
     cost_limit: int = 99
+    # Candidate markers keep the same proportions in the robot-centred crop.
+    pose_reference_crop_px: int = 768
+    pose_circle_radius_px: int = 12
+    frontier_diamond_radius_px: int = 19
 
 
 class MapRenderer:
@@ -27,18 +31,20 @@ class MapRenderer:
     def __init__(self):
         self.cfg = RenderConfig()
 
-    def render_background(self, prepared, pose):
+    def render_background(self, prepared, pose, view_size_m=None):
         return self._render(
             prepared["grid"], prepared["costmap"], pose, [], [],
             prepared["frontier_mask"], prepared["doors"],
             prepared["door_candidate_mask"], prepared["rooms"],
             prepared["current_room_mask"], draw_robot=False,
+            view_size_m=view_size_m,
         )
 
     def render_snapshot(
         self, prepared, pose, candidates, coverage_counts,
         search_overlay=None, live_fov_mask=None,
         observation=None, observation_mask=None,
+        pose_marker_scale=1.0,
     ):
         image = prepared["background"].copy()
         view = prepared["view"]
@@ -56,14 +62,45 @@ class MapRenderer:
         frontiers = [
             item for item in candidates if item.get("kind") == "frontier"
         ]
-        self._draw_frontier_candidates(image, view, frontiers)
+        self._draw_frontier_candidates(
+            image, view, frontiers, marker_scale=pose_marker_scale
+        )
         self._draw_dynamic(
             image, view, pose,
             [item for item in candidates if item.get("kind") != "frontier"],
+            marker_scale=pose_marker_scale,
         )
+        self._draw_orientation_legend(image)
         if mode == "exploration" and len(candidates) == 1:
-            self._draw_selected_pose(image, view, candidates[0])
+            self._draw_selected_pose(
+                image, view, candidates[0], marker_scale=pose_marker_scale
+            )
         return image
+
+    def pose_marker_scale_for_crop(self, view, crop_size_m):
+        """Scale pose badges to a fixed fraction of the delivered crop."""
+        if crop_size_m is None:
+            return 1.0
+        crop_pixels = float(crop_size_m) * float(view["ppm"])
+        return crop_pixels / float(self.cfg.pose_reference_crop_px)
+
+    @staticmethod
+    def _draw_orientation_legend(image):
+        """Make the camera/map correspondence explicit in every snapshot."""
+        labels = (
+            ("UP = FORWARD / IMAGE CENTER", (18, 28)),
+            ("MAP LEFT = IMAGE LEFT", (18, 50)),
+            ("MAP RIGHT = IMAGE RIGHT", (18, 72)),
+        )
+        for text, origin in labels:
+            cv2.putText(
+                image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                0.46, (255, 255, 255), 4, cv2.LINE_AA,
+            )
+            cv2.putText(
+                image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                0.46, (30, 30, 30), 1, cv2.LINE_AA,
+            )
 
     def _draw_observation_fov(
         self, image, view, observation, grid_mask
@@ -76,23 +113,53 @@ class MapRenderer:
         )
         cv2.drawContours(image, contours, -1, (0, 140, 255), 3, cv2.LINE_AA)
 
-    def _draw_frontier_candidates(self, image, view, frontiers, debug=False):
+    def _draw_frontier_candidates(
+        self, image, view, frontiers, debug=False, marker_scale=1.0
+    ):
+        radius = max(2, round(
+            self.cfg.frontier_diamond_radius_px * marker_scale
+        ))
         for item in frontiers:
             point = self._pixel(view, item["x"], item["y"])
             color = (110, 165, 110) if debug else (35, 185, 35)
-            self._heading_tick(image, point, item["yaw"], 19, color)
-            self._diamond_badge(image, point, item["id"], color)
+            self._diamond_badge(
+                image, point, item["id"], color, radius=radius
+            )
 
-    def _draw_selected_pose(self, image, view, candidate):
+    def _draw_selected_pose(
+        self, image, view, candidate, marker_scale=1.0
+    ):
         point = self._pixel(view, candidate["x"], candidate["y"])
-        cv2.circle(image, point, 25, (0, 165, 255), 4, cv2.LINE_AA)
+        radius = max(4, round(25 * marker_scale))
+        thickness = max(1, round(4 * marker_scale))
+        cv2.circle(
+            image, point, radius, (0, 165, 255), thickness, cv2.LINE_AA
+        )
         self._outlined_label(
             image, (point[0] + 28, point[1] - 18),
             f"NEXT {candidate['id']}", (0, 165, 255), scale=0.54,
         )
 
-    def _make_view(self, grid, pose):
-        """Crop tightly around explored space while keeping local samples visible."""
+    def _make_view(self, grid, pose, view_size_m=None):
+        """Build a robot-relative view where its current heading is always up."""
+        if view_size_m is not None:
+            size = float(view_size_m)
+            if not math.isfinite(size) or size <= 0.0:
+                raise ValueError("view_size_m must be a positive finite number")
+            half = size / 2.0
+            return {
+                "xmin": -half,
+                "xmax": half,
+                "ymin": -half,
+                "ymax": half,
+                "ppm": self.cfg.image_max_size / size,
+                "width": self.cfg.image_max_size,
+                "height": self.cfg.image_max_size,
+                "origin_x": float(pose["x"]),
+                "origin_y": float(pose["y"]),
+                "heading_yaw": float(pose["yaw"]),
+            }
+
         rows, cols = np.nonzero(grid.data >= 0)
         if len(rows):
             xs, ys = grid.world(cols, rows)
@@ -100,13 +167,21 @@ class MapRenderer:
             xs = np.array([pose["x"]])
             ys = np.array([pose["y"]])
 
+        dx = np.asarray(xs) - float(pose["x"])
+        dy = np.asarray(ys) - float(pose["y"])
+        yaw = float(pose["yaw"])
+        # Horizontal image motion is robot-right; vertical image motion is
+        # robot-forward. Keeping these as metric coordinates makes cropping
+        # and candidate interpretation independent of the world-map yaw.
+        right = dx * math.sin(yaw) - dy * math.cos(yaw)
+        forward = dx * math.cos(yaw) + dy * math.sin(yaw)
         radius = self.cfg.sample_radius
-        xs = np.append(xs, [pose["x"] - radius, pose["x"] + radius])
-        ys = np.append(ys, [pose["y"] - radius, pose["y"] + radius])
+        right = np.append(right, [-radius, radius])
+        forward = np.append(forward, [-radius, radius])
 
         margin = self.cfg.view_margin + grid.resolution
-        xmin, xmax = float(xs.min()) - margin, float(xs.max()) + margin
-        ymin, ymax = float(ys.min()) - margin, float(ys.max()) + margin
+        xmin, xmax = float(right.min()) - margin, float(right.max()) + margin
+        ymin, ymax = float(forward.min()) - margin, float(forward.max()) + margin
 
         span_x = max(xmax - xmin, grid.resolution)
         span_y = max(ymax - ymin, grid.resolution)
@@ -118,12 +193,20 @@ class MapRenderer:
             "ppm": ppm,
             "width": max(1, round(span_x * ppm)),
             "height": max(1, round(span_y * ppm)),
+            "origin_x": float(pose["x"]),
+            "origin_y": float(pose["y"]),
+            "heading_yaw": yaw,
         }
     @staticmethod
     def _pixel(view, x, y):
+        dx = float(x) - view.get("origin_x", 0.0)
+        dy = float(y) - view.get("origin_y", 0.0)
+        yaw = view.get("heading_yaw", 0.0)
+        right = dx * math.sin(yaw) - dy * math.cos(yaw)
+        forward = dx * math.cos(yaw) + dy * math.sin(yaw)
         return (
-            round((x - view["xmin"]) * view["ppm"]),
-            round((view["ymax"] - y) * view["ppm"]),
+            round((right - view["xmin"]) * view["ppm"]),
+            round((view["ymax"] - forward) * view["ppm"]),
         )
 
     @staticmethod
@@ -136,20 +219,6 @@ class MapRenderer:
             view["map_rows"][inside], view["map_cols"][inside]
         ]
         return projected
-
-    @staticmethod
-    def _heading_tick(image, point, yaw, radius, color):
-        direction = (math.cos(yaw), -math.sin(yaw))
-        start = (
-            round(point[0] + direction[0] * (radius - 1)),
-            round(point[1] + direction[1] * (radius - 1)),
-        )
-        end = (
-            round(point[0] + direction[0] * (radius + 10)),
-            round(point[1] + direction[1] * (radius + 10)),
-        )
-        cv2.line(image, start, end, (255, 255, 255), 6, cv2.LINE_AA)
-        cv2.line(image, start, end, color, 3, cv2.LINE_AA)
 
     @staticmethod
     def _centered_text(image, point, text, scale, color, thickness):
@@ -185,16 +254,29 @@ class MapRenderer:
 
     @staticmethod
     def _circle_badge(image, point, text, color, radius=12):
-        cv2.circle(image, point, radius + 3, (35, 35, 35), -1, cv2.LINE_AA)
-        cv2.circle(image, point, radius + 1, (255, 255, 255), -1, cv2.LINE_AA)
+        factor = radius / 12.0
+        outer = max(1, round(3 * factor))
+        keyline = max(1, round(factor))
+        cv2.circle(
+            image, point, radius + outer, (35, 35, 35), -1, cv2.LINE_AA
+        )
+        cv2.circle(
+            image, point, radius + keyline,
+            (255, 255, 255), -1, cv2.LINE_AA,
+        )
         cv2.circle(image, point, radius, color, -1, cv2.LINE_AA)
-        scale = 0.43 if len(text) <= 2 else 0.34
+        scale = (0.43 if len(text) <= 2 else 0.34) * factor
         MapRenderer._centered_text(
-            image, point, text, scale, (255, 255, 255), 1
+            image, point, text, scale, (255, 255, 255),
+            max(1, round(factor)),
         )
 
     @staticmethod
     def _diamond_badge(image, point, text, color, radius=19):
+        factor = radius / 19.0
+        outer = max(1, round(3 * factor))
+        keyline = max(1, round(factor))
+
         def diamond(size):
             return np.array([
                 (point[0], point[1] - size),
@@ -203,15 +285,16 @@ class MapRenderer:
                 (point[0] - size, point[1]),
             ], np.int32)
         cv2.fillConvexPoly(
-            image, diamond(radius + 3), (35, 35, 35), cv2.LINE_AA
+            image, diamond(radius + outer), (35, 35, 35), cv2.LINE_AA
         )
         cv2.fillConvexPoly(
-            image, diamond(radius + 1), (255, 255, 255), cv2.LINE_AA
+            image, diamond(radius + keyline), (255, 255, 255), cv2.LINE_AA
         )
         cv2.fillConvexPoly(image, diamond(radius), color, cv2.LINE_AA)
-        scale = 0.52 if len(text) <= 2 else 0.44
+        scale = (0.52 if len(text) <= 2 else 0.44) * factor
         MapRenderer._centered_text(
-            image, point, text, scale, (255, 255, 255), 1
+            image, point, text, scale, (255, 255, 255),
+            max(1, round(factor)),
         )
 
     @staticmethod
@@ -270,7 +353,7 @@ class MapRenderer:
             cv2.putText(image, "S", origin, cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 235, 255), 2, cv2.LINE_AA)
     def _draw_camera_fov(self, image, view, coverage):
-        """Tint the current camera footprint without changing search coverage."""
+        """Draw the obstacle-clipped cone corresponding to current Image 2."""
         if coverage is None or not np.any(coverage):
             return
         coverage = self._project_grid(view, coverage)
@@ -285,8 +368,20 @@ class MapRenderer:
             image[visible], 1.0 - self.cfg.fov_alpha,
             tint[visible], self.cfg.fov_alpha, 0,
         )
+        mask = coverage.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(image, contours, -1, (210, 185, 20), 3, cv2.LINE_AA)
+        robot = self._pixel(view, view["origin_x"], view["origin_y"])
+        self._outlined_label(
+            image, (robot[0] + 18, robot[1] - 34),
+            "CURRENT VIEW", (210, 185, 20), scale=0.42,
+        )
 
-    def _draw_dynamic(self, image, view, pose, locals_):
+    def _draw_dynamic(
+        self, image, view, pose, locals_, marker_scale=1.0
+    ):
         """Draw the inexpensive overlays that change with every TF pose."""
         center = self._pixel(view, pose["x"], pose["y"])
         robot_color = (25, 25, 225)
@@ -309,21 +404,33 @@ class MapRenderer:
 
         # Draw selectable poses last. In particular, the robot heading arrow
         # must not cover the closest forward candidate.
+        badge_radius = max(2, round(
+            self.cfg.pose_circle_radius_px * marker_scale
+        ))
         for item in locals_:
             if item["kind"] == "rotation":
                 continue
             point = self._pixel(view, item["x"], item["y"])
             color = (220, 105, 15)  # saturated blue in BGR
-            self._heading_tick(image, point, item["yaw"], 12, color)
-            self._circle_badge(image, point, item["id"], color)
+            self._circle_badge(
+                image, point, item["id"], color, radius=badge_radius
+            )
+        if any(item.get("kind") == "rotation" for item in locals_):
+            self._outlined_label(
+                image, (center[0] + 17, center[1] + 24),
+                "H", robot_color, scale=0.5,
+            )
     def _render(self, grid, costmap, pose, locals_, frontiers,
                 frontier_mask, doors, door_candidate_mask, rooms, room_mask,
-                draw_robot=True):
+                draw_robot=True, view_size_m=None):
         """Render a clean metric map intended for VLM waypoint selection."""
-        view = self._make_view(grid, pose)
-        xs = view["xmin"] + (np.arange(view["width"]) + 0.5) / view["ppm"]
-        ys = view["ymax"] - (np.arange(view["height"]) + 0.5) / view["ppm"]
-        x, y = np.meshgrid(xs, ys)
+        view = self._make_view(grid, pose, view_size_m=view_size_m)
+        rights = view["xmin"] + (np.arange(view["width"]) + 0.5) / view["ppm"]
+        forwards = view["ymax"] - (np.arange(view["height"]) + 0.5) / view["ppm"]
+        right, forward = np.meshgrid(rights, forwards)
+        yaw = view["heading_yaw"]
+        x = view["origin_x"] + right * math.sin(yaw) + forward * math.cos(yaw)
+        y = view["origin_y"] - right * math.cos(yaw) + forward * math.sin(yaw)
 
         # Reuse the map indices for occupancy and semantic overlay masks. At 1280
         # pixels this avoids two additional 1.6-million-element transforms.
@@ -404,19 +511,20 @@ class MapRenderer:
                 core_tint[frontier_pixels], 0.40, 0,
             )
 
-        # Metric grid helps the VLM reason about distance and direction.
+        # A robot-relative metric grid reinforces that up is forward and the
+        # camera image's left/right correspond directly to the map.
         spacing = self.cfg.grid_spacing
         x0 = math.ceil(view["xmin"] / spacing)
         x1 = math.floor(view["xmax"] / spacing)
         y0 = math.ceil(view["ymin"] / spacing)
         y1 = math.floor(view["ymax"] / spacing)
         for i in range(x0, x1 + 1):
-            px = self._pixel(view, i * spacing, view["ymin"])[0]
+            px = round((i * spacing - view["xmin"]) * view["ppm"])
             if 0 <= px < view["width"]:
                 visible = free[:, px] & ~frontier_halo[:, px]
                 image[visible, px] = (218, 218, 218)
         for i in range(y0, y1 + 1):
-            py = self._pixel(view, view["xmin"], i * spacing)[1]
+            py = round((view["ymax"] - i * spacing) * view["ppm"])
             if 0 <= py < view["height"]:
                 visible = free[py] & ~frontier_halo[py]
                 image[py, visible] = (218, 218, 218)
@@ -429,8 +537,8 @@ class MapRenderer:
             p = self._pixel(view, item["x"], item["y"])
             if item["kind"] == "frontier":
                 color = (35, 185, 35)
-                # Clear noisy occupancy/frontier pixels immediately around the
-                # badge. Draw this first so the heading tick remains visible.
+                # Clear noisy occupancy/frontier pixels around the badge so
+                # the candidate remains legible after JPEG compression.
                 clearance = np.array([
                     (p[0], p[1] - 26), (p[0] + 26, p[1]),
                     (p[0], p[1] + 26), (p[0] - 26, p[1]),
@@ -438,11 +546,9 @@ class MapRenderer:
                 cv2.fillConvexPoly(
                     image, clearance, (255, 255, 255), cv2.LINE_AA
                 )
-                self._heading_tick(image, p, item["yaw"], 19, color)
                 self._diamond_badge(image, p, item["id"], color)
             else:
                 color = (220, 105, 15)
-                self._heading_tick(image, p, item["yaw"], 12, color)
                 self._circle_badge(image, p, item["id"], color)
 
         # Accepted doors use saturated color and a strong white keyline so they
@@ -460,4 +566,3 @@ class MapRenderer:
             self._draw_dynamic(image, view, pose, locals_)
 
         return image, view
-

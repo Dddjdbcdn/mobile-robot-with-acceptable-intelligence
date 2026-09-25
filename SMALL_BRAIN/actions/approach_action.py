@@ -20,21 +20,12 @@ class ApproachAction:
         self.completion_future: asyncio.Future[ActionResult] | None = None
         self._navigation_attempts = 0
         self._last_destination: dict | None = None
-        self.following = False
 
-    async def start_approaching(
-        self, target, action_id, standoff_m=None, *, follow=False
-    ):
+    async def start_approaching(self, target, action_id, standoff_m=None):
         normalized_target = (
             normalize_human_target(target) or normalize_object_target(target)
         )
-        updating_follow = (
-            self.active
-            and follow
-            and self.following
-            and normalized_target == self.track_action.target
-        )
-        if self.active and not updating_follow:
+        if self.active:
             return ActionResult(
                 action_id=action_id,
                 action_type="approach_action",
@@ -60,26 +51,7 @@ class ApproachAction:
                 retryable=True,
             )
 
-        quick_person_stability = follow and normalized_target == "person"
-        if (
-            quick_person_stability
-            and not self.track_action.person_stable
-        ):
-            stable = await self.track_action.wait_until_person_stable(
-                timeout=2.0
-            )
-            if not stable:
-                return ActionResult(
-                    action_id=action_id,
-                    action_type="approach_action",
-                    status="failed",
-                    target=target,
-                    outcome="precondition_failed",
-                    reason_code="PERSON_TRACKING_STABILITY_TIMEOUT",
-                    retryable=True,
-                    data={"person_tracking_stable": False},
-                )
-        elif not quick_person_stability and not self.track_action.stable:
+        if not self.track_action.stable:
             stable = await self.track_action.wait_until_stable(timeout=10.0)
             if not stable:
                 return ActionResult(
@@ -123,17 +95,15 @@ class ApproachAction:
             "tof_range": tof_range,
         }
 
-        if not updating_follow:
-            self.completion_future = asyncio.get_running_loop().create_future()
-            self.active = True
-            self.action_id = action_id
-            self.target = target
-            self._navigation_attempts = 0
-            self._last_destination = None
-            self.following = follow
+        self.completion_future = asyncio.get_running_loop().create_future()
+        self.active = True
+        self.action_id = action_id
+        self.target = target
+        self._navigation_attempts = 0
+        self._last_destination = None
 
         command = {
-            "command": "navigate_to_follow" if follow else "navigate_to_approach",
+            "command": "navigate_to_approach",
             "action_id": self.action_id,
             "frame_id": "base_footprint",
             **raw_destination,
@@ -147,11 +117,6 @@ class ApproachAction:
                 if isinstance(feedback, dict)
                 else "invalid_navigation_feedback"
             )
-            if updating_follow:
-                await self.send_robot_command({
-                    "command": "stop_moving",
-                    "action_id": self.action_id,
-                })
             return self.complete_approaching(
                 status="failed",
                 outcome="rejected",
@@ -172,9 +137,7 @@ class ApproachAction:
             action_type="approach_action",
             status="running",
             target=target,
-            outcome="follow_goal_updated" if updating_follow else (
-                "following" if follow else "approaching"
-            ),
+            outcome="approaching",
             data={
                 "tracking_stable": self.track_action.stable,
                 "person_tracking_stable": getattr(
@@ -247,7 +210,6 @@ class ApproachAction:
         self.active = False
         self.action_id = None
         self.target = None
-        self.following = False
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
         return result
