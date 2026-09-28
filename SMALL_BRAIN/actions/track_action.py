@@ -1,271 +1,36 @@
 import asyncio
+import math
 from pathlib import Path
 import time
 
+from actions.action_result import ActionResult
+from actions.tracking.person_pose import (
+    find_best_person_path,
+    person_keypoint,
+    predict_next_keypoint,
+)
+from actions.tracking.stable_seed import StableTargetSeedTracker
+from actions.tracking.target_catalog import (
+    DJ_YOLO_CLASSES,
+    HUMAN_TRACKABLE_PARTS,
+    normalize_human_target,
+    normalize_object_target,
+)
 from cognition.state import robot_state
 from utilities.camera_sampler import pose_body_mask, project_tof_region
 
 HORIZONTAL_FOV_DEG = 85
 VERTICAL_FOV_DEG = 52
 
-import math
 
-dj_yolo_classes = [
-    "guitar",
-    "chair",
-    "table",
-    "person",
-    "laptop",
-    "door",
-    "television",
-    "fan",
-    "bottle",
-    "mirror",
-    "toolbox",
-    "dumbbell",
-    "camera",
-    "houseplant",
-    "curtain",
-    "power socket",
-    "book",
-    "microphone",
-    "smartphone",
-    "air conditioner",
-    "remote control"
-]
-
-SKELETON_GRAPH = {
-    "nose": ["left_eye", "right_eye"],
-    "left_eye": ["nose", "left_ear"],
-    "right_eye": ["nose", "right_ear"],
-    "left_ear": ["left_eye", "left_shoulder"],
-    "right_ear": ["right_eye", "right_shoulder"],
-    "left_shoulder": [
-        "left_ear", "right_shoulder", "left_elbow", "left_hip",
-        "torso_center",
-    ],
-    "right_shoulder": [
-        "right_ear", "left_shoulder", "right_elbow", "right_hip",
-        "torso_center",
-    ],
-    "left_elbow": ["left_shoulder", "left_wrist"],
-    "right_elbow": ["right_shoulder", "right_wrist"],
-    "left_wrist": ["left_elbow"],
-    "right_wrist": ["right_elbow"],
-    "left_hip": [
-        "left_shoulder", "right_hip", "left_knee", "torso_center",
-    ],
-    "right_hip": [
-        "right_shoulder", "left_hip", "right_knee", "torso_center",
-    ],
-    "left_knee": ["left_hip", "left_ankle"],
-    "right_knee": ["right_hip", "right_ankle"],
-    "left_ankle": ["left_knee"],
-    "right_ankle": ["right_knee"],
-    "torso_center": [
-        "left_shoulder", "right_shoulder", "left_hip", "right_hip",
-    ],
-}
-
-HUMAN_RETARGETS = {
-    "person": ["torso_center"],
-    "human": ["torso_center"],
-    "torso_center": ["torso_center"],
-    "face": ["nose"],
-    "head": ["nose"],
-
-    "eye": ["left_eye","right_eye"],
-    "eyes": ["left_eye","right_eye"],
-    "left_eye": ["left_eye"],
-    "right_eye": ["right_eye"],
-
-    "hand": ["left_wrist","right_wrist"],
-    "left_hand": ["left_wrist"],
-    "right_hand": ["right_wrist"],
-
-    "leg": ["left_knee","right_knee"],
-    "left_leg": ["left_knee"],
-    "right_leg": ["right_knee"],
-
-    "feet": ["left_ankle","right_ankle"],
-    "left_feet": ["left_ankle"],
-    "right_feet": ["right_ankle"],
-}
-
-human_trackable_parts = list(HUMAN_RETARGETS.keys())
-
-def is_yolo_trackable_target(target):
-    normalized_target = normalize_human_target(target) or normalize_object_target(target)
-    return (
-        normalized_target in human_trackable_parts
-        or normalized_target in dj_yolo_classes
-    )
-
-def normalize_human_target(target):
-    target = str(target or "").lower().strip()
-
-    target = target.replace("'s","")
-    target = target.replace("-"," ")
-    target = target.replace("_"," ")
-
-    words = target.split()
-
-    side = None
-
-    if "left" in words: side = "left"
-    elif "right" in words: side = "right"
-
-    if "torso" in words or "body" in words: part = "torso_center"
-    elif "hand" in words or "wrist" in words: part = "hand"
-    elif "leg" in words: part = "leg"
-    elif "foot" in words or "feet" in words or "ankle" in words: part = "feet"
-    elif "eye" in words or "eyes" in words: part = "eye"
-    elif "face" in words: part = "face"
-    elif "head" in words: part = "head"
-    elif "person" in words or "human" in words or "user" in words or "me" in words or "you" in words or "dang" in words or "owner" in words: part = "person"
-
-    else:
-        return None
-
-    if side is not None and part in ["hand","leg","eye","foot"]:
-        return f"{side}_{part}"
-
-    return part
-
-def normalize_object_target(target):
-    target = str(target or "").lower().strip()
-    target = target.replace("'s", "")
-    target = target.replace("-", " ")
-    target = target.replace("_", " ")
-    target = " ".join(target.split())
-
-    aliases = {
-        # guitar
-        "guitars": "guitar",
-        "acoustic guitar": "guitar",
-        "electric guitar": "guitar",
-
-        # chair
-        "chairs": "chair",
-        "seat": "chair",
-        "seats": "chair",
-
-        # table
-        "tables": "table",
-        "desk": "table",
-        "desks": "table",
-
-        # laptop
-        "laptops": "laptop",
-        "notebook": "laptop",
-        "notebook computer": "laptop",
-        "computer": "laptop",
-
-        # door
-        "doors": "door",
-
-        # television
-        "tv": "television",
-        "t v": "television",
-        "television set": "television",
-        "screen": "television",
-
-        # fan
-        "fans": "fan",
-        "electric fan": "fan",
-
-        # bottle
-        "bottles": "bottle",
-        "water bottle": "bottle",
-        "water bottles": "bottle",
-        "drink bottle": "bottle",
-        "drinking bottle": "bottle",
-
-        # mirror
-        "mirrors": "mirror",
-
-        # toolbox
-        "tool box": "toolbox",
-        "tool boxes": "toolbox",
-        "toolboxes": "toolbox",
-
-        # dumbbell
-        "dumbbells": "dumbbell",
-        "weight": "dumbbell",
-        "weights": "dumbbell",
-        "hand weight": "dumbbell",
-
-        # camera
-        "cameras": "camera",
-        "webcam": "camera",
-
-        # houseplant
-        "house plant": "houseplant",
-        "house plants": "houseplant",
-        "plant": "houseplant",
-        "plants": "houseplant",
-        "potted plant": "houseplant",
-        "indoor plant": "houseplant",
-
-        # curtain
-        "curtains": "curtain",
-        "drape": "curtain",
-        "drapes": "curtain",
-
-        # power socket
-        "socket": "power socket",
-        "sockets": "power socket",
-        "power outlet": "power socket",
-        "outlet": "power socket",
-        "wall outlet": "power socket",
-        "electrical outlet": "power socket",
-        "plug socket": "power socket",
-
-        # book
-        "books": "book",
-
-        # microphone
-        "mic": "microphone",
-        "mics": "microphone",
-        "microphones": "microphone",
-
-        # smartphone
-        "phone": "smartphone",
-        "phones": "smartphone",
-        "smart phone": "smartphone",
-        "mobile phone": "smartphone",
-        "cell phone": "smartphone",
-        "cellphone": "smartphone",
-
-        # air conditioner
-        "air conditioning": "air conditioner",
-        "aircon": "air conditioner",
-        "air con": "air conditioner",
-        "ac": "air conditioner",
-        "a c": "air conditioner",
-
-        # remote control
-        "remote": "remote control",
-        "remotes": "remote control",
-        "controller": "remote control",
-        "tv remote": "remote control",
-        "television remote": "remote control",
-        "remote controller": "remote control",
-    }
-
-    return aliases.get(target, target)
-
-from actions.action_result import ActionResult
-class TrackAction():
+class TrackAction:
     OBJECT_FAILURE_GRACE_FRAMES = 3
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
-    PERSON_STABLE_FRAMES = 5
-    PERSON_POINT_BASE_TOLERANCE_M = 0.20
-    PERSON_MAX_SPEED_MPS = 2.0
-    PERSON_POINT_MAX_AGE_SECONDS = 0.50
-    PERSON_POINT_RESET_SECONDS = 0.75
-    PERSON_STABILITY_UPDATE_HZ = 5.0
+    TARGET_SEED_SAMPLES = StableTargetSeedTracker.SAMPLE_COUNT
+    TRACKED_TARGET_SEED_OWNER = "tracked_target"
+    PERSON_POINT_MAX_AGE_SECONDS = StableTargetSeedTracker.INPUT_MAX_AGE_SECONDS
+    PERSON_SEED_UPDATE_HZ = 5.0
 
     def __init__(
         self,
@@ -276,7 +41,6 @@ class TrackAction():
         zmq_pub_socket,
         send_robot_command,
         STABLE_THRESHOLD=0.05,
-        semantic_memory=None,
         person_tracker_pub_socket=None,
     ):
         self.csrt_tracker = csrt_tracker
@@ -289,27 +53,145 @@ class TrackAction():
 
         self.active = False
         self.target = None
-        self.stable = False
-        self.stable_tick = 0
-        self.person_stable = False
-        self.person_stable_tick = 0
-        self._last_valid_person_point = None
-        self._last_valid_person_timestamp = None
         self.stable_threshold = STABLE_THRESHOLD
         self._tracking_task = None
         self.completion_future = None
         self.action_id = None
-        self.semantic_memory = semantic_memory
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = True
         self._continuous_person_reacquisition = False
         self._yolo_owner = None
+        self._visual_target_override = None
+        self._stable_seed_tracker = StableTargetSeedTracker()
         # Persist across tracker loss so approach can reacquire after moving.
         self.last_stable_target_location = None
 
         self.person_path = []
         self.person_path_index = 0
+
+    def set_visual_target_override(self, owner, normalized_x, normalized_y):
+        """Temporarily aim person tracking at an externally observed point."""
+        owner = str(owner)
+        previous_owner = (
+            None if self._visual_target_override is None
+            else self._visual_target_override.get("owner")
+        )
+        if previous_owner != owner:
+            self.clear_stable_target_seed(owner)
+        self._visual_target_override = {
+            "owner": owner,
+            "x": max(0.0, min(1.0, float(normalized_x))),
+            "y": max(0.0, min(1.0, float(normalized_y))),
+            "updated_at": time.monotonic(),
+        }
+        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
+        center_tolerance = getattr(self, "stable_threshold", 0.05)
+        if (
+            abs(self._visual_target_override["x"] - 0.5)
+            < center_tolerance
+            and abs(self._visual_target_override["y"] - 0.5)
+            < center_tolerance
+        ):
+            self.update_stable_target_seed(
+                owner,
+                target="hand",
+                require_person_proximity=True,
+            )
+        else:
+            self.clear_stable_target_seed(owner)
+
+    def clear_visual_target_override(self, owner):
+        override = self._visual_target_override
+        if override is None or override.get("owner") != str(owner):
+            return
+        self._visual_target_override = None
+        self.clear_stable_target_seed(owner)
+
+    def _current_visual_target_override(self, max_age_seconds=0.35):
+        override = self._visual_target_override
+        if override is None:
+            return None
+        if time.monotonic() - override["updated_at"] > max_age_seconds:
+            self.clear_stable_target_seed(override.get("owner"))
+            self._visual_target_override = None
+            return None
+        return override["x"], override["y"]
+
+    def _seed_tracker(self):
+        if not hasattr(self, "_stable_seed_tracker"):
+            self._stable_seed_tracker = StableTargetSeedTracker()
+        return self._stable_seed_tracker
+
+    def clear_stable_target_seed(self, owner=None):
+        """Clear one owner's stable ToF seed, or all seed state."""
+        self._seed_tracker().clear(owner)
+
+    def update_stable_target_seed(
+        self,
+        owner,
+        *,
+        target=None,
+        require_person_proximity=False,
+    ):
+        """Validate raw camera depth into an owner-scoped stable seed."""
+        return self._seed_tracker().update(
+            owner,
+            robot_state.get("camera"),
+            target=target or getattr(self, "target", None),
+            session_id=getattr(self, "action_id", None),
+            person=robot_state.get("person"),
+            require_person_proximity=require_person_proximity,
+        )
+
+    def get_stable_target_seed(
+        self,
+        owner,
+        max_age_seconds=None,
+        *,
+        target=None,
+        session_id=None,
+    ):
+        """Return a fresh validated seed belonging to ``owner``."""
+        return self._seed_tracker().get(
+            owner,
+            max_age_seconds,
+            target=target,
+            session_id=session_id,
+        )
+
+    async def wait_for_stable_target_seed(
+        self,
+        owner,
+        *,
+        target=None,
+        session_id=None,
+        check_interval=0.05,
+        timeout=10.0,
+    ):
+        """Wait only for the target and tracking session captured at entry."""
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        expected_target = self.target if target is None else target
+        expected_session_id = (
+            self.action_id if session_id is None else session_id
+        )
+        while (
+            self.active
+            and self.target == expected_target
+            and self.action_id == expected_session_id
+        ):
+            seed = self.get_stable_target_seed(
+                owner,
+                target=expected_target,
+                session_id=expected_session_id,
+            )
+            if seed is not None:
+                return seed
+            if timeout is not None and loop.time() - started_at >= timeout:
+                return None
+            await asyncio.sleep(check_interval)
+        return None
 
     async def start_tracking(
         self,
@@ -331,9 +213,7 @@ class TrackAction():
 
         self.action_id = action_id
         self.target = normalized_target
-        self.stable = False
-        self.stable_tick = 0
-        self._reset_person_stability(clear_point=True)
+        self.clear_stable_target_seed()
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = allow_grounding_dino
@@ -344,8 +224,8 @@ class TrackAction():
 
         yolo_sequence = None
         yolo_mode = (
-            "pose" if normalized_target in human_trackable_parts
-            else "dj" if normalized_target in dj_yolo_classes
+            "pose" if normalized_target in HUMAN_TRACKABLE_PARTS
+            else "dj" if normalized_target in DJ_YOLO_CLASSES
             else None
         )
         if yolo_mode is not None and hasattr(self.yolo, "activate"):
@@ -366,7 +246,7 @@ class TrackAction():
             )
             snapshot = self.camera.snapshot()
 
-            if normalized_target in human_trackable_parts:
+            if normalized_target in HUMAN_TRACKABLE_PARTS:
                 return await self._start_person_tracking(normalized_target)
 
             return await self._start_object_tracking(
@@ -435,7 +315,6 @@ class TrackAction():
             target=target,
             outcome="tracking",
             data={
-                "tracking_stable": False,
                 "detection_source": detection_source,
                 "detection_confidence": detection_confidence,
             },
@@ -454,7 +333,7 @@ class TrackAction():
         detection_source = None
         detection_confidence = None
 
-        if target in dj_yolo_classes:
+        if target in DJ_YOLO_CLASSES:
             matching = [
                 detection
                 for detection in self.yolo.detections
@@ -549,27 +428,34 @@ class TrackAction():
                 delta_pan_angle, delta_tilt_angle = self.target_to_angles(
                     target_x, target_y
                 )
-                await self.zmq_pub_socket.send_json({
-                    "delta_pan_angle": delta_pan_angle,
-                    "delta_tilt_angle": delta_tilt_angle,
-                    "tracking_sequence": f"csrt:{tracking_update.sequence}",
-                })
 
-                if (
+                centered = (
                     abs(target_x - 0.5) < self.stable_threshold
                     and abs(target_y - 0.5) < self.stable_threshold
-                ):
-                    self.stable_tick += 1
-                    if self.stable_tick >= 10:
-                        self.stable = True
-                        await self._remember_stable_target()
+                )
+                if not centered:
+                    await self.zmq_pub_socket.send_json({
+                        "delta_pan_angle": delta_pan_angle,
+                        "delta_tilt_angle": delta_tilt_angle,
+                        "tracking_sequence": f"csrt:{tracking_update.sequence}",
+                    })
+
+                if centered:
+                    seed = self.update_stable_target_seed(
+                        self.TRACKED_TARGET_SEED_OWNER,
+                        target=self.target,
+                    )
+                    if seed is not None:
+                        self._remember_stable_target()
                 else:
-                    self.stable_tick = 0
-                    self.stable = False
+                    self.clear_stable_target_seed(
+                        self.TRACKED_TARGET_SEED_OWNER
+                    )
             else:
+                self.clear_stable_target_seed(
+                    self.TRACKED_TARGET_SEED_OWNER
+                )
                 failure_frames += 1
-                self.stable_tick = 0
-                self.stable = False
                 if failure_frames >= self.OBJECT_FAILURE_GRACE_FRAMES:
                     # Keep the camera at its last tracked angle. Re-detect there and
                     # initialize a fresh CSRT instance instead of recentering/searching.
@@ -596,7 +482,7 @@ class TrackAction():
 
             await asyncio.sleep(0.05)
 
-    async def _remember_stable_target(self):
+    def _remember_stable_target(self):
         if self._memory_recorded_for_session:
             return
         state_snapshot = {
@@ -629,19 +515,7 @@ class TrackAction():
             "confidence": self.detection_confidence,
             "captured_at": camera.get("timestamp"),
         }
-        # Saving the session snapshot does not depend on persistent memory.
         self._memory_recorded_for_session = True
-        if self.semantic_memory is None:
-            return
-
-        record = await asyncio.to_thread(
-            self.semantic_memory.remember,
-            self.target,
-            state_snapshot,
-            self.detection_confidence,
-        )
-        if record is not None:
-            self.last_stable_target_location["semantic_record"] = record
 
     async def _start_person_tracking(self, target):
         detections = [
@@ -668,11 +542,9 @@ class TrackAction():
 
         person = max(detections, key=lambda detection: detection["confidence"])
         self.detection_confidence = float(person.get("confidence") or 1.0)
-        self.person_path = self.find_best_person_path(person, target)
+        self.person_path = find_best_person_path(person, target)
 
         self.person_path_index = 0
-        self.person_stable_count = 0
-
         feedback = await self.send_robot_command({
             "command": "track_action",
             "action_id": self.action_id,
@@ -690,101 +562,29 @@ class TrackAction():
             target=target,
             outcome="tracking",
             data={
-                "tracking_stable": False,
                 "detection_source": "yolo_pose",
                 "detection_confidence": person.get("confidence"),
                 "keypoint_path": list(self.person_path),
             },
         )
 
-    def find_best_person_path(self,person,target):
-        target_keypoints = HUMAN_RETARGETS.get(target)
-        visible_keypoints = [name for name,keypoint in person["keypoints"].items()]
-        best_path = None
-        shortest_path = float("inf")
-        for visible_keypoint in visible_keypoints:
-            for target_keypoint in target_keypoints:
-                path = self.find_skeleton_path(
-                    visible_keypoint,
-                    target_keypoint
-                )
-                if path and len(path) < shortest_path:
-                    shortest_path = len(path)
-                    best_path = path
-        return best_path
-
-    def find_skeleton_path(self,start,target):
-        queue = [(start,[start])]
-        visited = set()
-        while queue:
-            current,path = queue.pop(0)
-            if current == target: return path
-            if current in visited: continue
-            visited.add(current)
-            for neighbor in SKELETON_GRAPH[current]:
-                queue.append((neighbor,path + [neighbor]))
-        return None
-
-    @staticmethod
-    def _person_keypoint(person, name):
-        if name != "torso_center":
-            return person["keypoints"].get(name)
-
-        keypoints = person.get("keypoints") or {}
-        shoulders = [
-            keypoints[name]
-            for name in ("left_shoulder", "right_shoulder")
-            if name in keypoints
-        ]
-        hips = [
-            keypoints[name]
-            for name in ("left_hip", "right_hip")
-            if name in keypoints
-        ]
-        if shoulders and hips:
-            shoulder_x = sum(p["normalized_x"] for p in shoulders) / len(shoulders)
-            shoulder_y = sum(p["normalized_y"] for p in shoulders) / len(shoulders)
-            hip_x = sum(p["normalized_x"] for p in hips) / len(hips)
-            hip_y = sum(p["normalized_y"] for p in hips) / len(hips)
-            return {
-                "normalized_x": (shoulder_x + hip_x) * 0.5,
-                "normalized_y": (shoulder_y + hip_y) * 0.5,
-            }
-
-        bbox = person.get("bbox") or {}
-        center_x = bbox.get("normalized_center_x")
-        center_y = bbox.get("normalized_center_y")
-        if isinstance(center_x, (int, float)) and isinstance(
-            center_y, (int, float)
-        ):
-            return {
-                "normalized_x": float(center_x),
-                "normalized_y": float(center_y),
-            }
-        return None
-
-    def _reset_person_stability(self, clear_point=False):
-        self.person_stable = False
-        self.person_stable_tick = 0
-        if clear_point:
-            self._last_valid_person_point = None
-            self._last_valid_person_timestamp = None
+    def _clear_person_seed(self):
+        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
 
     async def _publish_stable_person_position(self):
         if self.person_tracker_pub_socket is None:
             return
-        camera_state = robot_state.get("camera") or {}
-        x = camera_state.get("object_x")
-        y = camera_state.get("object_y")
-        if not all(
-            isinstance(value, (int, float)) and math.isfinite(float(value))
-            for value in (x, y)
-        ):
+        seed = self.get_stable_target_seed(
+            self.TRACKED_TARGET_SEED_OWNER,
+            target=self.target,
+            session_id=self.action_id,
+        )
+        if seed is None:
             return
         await self.person_tracker_pub_socket.send_json({
             "type": "person_tof_position",
-            "x": float(x),
-            "y": float(y),
+            "x": seed["x"],
+            "y": seed["y"],
             "frame_id": "base_footprint",
             "sent_at_unix_ns": time.time_ns(),
             "action_id": self.action_id,
@@ -803,8 +603,8 @@ class TrackAction():
         """Keep lidar tracking enabled between visual reacquisition attempts."""
         await self._publish_person_tracking_state(True, action_id=action_id)
 
-    def _update_person_stability(self, person):
-        """Validate a fresh ToF point against the pose mask and recent motion."""
+    def _update_person_seed(self, person):
+        """Validate a centered person's ToF point against the pose mask."""
         camera_state = robot_state.get("camera") or {}
         timestamp = camera_state.get("timestamp")
         distance = camera_state.get("camera_tof_range")
@@ -817,8 +617,8 @@ class TrackAction():
             or time.monotonic() - float(timestamp)
             > self.PERSON_POINT_MAX_AGE_SECONDS
         ):
-            self._reset_person_stability()
-            return False
+            self._clear_person_seed()
+            return None
 
         try:
             frame_height, frame_width = self.camera.snapshot().tracking_bgr.shape[:2]
@@ -840,65 +640,18 @@ class TrackAction():
                 frame_width, frame_height, max(float(distance), 0.02)
             )
         except (KeyError, TypeError, ValueError, RuntimeError):
-            self._reset_person_stability()
-            return False
+            self._clear_person_seed()
+            return None
 
         tof_x, tof_y = tof_center
         if mask[tof_y, tof_x] == 0:
-            self._reset_person_stability()
-            return False
+            self._clear_person_seed()
+            return None
 
-        map_x = camera_state.get("object_map_x")
-        map_y = camera_state.get("object_map_y")
-        if all(
-            isinstance(value, (int, float)) and math.isfinite(float(value))
-            for value in (map_x, map_y)
-        ):
-            point = ("map", float(map_x), float(map_y))
-        else:
-            object_x = camera_state.get("object_x")
-            object_y = camera_state.get("object_y")
-            if not all(
-                isinstance(value, (int, float)) and math.isfinite(float(value))
-                for value in (object_x, object_y)
-            ):
-                self._reset_person_stability()
-                return False
-            point = ("base", float(object_x), float(object_y))
-
-        timestamp = float(timestamp)
-        previous = self._last_valid_person_point
-        previous_timestamp = self._last_valid_person_timestamp
-        if previous_timestamp is not None:
-            elapsed = timestamp - previous_timestamp
-            if elapsed <= 0.0:
-                return self.person_stable
-            if elapsed > self.PERSON_POINT_RESET_SECONDS:
-                previous = None
-                self._reset_person_stability(clear_point=True)
-
-        if previous is not None and previous[0] == point[0]:
-            elapsed = timestamp - float(previous_timestamp)
-            tolerance = (
-                self.PERSON_POINT_BASE_TOLERANCE_M
-                + self.PERSON_MAX_SPEED_MPS * elapsed
-            )
-            deviation = math.hypot(
-                point[1] - previous[1], point[2] - previous[2]
-            )
-            if deviation > tolerance:
-                self._reset_person_stability()
-                return False
-        else:
-            self.person_stable_tick = 0
-
-        self._last_valid_person_point = point
-        self._last_valid_person_timestamp = timestamp
-        self.person_stable_tick += 1
-        self.person_stable = (
-            self.person_stable_tick >= self.PERSON_STABLE_FRAMES
+        return self.update_stable_target_seed(
+            self.TRACKED_TARGET_SEED_OWNER,
+            target=getattr(self, "target", None),
         )
-        return self.person_stable
 
     async def _person_tracking_loop(self):
         current_reached = False
@@ -908,7 +661,7 @@ class TrackAction():
         keypoint_timeout_seconds = 2.0
         loop = asyncio.get_running_loop()
         last_inference_sequence = None
-        last_stability_update_at = None
+        last_seed_update_at = None
         last_lidar_heartbeat_at = loop.time()
 
         while self.active:
@@ -946,7 +699,7 @@ class TrackAction():
             ]
 
             if not detections:
-                self._reset_person_stability()
+                self._clear_person_seed()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
                 elif (
@@ -968,19 +721,8 @@ class TrackAction():
                 detections,
                 key=lambda detection: detection["confidence"]
             )
-            now = loop.time()
-            stability_update_interval = 1.0 / self.PERSON_STABILITY_UPDATE_HZ
-            if (
-                last_stability_update_at is None
-                or now - last_stability_update_at >= stability_update_interval
-            ):
-                self._update_person_stability(person)
-                if self.target in human_trackable_parts and self.person_stable:
-                    await self._publish_stable_person_position()
-                last_stability_update_at = now
-
             current_name = self.person_path[self.person_path_index]
-            current_keypoint = self._person_keypoint(person, current_name)
+            current_keypoint = person_keypoint(person, current_name)
 
             if not current_reached:
                 if current_keypoint is None:
@@ -1007,7 +749,7 @@ class TrackAction():
             if self.person_path_index < len(self.person_path) - 1:
                 if current_reached:
                     next_name = self.person_path[self.person_path_index + 1]
-                    next_keypoint = self._person_keypoint(person, next_name)
+                    next_keypoint = person_keypoint(person, next_name)
 
                     if next_keypoint is not None:
                         self.person_path_index += 1
@@ -1026,8 +768,21 @@ class TrackAction():
 
                 else:
                     if (abs(target_x - 0.5) < self.stable_threshold and abs(target_y - 0.5) < self.stable_threshold):
-                        predicted_target = self.predict_next_keypoint(person)
+                        predicted_target = predict_next_keypoint(
+                            person,
+                            self.person_path,
+                            self.person_path_index,
+                        )
                         current_reached = True
+
+            visual_override = self._current_visual_target_override()
+            if visual_override is not None:
+                target_x, target_y = visual_override
+
+            target_centered = (
+                abs(target_x - 0.5) < self.stable_threshold
+                and abs(target_y - 0.5) < self.stable_threshold
+            )
 
             delta_pan_angle,delta_tilt_angle = self.target_to_angles(target_x,target_y)
 
@@ -1061,86 +816,48 @@ class TrackAction():
                     ),
                 })
 
-            await self.zmq_pub_socket.send_json({
-                "delta_pan_angle": delta_pan_angle,
-                "delta_tilt_angle": delta_tilt_angle,
-                "tracking_sequence": f"pose:{inference_sequence}",
-                "tracking_timing": tracking_timing,
-            })
+            if visual_override is not None or not target_centered:
+                await self.zmq_pub_socket.send_json({
+                    "delta_pan_angle": delta_pan_angle,
+                    "delta_tilt_angle": delta_tilt_angle,
+                    "tracking_sequence": f"pose:{inference_sequence}",
+                    "tracking_timing": tracking_timing,
+                })
 
-            if self.person_path_index == len(self.person_path) - 1:
-                if (abs(target_x-0.5) < self.stable_threshold and abs(target_y-0.5) < self.stable_threshold):
-                    self.stable_tick += 1
-                    if self.stable_tick >= 5:
-                        self.stable = True
-                        await self._remember_stable_target()
-                else:
-                    self.stable_tick = 0
-                    self.stable = False
+            final_keypoint = self.person_path_index == len(self.person_path) - 1
+            if visual_override is None and final_keypoint and target_centered:
+                now = loop.time()
+                seed_update_interval = 1.0 / self.PERSON_SEED_UPDATE_HZ
+                if (
+                    last_seed_update_at is None
+                    or now - last_seed_update_at >= seed_update_interval
+                ):
+                    seed = self._update_person_seed(person)
+                    if seed is not None:
+                        self._remember_stable_target()
+                        await self._publish_stable_person_position()
+                    last_seed_update_at = now
+            elif visual_override is None:
+                self._clear_person_seed()
+                last_seed_update_at = None
 
             await asyncio.sleep(0.01)
 
-    def predict_next_keypoint(self,person):
-        if self.person_path_index == 0:
-            return None
+    async def adopt_person_tracking(
+        self,
+        action_id,
+        continuous_person_reacquisition=False,
+    ):
+        """Transfer an active human track without restarting the camera servo."""
+        if not self.active or self.target not in HUMAN_TRACKABLE_PARTS:
+            return False
 
-        previous_name = self.person_path[self.person_path_index - 1]
-        current_name = self.person_path[self.person_path_index]
-
-        previous_keypoint = person["keypoints"].get(previous_name)
-        current_keypoint = person["keypoints"].get(current_name)
-
-        if previous_keypoint is None or current_keypoint is None:
-            return None
-
-        previous_x = previous_keypoint["normalized_x"]
-        previous_y = previous_keypoint["normalized_y"]
-
-        current_x = current_keypoint["normalized_x"]
-        current_y = current_keypoint["normalized_y"]
-
-        delta_x = current_x - previous_x
-        delta_y = current_y - previous_y
-
-        predicted_x = current_x + delta_x
-        predicted_y = current_y + delta_y
-
-        predicted_x = max(0.0,min(1.0,predicted_x))
-        predicted_y = max(0.0,min(1.0,predicted_y))
-
-        return predicted_x,predicted_y
-
-    async def wait_until_stable(self,check_interval=0.05,timeout=10.0):
-        loop = asyncio.get_running_loop()
-        start_time = loop.time()
-
-        while self.active:
-            if self.stable:
-                return True
-
-            if (
-                timeout is not None
-                and loop.time() - start_time >= timeout
-            ):
-                return False
-
-            await asyncio.sleep(check_interval)
-
-        return False
-
-    async def wait_until_person_stable(self, check_interval=0.05, timeout=2.0):
-        """Wait for the quick pose/ToF stability used by person following."""
-        loop = asyncio.get_running_loop()
-        start_time = loop.time()
-
-        while self.active:
-            if self.person_stable:
-                return True
-            if timeout is not None and loop.time() - start_time >= timeout:
-                return False
-            await asyncio.sleep(check_interval)
-
-        return False
+        self.action_id = action_id
+        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
+        if continuous_person_reacquisition:
+            self._continuous_person_reacquisition = True
+        await self._publish_person_tracking_state(True)
+        return True
 
 
     async def wait_until_finished(self):
@@ -1157,8 +874,8 @@ class TrackAction():
             return
 
         tracking_task = self._tracking_task
-        was_person_tracking = self.target in human_trackable_parts
-        person_action_id = self.action_id
+        was_person_tracking = self.target in HUMAN_TRACKABLE_PARTS
+        tracked_action_id = self.action_id
         preserve_person_tracker = (
             was_person_tracking
             and status == "failed"
@@ -1190,7 +907,7 @@ class TrackAction():
 
         if was_person_tracking and not preserve_person_tracker:
             await self._publish_person_tracking_state(
-                False, action_id=person_action_id
+                False, action_id=tracked_action_id
             )
 
         return result
@@ -1204,8 +921,11 @@ class TrackAction():
     ):
         action_id = self.action_id or "unassigned"
         target = self.target
-        was_stable = self.stable
-        was_person_stable = self.person_stable
+        had_validated_seed = self.get_stable_target_seed(
+            self.TRACKED_TARGET_SEED_OWNER,
+            target=target,
+            session_id=action_id,
+        ) is not None
 
         result = ActionResult(
             action_id=action_id,
@@ -1216,8 +936,7 @@ class TrackAction():
             reason_code=reason_code,
             retryable=status == "failed",
             data={
-                "tracking_was_stable": was_stable,
-                "person_tracking_was_stable": was_person_stable,
+                "had_validated_seed": had_validated_seed,
                 **(data or {}),
             },
         )
@@ -1225,11 +944,10 @@ class TrackAction():
         completion_future = self.completion_future
 
         self._deactivate_yolo()
-        self.stable = False
-        self.stable_tick = 0
-        self._reset_person_stability(clear_point=True)
         self.active = False
         self._continuous_person_reacquisition = False
+        self._visual_target_override = None
+        self.clear_stable_target_seed()
         self.csrt_tracker.stop_tracking()
         self.action_id = None
         self.target = None

@@ -30,12 +30,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'topic_bridge.py = robot.topic_bridge:main',
-            'llm_bridge.py = robot.llm_bridge:main',
-            'trajectory.py = robot.trajectory:main',
-            'ring_bridge.py = robot.ring_bridge:main',
-            'servo_teleop.py = robot.servo_teleop:main',
-            'person_lidar_tracker.py = robot.person_lidar_tracker:main',
+            'topic_bridge.py = robot.bridge.topic_bridge:main',
+            'llm_bridge.py = robot.bridge.llm_bridge:main',
+            'trajectory.py = robot.store.trajectory:main',
+            'ring_bridge.py = robot.store.ring_bridge:main',
+            'test_servo.py = robot.utilities.camera_servo:main',
+            'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
         ],
     },
 )

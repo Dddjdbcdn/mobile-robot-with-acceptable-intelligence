@@ -2,7 +2,7 @@
 
 The Small Brain applies optional native V4L2 controls when it opens the USB
 camera. With no variables set, the camera keeps its driver defaults/current
-values. These settings do not affect the Astra camera stream.
+values.
 
 ## Connected camera controls
 

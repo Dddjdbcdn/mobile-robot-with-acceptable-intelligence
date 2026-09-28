@@ -104,8 +104,7 @@ def draw_tof_overlay(
     frame: np.ndarray,
     stale_after_s: float = 0.5,
     tracking: bool = False,
-    tracking_stable: bool = False,
-    person_tracking_stable: bool = False,
+    stable_seed_ready: bool = False,
 ) -> np.ndarray:
     d = robot_state["camera"]
     distance = d["camera_tof_range"]
@@ -158,11 +157,7 @@ def draw_tof_overlay(
     ]
 
     if tracking:
-        lines.append(f"Stable: {'YES' if tracking_stable else 'NO'}")
-        lines.append(
-            "Person stable: "
-            f"{'YES' if person_tracking_stable else 'NO'}"
-        )
+        lines.append(f"Stable seed: {'YES' if stable_seed_ready else 'NO'}")
 
     for i, text in enumerate(lines):
         cv2.putText(

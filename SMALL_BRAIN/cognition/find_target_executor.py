@@ -7,7 +7,7 @@ import time
 
 from actions.action_result import ActionResult
 from cognition.state import robot_state
-from actions.track_action import (
+from actions.tracking.target_catalog import (
     normalize_human_target,
     normalize_object_target,
 )
@@ -15,30 +15,36 @@ from actions.track_action import (
 
 @dataclass(frozen=True, slots=True)
 class FindLoopConfig:
-    max_local_waypoints: int = 2
-    max_destination_waypoints: int = 10
+    max_context_waypoints: int = 4
     max_exploration_waypoints: int = 20
     max_total_waypoints: int = 50
     max_duration_seconds: float = 600.0
     camera_center_pan_deg: float = 95.0
-    camera_horizontal_fov_deg: float = 60.0
+    camera_horizontal_fov_deg: float = 85.0
     camera_reliable_range_m: float = 2.0
 
 
-class GoalExecutor:
-    """Own the complete find -> track -> approach object goal."""
+class FindTargetExecutor:
+    """Own bounded finding for objects, people, and visually recognizable places."""
 
     MAP_SNAPSHOT_TIMEOUT = 8.0
+    KNOWN_PERSON_FACE_THRESHOLD_DEG = 60.0
     REACQUISITION_MISS_CODES = {
         "TARGET_NOT_VISIBLE",
         "SEARCH_CONTEXTUAL_CLUE",
         "OBJECT_DETECTION_FAILED",
         "PERSON_DETECTION_FAILED",
         "PERSON_KEYPOINT_TIMEOUT",
-        "TRACKING_STABILITY_TIMEOUT",
+        "STABLE_SEED_TIMEOUT",
         "POST_APPROACH_TRACKING_UNSTABLE",
         "OBJECT_LOST",
         "PERSON_LOST",
+    }
+    VISUAL_NAVIGATION_FALLBACK_CODES = {
+        "OBJECT_DETECTION_FAILED",
+        "PERSON_DETECTION_FAILED",
+        "TARGET_NOT_TRACKED",
+        "STABLE_SEED_TIMEOUT",
     }
 
     TURN_COMMANDS = {
@@ -49,22 +55,20 @@ class GoalExecutor:
 
     def __init__(
         self,
-        move_action,
         search_action,
         track_action,
         approach_action,
         see_action,
-        semantic_memory=None,
-        navigate_action=None,
+        map_navigation_action=None,
+        local_navigation_action=None,
         send_map_overlay=None,
     ):
-        self.move_action = move_action
         self.search_action = search_action
         self.track_action = track_action
         self.approach_action = approach_action
         self.see_action = see_action
-        self.semantic_memory = semantic_memory
-        self.navigate_action = navigate_action
+        self.map_navigation_action = map_navigation_action
+        self.local_navigation_action = local_navigation_action
         self.send_map_overlay = send_map_overlay
         self.find_loop = FindLoopConfig()
 
@@ -73,6 +77,7 @@ class GoalExecutor:
         self.target: str | None = None
         self.goal: str | None = None
         self.action_type: str | None = None
+        self.target_kind = "object"
         self.completion_future: asyncio.Future[ActionResult] | None = None
         self._runner: asyncio.Task | None = None
         self._completed_steps: list[str] = []
@@ -83,38 +88,50 @@ class GoalExecutor:
         self._search_waypoint_count = 0
         self._search_started_at = 0.0
         self._approach_standoff_m: float | None = None
+        self.approach_target = True
+        self._continuous_person_reacquisition = False
 
     async def start(
         self,
-        goal,
         target,
         action_id,
+        target_kind="object",
         approach_standoff_m=None,
+        approach=True,
+        continuous_person_reacquisition=False,
+        action_type=None,
     ) -> ActionResult:
-        """Start the one supported composite goal: find, track, and approach."""
+        """Find a target, optionally stopping after stable visual acquisition."""
         target = str(target or "").strip()
+        normalized_kind = str(target_kind or "object").strip().lower()
+        action_type = str(action_type or "find_target")
         if self.active:
             return ActionResult(
-                action_id, "find_object", "already_running", target=target or None,
+                action_id, action_type, "already_running", target=target or None,
                 outcome="already_running", reason_code="GOAL_BUSY", retryable=True,
                 data={"active_action_id": self.action_id},
             )
-        if str(goal or "").strip().lower() != "find_object":
+        if normalized_kind not in {"object", "place", "person"}:
             return self._invalid_result(
-                action_id, target or None, "UNKNOWN_GOAL", "unsupported_goal",
-                "find_object",
+                action_id, target or None, "UNKNOWN_TARGET_KIND", "unsupported_target_kind",
+                action_type,
             )
         if not target:
             return self._invalid_result(
                 action_id, None, "GOAL_TARGET_REQUIRED", "invalid_request",
-                "find_object",
+                action_type,
             )
 
         self.active = True
         self.action_id = action_id
         self.target = target
-        self.goal = "find_object"
-        self.action_type = "find_object"
+        self.goal = "find_target"
+        self.action_type = action_type
+        self.target_kind = normalized_kind
+        self.approach_target = bool(approach)
+        self._continuous_person_reacquisition = bool(
+            continuous_person_reacquisition
+        )
         self._completed_steps = []
         self._started_tracking = False
         self._approach_result_data = {}
@@ -131,12 +148,12 @@ class GoalExecutor:
 
         self.completion_future = asyncio.get_running_loop().create_future()
         self._runner = asyncio.create_task(
-            self._run(), name=f"find-object-{action_id}"
+            self._run(), name=f"find-{normalized_kind}-{action_id}"
         )
         self._runner.add_done_callback(self._runner_done)
         return ActionResult(
-            action_id, "find_object", "running", target=target,
-            outcome="finding_tracking_and_approaching",
+            action_id, action_type, "running", target=target,
+            outcome=f"finding_{normalized_kind}",
         )
 
     async def wait_until_finished(self) -> ActionResult:
@@ -152,12 +169,15 @@ class GoalExecutor:
 
         if self.approach_action.active:
             await self.approach_action.stop_approaching(reason_code)
-        if self.navigate_action is not None and self.navigate_action.active:
-            await self.navigate_action.stop(reason_code)
+        if self.map_navigation_action is not None and self.map_navigation_action.active:
+            await self.map_navigation_action.stop(reason_code)
+        if (
+            self.local_navigation_action is not None
+            and self.local_navigation_action.active
+        ):
+            await self.local_navigation_action.stop(reason_code)
         if self.search_action.active:
             await self.search_action.stop_searching(reason_code)
-        if self.move_action.active:
-            await self.move_action.stop_moving(reason_code)
         if self._started_tracking and self.track_action.active:
             await self.track_action.stop_tracking(reason_code)
 
@@ -171,17 +191,40 @@ class GoalExecutor:
         return result
 
     async def _run(self) -> None:
-        """Search until one candidate survives tracking and arrival checks."""
+        """Run the selected bounded search goal to its terminal result."""
         try:
+            person = robot_state.get("person") or {}
+            robot_pose = robot_state.get("pose") or {}
+            if (
+                getattr(self, "target_kind", "object") == "person"
+                and getattr(self, "local_navigation_action", None) is not None
+                and self._person_pose_is_fresh(person)
+                and self._person_bearing_exceeds_face_threshold(
+                    person, robot_pose
+                )
+            ):
+                facing = await self.local_navigation_action.start(
+                    "face_person", self._step_id("face_known_person")
+                )
+                facing = await self._terminal_result(
+                    self.local_navigation_action, facing
+                )
+                if facing.status == "succeeded":
+                    self._completed_steps.append("faced_known_person")
             result = await self._search_environment()
             if result.status != "succeeded":
-                raise GoalStepFailed("find", result)
+                raise GoalStepFailed(
+                    "find",
+                    result,
+                )
         except asyncio.CancelledError:
             return
         except GoalStepFailed as error:
             self._complete(
                 status="failed",
-                outcome="find_object_failed",
+                outcome=(
+                    "find_target_failed"
+                ),
                 reason_code=error.result.reason_code or "GOAL_STEP_FAILED",
                 data={
                     "failed_step": error.step,
@@ -198,17 +241,34 @@ class GoalExecutor:
             )
             return
 
-        self._complete(
-            status="succeeded",
-            outcome="found_reached_and_reacquired",
+        acquisition_only = (
+            getattr(self, "target_kind", "object") != "place"
+            and not getattr(self, "approach_target", True)
         )
+        if getattr(self, "target_kind", "object") == "place":
+            outcome = "place_reached"
+        elif acquisition_only:
+            outcome = (
+                "person_acquired"
+                if getattr(self, "target_kind", "object") == "person"
+                else "target_acquired"
+            )
+        else:
+            outcome = "found_reached_and_reacquired"
+        completion = {"status": "succeeded", "outcome": outcome}
+        if acquisition_only:
+            completion["data"] = result.data
+        self._complete(**completion)
 
     async def _track(self,allow_grounding_dino=True,step="track") -> ActionResult:
-        result = await self.track_action.start_tracking(
-            target=self.target,
-            action_id=self._step_id(step),
-            allow_grounding_dino=allow_grounding_dino,
-        )
+        tracking_options = {
+            "target": self.target,
+            "action_id": self._step_id(step),
+            "allow_grounding_dino": allow_grounding_dino,
+        }
+        if getattr(self, "_continuous_person_reacquisition", False):
+            tracking_options["continuous_person_reacquisition"] = True
+        result = await self.track_action.start_tracking(**tracking_options)
         if result.status == "running":
             self._started_tracking = True
             return ActionResult(
@@ -220,6 +280,83 @@ class GoalExecutor:
                 data=result.data,
             )
         return result
+
+    @staticmethod
+    def _person_pose_is_fresh(person):
+        return (
+            isinstance(person, dict)
+            and isinstance(person.get("x"), (int, float))
+            and isinstance(person.get("y"), (int, float))
+            and time.monotonic() - float(person.get("timestamp") or 0.0) <= 1.0
+        )
+
+    @classmethod
+    def _person_bearing_exceeds_face_threshold(cls, person, robot_pose):
+        values = (
+            person.get("x"), person.get("y"),
+            robot_pose.get("x"), robot_pose.get("y"), robot_pose.get("yaw"),
+        )
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in values
+        ):
+            return False
+        dx = float(person["x"]) - float(robot_pose["x"])
+        dy = float(person["y"]) - float(robot_pose["y"])
+        if math.hypot(dx, dy) <= 1e-6:
+            return False
+        bearing = math.atan2(dy, dx)
+        heading_error = math.atan2(
+            math.sin(bearing - float(robot_pose["yaw"])),
+            math.cos(bearing - float(robot_pose["yaw"])),
+        )
+        return abs(math.degrees(heading_error)) > (
+            cls.KNOWN_PERSON_FACE_THRESHOLD_DEG
+        )
+
+    async def _acquire_target_without_approach(self, attempt):
+        suffix = "" if attempt == 0 else f"_{attempt}"
+        person_target = getattr(self, "target_kind", "object") == "person"
+        target_label = "person" if person_target else "target"
+        self._completed_steps.append(
+            "target_found" if attempt == 0 else f"target_refound_{attempt}"
+        )
+        tracked = await self._track(
+            allow_grounding_dino=True,
+            step=f"acquire_{target_label}{suffix}",
+        )
+        if tracked.status != "succeeded":
+            return tracked
+        tracking_session_id = self.track_action.action_id
+        seed = await self.track_action.wait_for_stable_target_seed(
+            self.track_action.TRACKED_TARGET_SEED_OWNER,
+            target=self.track_action.target,
+            session_id=tracking_session_id,
+            timeout=10.0,
+        )
+        if seed is None:
+            return ActionResult(
+                self._step_id(f"align_{target_label}{suffix}"),
+                "track_action",
+                "failed",
+                target=self.target,
+                outcome="stable_seed_timeout",
+                reason_code="STABLE_SEED_TIMEOUT",
+                retryable=True,
+            )
+        self._completed_steps.append("target_tracked_and_aligned")
+        return ActionResult(
+            self._step_id(f"target_acquired{suffix}"),
+            "track_action",
+            "succeeded",
+            target=self.target,
+            outcome="target_found_and_aligned",
+            data={"tracking_active": True, "stable_seed": dict(seed)},
+        )
+
+    async def _acquire_person_without_approach(self, attempt):
+        """Compatibility wrapper for existing internal callers and tests."""
+        return await self._acquire_target_without_approach(attempt)
 
     async def _approach(self, step="approach") -> ActionResult:
         result = await self.approach_action.start_approaching(
@@ -293,7 +430,7 @@ class GoalExecutor:
             status="succeeded",
             target=self.target,
             outcome="post_approach_target_reacquired",
-            data={"tracking_stable": True, "search_effort": "best_effort"},
+            data={"stable_seed_ready": True, "search_effort": "best_effort"},
         )
         self._approach_result_data.update({
             "verified": True,
@@ -311,7 +448,8 @@ class GoalExecutor:
             mode=mode,
             observation=observation,
         )
-        result = await self.navigate_action.start_find_object_step(
+        navigation_action = self.map_navigation_action
+        result = await navigation_action.start_find_target_step(
             target=self.target,
             action_id=self._step_id(step),
             mode=mode,
@@ -319,7 +457,7 @@ class GoalExecutor:
             overlay_action_id=self.action_id,
             overlay_revision=revision,
         )
-        result = await self._terminal_result(self.navigate_action, result)
+        result = await self._terminal_result(navigation_action, result)
         if result.status == "succeeded":
             self._search_waypoint_count += 1
             self._completed_steps.append(step)
@@ -375,11 +513,36 @@ class GoalExecutor:
             pending_result = None
 
             if found or candidate_type == "visual":
+                if getattr(self, "target_kind", "object") == "place":
+                    if observation is None:
+                        return ActionResult(
+                            self._step_id("place_view_missing"), "search_action", "failed",
+                            target=self.target, reason_code="FOUND_VIEW_UNAVAILABLE",
+                        )
+                    return await self._navigate_search_step(
+                        dict(observation), mode="context", step="place_destination"
+                    )
+                visual_observation = (
+                    dict(observation) if isinstance(observation, dict) else None
+                )
                 self.search_action.last_observation_frame = None
                 waypoint_count_before = self._search_waypoint_count
-                verified = await self._track_approach_and_reacquire(
-                    candidate_attempt
-                )
+                if (
+                    getattr(self, "target_kind", "object") != "place"
+                    and not getattr(self, "approach_target", True)
+                ):
+                    if getattr(self, "target_kind", "object") == "person":
+                        verified = await self._acquire_person_without_approach(
+                            candidate_attempt
+                        )
+                    else:
+                        verified = await self._acquire_target_without_approach(
+                            candidate_attempt
+                        )
+                else:
+                    verified = await self._track_approach_and_reacquire(
+                        candidate_attempt
+                    )
                 if verified.status == "succeeded":
                     return verified
                 if verified.reason_code not in self.REACQUISITION_MISS_CODES:
@@ -391,6 +554,26 @@ class GoalExecutor:
                         outcome="candidate_not_verified",
                         reset_camera=False,
                     )
+
+                if (
+                    visual_observation is not None
+                    and verified.reason_code
+                    in self.VISUAL_NAVIGATION_FALLBACK_CODES
+                ):
+                    fallback_step = f"visual_fallback_{candidate_attempt + 1}"
+                    navigation = await self._navigate_search_step(
+                        visual_observation,
+                        mode="visual",
+                        step=fallback_step,
+                    )
+                    if navigation.status == "succeeded":
+                        candidate_attempt += 1
+                        step = fallback_step
+                        continue
+                    if navigation.reason_code not in {
+                        "NAVIGATION_BLOCKED", "NO_NAVIGATION_CANDIDATES"
+                    }:
+                        return navigation
 
                 rejection = (
                     "approach_destination_rejected"
@@ -413,16 +596,12 @@ class GoalExecutor:
                 step = f"approach_{candidate_attempt}_rejected"
                 continue
 
-            if candidate_type in {"local", "destination"}:
+            if candidate_type == "context":
                 if candidate_type != contextual_type:
-                    contextual_type = candidate_type
+                    contextual_type = "context"
                     contextual_movements = 0
-                if candidate_type == "local":
-                    mode = "context"
-                    movement_limit = self.find_loop.max_local_waypoints
-                else:
-                    mode = "destination"
-                    movement_limit = self.find_loop.max_destination_waypoints
+                mode = "context"
+                movement_limit = self.find_loop.max_context_waypoints
 
                 if contextual_movements < movement_limit:
                     payload = dict(observation)
@@ -487,6 +666,8 @@ class GoalExecutor:
             self.search_action.active
             and self._normalize_target(self.search_action.target)
             == self._normalize_target(self.target)
+            and getattr(self.search_action, "search_mode", "specific")
+            == ("place" if getattr(self, "target_kind", "object") == "place" else "specific")
         ):
             search_result = await self.search_action.wait_until_finished()
         else:
@@ -497,6 +678,10 @@ class GoalExecutor:
                 initial_view_only=initial_view_only,
                 sweep_directions=sweep_directions,
                 candidate_context=candidate_context,
+                search_mode=(
+                    "place" if getattr(self, "target_kind", "object") == "place"
+                    else "specific"
+                ),
             )
             search_result = await self._terminal_result(
                 self.search_action, search_result
@@ -678,11 +863,11 @@ class GoalExecutor:
         )
         if within_duration and within_waypoints:
             return None
-        reason_code = (
-            "OBJECT_SEARCH_WAYPOINT_LIMIT"
-            if not within_waypoints
-            else "OBJECT_SEARCH_DURATION_LIMIT"
+        prefix = (
+            "PLACE_SEARCH" if getattr(self, "target_kind", "object") == "place"
+            else "OBJECT_SEARCH"
         )
+        reason_code = f"{prefix}_{'WAYPOINT' if not within_waypoints else 'DURATION'}_LIMIT"
         return ActionResult(
             self._step_id("search_timeout"),
             "search_action",
@@ -707,7 +892,11 @@ class GoalExecutor:
             "failed",
             target=self.target,
             outcome="search_space_exhausted",
-            reason_code="OBJECT_SEARCH_EXHAUSTED",
+            reason_code=(
+                "PLACE_SEARCH_EXHAUSTED"
+                if getattr(self, "target_kind", "object") == "place"
+                else "OBJECT_SEARCH_EXHAUSTED"
+            ),
             data=data,
         )
 
@@ -733,7 +922,7 @@ class GoalExecutor:
             reason_code=reason_code,
             retryable=status == "failed",
             data={
-                "goal": self.goal,
+                "goal": getattr(self, "goal", None),
                 "completed_steps": list(self._completed_steps),
                 "search_waypoint_count": self._search_waypoint_count,
                 "search_poses": list(self._search_poses),

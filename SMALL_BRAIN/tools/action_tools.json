@@ -1,36 +1,24 @@
 [
   {
     "type": "function",
-    "name": "find_object",
-    "description": "Find, track, and approach a named object as one complete goal. After approaching, the robot performs a maximum-effort search and must reacquire stable tracking; otherwise it resumes finding. Call once and use stop_goal to cancel.",
+    "name": "find_target",
+    "description": "Find, search for, locate, approach, or go to a named non-person object or visually recognizable place. Trigger phrases include 'find the bottle', 'look for my keys', 'locate the chair', 'move next to the table', and 'go to the kitchen'. Never use find_target for a person, a request to continuously watch a target, a pure visual question, or a clearly stated direction. Use watch_target for continuous watching, see_action for visual questions, and explicit_navigation for clear movement directions. Hand-guided movement is automatic and has no tool call.",
     "parameters": {
       "type": "object",
       "properties": {
         "target": {
           "type": "string",
-          "description": "The specific object to find and approach."
-        }
-      },
-      "required": [
-        "target"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
-    "name": "watch_target",
-    "description": "Start continuous camera tracking. If succeeded, tracking remains active until replaced by another camera action or stopped with stop_tracking.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "target": {
+          "description": "The non-person object or recognizable place named by the user. Preserve useful visual qualifiers, for example 'red bottle' or 'door beside the television'."
+        },
+        "target_kind": {
           "type": "string",
-          "description": "The specific person, body part, or object concerned by the request."
+          "enum": ["object", "place"],
+          "description": "Whether the target is an object or a visually recognizable place. People are not valid find_target targets."
         }
       },
       "required": [
-        "target"
+        "target",
+        "target_kind"
       ],
       "additionalProperties": false
     }
@@ -38,18 +26,18 @@
   {
     "type": "function",
     "name": "see_action",
-    "description": "Look at the current scene and answer a visual question. Optionally move the camera to a semantic region first; the observation is always captured after the camera settles, so never call a separate camera-move tool.",
+    "description": "Perform one visual observation and answer a question about the current scene. Trigger phrases include 'what do you see?', 'is there a bottle?', 'what color is the chair?', 'look left and tell me what is there', and 'check above you'. Optionally aim the camera first using region; the image is captured after the camera settles, so never call another camera-movement tool. Do not use see_action to continuously watch a target, move the robot, or search the environment. Use watch_target for continuous watching. Hand-guided movement is automatic and has no tool call.",
     "parameters": {
       "type": "object",
       "properties": {
         "query": {
           "type": "string",
-          "description": "What to inspect or determine from the new camera image."
+          "description": "A complete visual question describing what the model must inspect or determine from the newly captured image."
         },
         "region": {
           "type": ["string", "null"],
           "enum": ["upper_left", "up", "upper_right", "left", "center", "right", "lower_left", "down", "lower_right", null],
-          "description": "Optional camera direction to move to before observing; null keeps the current view."
+          "description": "Camera direction explicitly requested by the user before the one-shot observation. Use null when no clear viewing direction was stated."
         }
       },
       "required": ["query", "region"],
@@ -58,35 +46,57 @@
   },
   {
     "type": "function",
-    "name": "navigate_action",
-    "description": "Goal-mode navigation. The robot may repeatedly inspect a local map crop and camera view, choose safe Nav2 waypoints, and roam until the complete movement goal is visibly confirmed, blocked, stopped, or a safety limit is reached. Call once for the whole navigation goal.",
+    "name": "explicit_navigation",
+    "description": "Execute one clear movement whose direction or destination is fully stated in the user's speech. Trigger phrases include 'move/go forward', 'back up', 'step/nudge left', 'turn/rotate right', 'turn around', 'go as far forward as possible', 'move to the middle of this open space', 'go back to the previous position', 'leave/exit this room', 'go into the next room', 'go to Room 2', and 'return to where you started'. Do not infer a direction from a gesture or vague word. Use watch_target for 'look at me' or 'watch the bottle', and find_target when the destination is a named object or visually recognizable place. Hand-guided movement is automatic and has no tool call.",
     "parameters": {
       "type": "object",
       "properties": {
-        "query": {
+        "local_command": {
           "type": "string",
-          "description": "The complete destination or roaming goal, including any visual arrival condition."
+          "enum": ["nudge_forward", "nudge_backward", "nudge_left", "nudge_right", "rotate_left", "rotate_right", "rotate_around", "furthest_forward", "furthest_backward", "open_space_middle", "previous_position", "exit_room", "go_to_another_room", "go_to_room", "return_to_initial_place"],
+          "description": "Map the user's explicit wording to exactly one command. Use nudge_* for a short translation, rotate_* for an in-place turn, furthest_* for maximum reachable travel, open_space_middle for the center of free space, previous_position to undo the last navigation, exit_room to reach but not cross the current exit, go_to_another_room to cross into the adjacent room, go_to_room for a numbered room, and return_to_initial_place for the startup location in Room 1."
         },
-        "completion_mode": {
-          "type": "string",
-          "enum": ["single_move", "verify_goal"],
-          "description": "Use single_move when one bounded displacement or turn directly completes the request, such as nudge forward, move slightly, back up a little, or turn left. Use verify_goal for destinations, roaming, and goals requiring fresh visual confirmation after waypoints."
+        "room_id": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Required room number only when local_command is go_to_room; use null for every other command."
         }
       },
-      "required": ["query", "completion_mode"],
+      "required": ["local_command", "room_id"],
       "additionalProperties": false
     }
   },
   {
     "type": "function",
-    "name": "follow_action",
-    "description": "Find a person, initialize camera/ToF-assisted lidar tracking, then continuously follow the lidar-estimated person pose with Nav2. This remains active until stopped.",
+    "name": "watch_target",
+    "description": "Continuously watch a person or object without approaching it. Trigger phrases include 'look at me', 'face me', 'watch me', 'keep looking at me', 'watch the bottle', and 'keep your eyes on the door'. The robot runs the normal find-target search with approach disabled, aligns the camera, and leaves TrackAction active until stop_watching_target or another camera-owning action. Do not use this for a one-shot visual question, person-indicated navigation, or following a moving person with the robot base.",
     "parameters": {
       "type": "object",
       "properties": {
         "target": {
           "type": "string",
-          "description": "The person to follow. Use person for an unspecified person."
+          "description": "The person or object to watch, preserving useful visual qualifiers. Use 'person' when the user says me without another identity."
+        },
+        "target_kind": {
+          "type": "string",
+          "enum": ["object", "person"],
+          "description": "Whether the watched target is a person or an object."
+        }
+      },
+      "required": ["target", "target_kind"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "follow_person",
+    "description": "Continuously move behind a person. Trigger phrases include 'follow me', 'come with me', 'walk with me', 'stay with me', 'trail me', and 'follow that person'. The robot finds the person, initializes camera/ToF-assisted lidar tracking, and repeatedly follows the estimated pose with Nav2 until stop_follow is called. Do not use follow_person for hand gestures or for 'look at me' (use watch_target).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The person named by the user. Use 'person' when no identity or distinguishing description was given."
         }
       },
       "required": ["target"],

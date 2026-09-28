@@ -3,39 +3,39 @@ from io import BytesIO
 from PIL import Image, ImageDraw
 import asyncio
 import base64
+import copy
 import json
 from pathlib import Path
 import time
 from typing import Any
 import uuid
 
-# Assuming these are available in your environment
-from utilities.database_functions import load_json
-
 from cognition.state import robot_state
-from actions.track_action import dj_yolo_classes, normalize_object_target
+from actions.tracking.target_catalog import (
+    DJ_YOLO_CLASSES,
+    normalize_object_target,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VISION_OOB_TOOLS_PATH = str(REPO_ROOT / "tools" / "vision_oob_tools.json")
+VISION_OOB_TOOLS_PATH = REPO_ROOT / "tools" / "vision_oob_tools.json"
 
-tools = load_json(VISION_OOB_TOOLS_PATH)
+with VISION_OOB_TOOLS_PATH.open(encoding="utf-8") as tools_file:
+    tools = json.load(tools_file)
 vision_oob_tools = {tool["name"]: tool for tool in tools}
 ASSESS_BATCH_SEARCH_TOOL = vision_oob_tools.get("assess_batch_search")
 ASSESS_FRAME_SEARCH_TOOL = vision_oob_tools.get("assess_frame_search")
 
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.5
 SEARCH_CANDIDATE_TYPES = {
-    "visual", "local", "destination", "speculative",
+    "visual", "context", "speculative",
 }
 CANDIDATE_TYPE_GUIDANCE = (
     "Classify candidate_type strictly. visual means an object closely matches the "
     "target visually, or a target-specific part is visible, but it is not yet "
-    "definitive. local means specific target-linked evidence is visible nearby and "
-    "a short movement may reveal the target; generic containers and ordinary nearby "
-    "objects are not local evidence. destination means a recognized or mapped place "
-    "or route has a strong semantic relationship to the target; an unidentified "
-    "hallway alone is not a destination. speculative means only a generic possibility "
-    "with no target-specific evidence. Use visual, local, or destination only when "
+    "definitive. context means specific target-linked evidence or a recognized place "
+    "is visible and moving within that 85-degree view may reveal the target; generic "
+    "containers and unidentified routes are not context. speculative means only a generic possibility "
+    "with no target-specific evidence. Use visual or context only when "
     "the visible evidence closely supports that definition; otherwise use speculative."
 )
 CAMERA_HORIZONTAL_FOV_DEG = 85
@@ -109,6 +109,11 @@ class SearchAction:
         self.batch_results = []
         self.pending_request_id = None
         self.candidate_context = None
+        self.search_mode = "specific"
+
+    def _assessment_tool(self, *, batch: bool):
+        template = ASSESS_BATCH_SEARCH_TOOL if batch else ASSESS_FRAME_SEARCH_TOOL
+        return copy.deepcopy(template)
 
     def _candidate_context_instruction(self) -> str:
         context = self.candidate_context
@@ -296,22 +301,23 @@ class SearchAction:
             await self.complete_searching("succeeded", "found")
             return
 
+        instruction = (
+                f"Search for this {'place' if self.search_mode == 'place' else 'object'}: {self.target}\n\n"
+                f"{self._candidate_context_instruction()}"
+                "Use found only when the requested target is definitively visible.\n"
+                "Use candidate only for one specific but not yet definitive piece "
+                "of visible evidence.\n"
+                f"{CANDIDATE_TYPE_GUIDANCE}\n"
+                "Use not_found when neither the target nor a useful clue is visible.\n"
+                "Only candidate needs candidate_type and contextual_clue. "
+                "Use null candidate_type for found/not_found. "
+                "Only found needs target_position.\n"
+                "Always call assess_frame_search exactly once."
+        )
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
-                "text": (
-                    f"Search for this object: {self.target}\n\n"
-                    f"{self._candidate_context_instruction()}"
-                    "Use found only when the requested target is definitively visible.\n"
-                    "Use candidate only for one specific but not yet definitive piece "
-                    "of visible evidence.\n"
-                    f"{CANDIDATE_TYPE_GUIDANCE}\n"
-                    "Use not_found when neither the target nor a useful clue is visible.\n"
-                    "Only candidate needs candidate_type and contextual_clue. "
-                    "Use null candidate_type for found/not_found. "
-                    "Only found needs target_position.\n"
-                    "Always call assess_frame_search exactly once."
-                ),
+                "text": instruction,
             },
             {
                 "type": "input_image",
@@ -330,7 +336,7 @@ class SearchAction:
                     "request_id": request_id,
                 },
                 "output_modalities": ["text"],
-                "tools": [ASSESS_FRAME_SEARCH_TOOL],
+                "tools": [self._assessment_tool(batch=False)],
                 "tool_choice": "required",
                 "input": [{"type": "message", "role": "user", "content": content}],
             },
@@ -351,7 +357,7 @@ class SearchAction:
         if self.yolo is None:
             return None
         normalized_target = normalize_object_target(self.target)
-        if normalized_target not in dj_yolo_classes:
+        if normalized_target not in DJ_YOLO_CLASSES:
             return None
         detections = [
             detection for detection in list(self.yolo.detections)
@@ -401,29 +407,33 @@ class SearchAction:
                 f"clue={initial_assessment.get('contextual_clue')}. "
                 "Compare it with any side clues and select the best one.\n"
             )
+        specific_instruction = (
+            f"Search for this object: {self.target}\n\n"
+            f"{self._candidate_context_instruction()}"
+            "These images together cover the available horizontal search view. "
+            "The center image was assessed first and is reused here; the other "
+            "images are only the left/right directions. Rank all supplied images "
+            "together.\n"
+            f"Current tilt: {tilt_position}\n"
+            f"{images_order}\n"
+            f"{prior_candidate}"
+            "Examine every supplied image. Use found only when the requested "
+            "target is definitively visible; provide its image and target_position.\n"
+            "Use candidate only for one specific but not yet definitive piece "
+            "of visible evidence; provide its image, candidate_type, and "
+            "contextual_clue.\n"
+            f"{CANDIDATE_TYPE_GUIDANCE}\n"
+            "Use not_found when neither the target nor a useful clue is visible.\n"
+            "Use null candidate_type and contextual_clue for found/not_found, "
+            "and null target_position for candidate/not_found.\n"
+            "Always call assess_batch_search exactly once."
+        )
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
-                "text": (
-                    f"Search for this object: {self.target}\n\n"
-                    f"{self._candidate_context_instruction()}"
-                    "These images together cover the available horizontal search view. "
-                    "The center image was assessed first and is reused here; the other "
-                    "images are only the left/right directions whose 60-degree, 2-meter "
-                    "Rank all supplied images together.\n"
-                    f"Current tilt: {tilt_position}\n"
-                    f"{images_order}\n"
-                    f"{prior_candidate}"
-                    "Examine every supplied image. Use found only when the requested "
-                    "target is definitively visible; provide its image and target_position.\n"
-                    "Use candidate only for one specific but not yet definitive piece "
-                    "of visible evidence; provide its image, candidate_type, and "
-                    "contextual_clue.\n"
-                    f"{CANDIDATE_TYPE_GUIDANCE}\n"
-                    "Use not_found when neither the target nor a useful clue is visible.\n"
-                    "Use null candidate_type and contextual_clue for found/not_found, "
-                    "and null target_position for candidate/not_found.\n"
-                    "Always call assess_batch_search exactly once."
+                "text": specific_instruction.replace(
+                    "Search for this object:",
+                    f"Search for this {'place' if self.search_mode == 'place' else 'object'}:",
                 ),
             }
         ]
@@ -452,7 +462,7 @@ class SearchAction:
                     "sweep_index": str(self.sweep_index),
                 },
                 "output_modalities": ["text"],
-                "tools": [ASSESS_BATCH_SEARCH_TOOL],
+                "tools": [self._assessment_tool(batch=True)],
                 "tool_choice": "required",
                 "input": [{"type": "message", "role": "user", "content": content}],
             },
@@ -636,6 +646,7 @@ class SearchAction:
         initial_view_only=False,
         sweep_directions=None,
         candidate_context=None,
+        search_mode="specific",
     ):
         if self.active:
             return ActionResult(
@@ -672,6 +683,16 @@ class SearchAction:
                 outcome="invalid_request",
                 reason_code="UNKNOWN_SEARCH_EFFORT",
             )
+        normalized_mode = str(search_mode or "specific").strip().lower()
+        if normalized_mode not in {"specific", "place"}:
+            return ActionResult(
+                action_id=action_id,
+                action_type="search_action",
+                status="failed",
+                target=normalized_target,
+                outcome="invalid_request",
+                reason_code="UNKNOWN_SEARCH_MODE",
+            )
 
         self.reset_state()
         self.last_observation_frame = None
@@ -682,6 +703,7 @@ class SearchAction:
         self.action_id = action_id
         self.search_id = action_id
         self.target = normalized_target
+        self.search_mode = normalized_mode
         self.effort = normalized_effort
         self.initial_view_only = initial_view_only is True
         self.candidate_context = (
@@ -708,8 +730,10 @@ class SearchAction:
         yolo_sequence = None
         yolo_target = normalize_object_target(normalized_target)
         if (
+            self.search_mode == "specific"
+            and
             self.yolo is not None
-            and yolo_target in dj_yolo_classes
+            and yolo_target in DJ_YOLO_CLASSES
             and hasattr(self.yolo, "activate")
         ):
             self._yolo_owner = f"search:{action_id}"
@@ -730,6 +754,7 @@ class SearchAction:
             data={
                 "effort": self.effort,
                 "initial_view_only": self.initial_view_only,
+                "search_mode": self.search_mode,
             },
         )
 
@@ -789,6 +814,12 @@ class SearchAction:
                 clue_frame = dict(frame)
                 clue_frame["contextual_clue"] = clue["text"]
                 clue_frame["candidate_type"] = clue["candidate_type"]
+        elif outcome == "found" and isinstance(self.current_candidate, dict):
+            frame = self.current_candidate.get("frame")
+            if isinstance(frame, dict):
+                clue_frame = dict(frame)
+                clue_frame["candidate_type"] = "found"
+                clue_frame["contextual_clue"] = f"Confirmed {self.target} in this view."
 
         data = {
             "initial_frame_assessment": first_frame_result,

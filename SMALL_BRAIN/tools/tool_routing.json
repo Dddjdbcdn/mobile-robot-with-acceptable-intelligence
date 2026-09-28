@@ -1,0 +1,30 @@
+{
+  "core_rules": [
+    "Choose tools from the user's intended outcome, not from one keyword in isolation.",
+    "Call at most one action tool for one command unless a tool result explicitly requires another decision.",
+    "Do not narrate an action that a tool can perform; call the correct tool.",
+    "Do not invent unsupported tool names or parameter values.",
+    "Hand-guided movement is automatic while a person is tracked and has no tool call."
+  ],
+  "action_vocabulary": {
+    "find_target": "find, search for, look for, locate, approach, move next to, or go to a named non-person object or recognizable place",
+    "see_action": "what do you see, can you see, is there, what color, inspect, check, or look in a clear camera direction and report what is visible",
+    "explicit_navigation": "move, go, back up, nudge, turn, rotate, turn around, exit, move to the center, middle, open space, next room, numbered room, previous position, or starting place when the direction or destination is explicit",
+    "watch_target": "look at me, face me, watch me, watch the named object, keep looking, or keep your eyes on the target",
+    "follow_person": "follow me, come with me, walk with me, stay with me, trail me, or follow that person"
+  },
+  "important_distinctions": [
+    "Come with me means continuously move with the speaker: follow_person.",
+    "Look at me means continuous person-facing camera tracking: watch_target with target_kind person.",
+    "Look left means a one-shot observation only when the user wants visual information; use see_action with region left.",
+    "Turn left or move left changes the robot pose: explicit_navigation.",
+    "Do not call a tool for a hand gesture; the background hand-guidance controller owns it.",
+    "Go to the kitchen names a recognizable place: find_target. Go to Room 2 names a map command: explicit_navigation."
+  ],
+  "stop_vocabulary": {
+    "stop_goal": "stop searching, stop looking for it, cancel finding the target, or stop going to the named object/place",
+    "stop_navigation": "stop moving, halt, cancel navigation, or don't go there",
+    "stop_follow": "stop following me, don't follow me, wait here, or stay here",
+    "stop_watching_target": "stop looking, stop watching the target, look away, or don't track me"
+  }
+}

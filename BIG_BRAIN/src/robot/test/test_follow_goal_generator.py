@@ -1,8 +1,9 @@
 import math
+from dataclasses import replace
 
 import pytest
 
-from robot.follow_goal_generator import FollowGoalGenerator
+from robot.person_pose.follow_goal_generator import FollowGoalGenerator
 
 
 def test_generates_standoff_goal_without_unneeded_rotation():
@@ -116,3 +117,25 @@ def test_stale_camera_falls_back_to_lidar_heading():
     assert goal is not None
     assert not goal.used_camera
     assert math.degrees(goal.yaw) == pytest.approx(-45.0)
+    assert goal.camera_pan_target_deg == pytest.approx(50.0)
+
+
+def test_goal_update_policy_uses_motion_yaw_and_refresh_thresholds():
+    generator = FollowGoalGenerator()
+    goal = generator.generate(
+        person_x=2.0,
+        person_y=0.0,
+        robot_x=0.0,
+        robot_y=0.0,
+        robot_yaw=0.0,
+    )
+
+    assert goal is not None
+    previous = (goal.x, goal.y, goal.yaw)
+    assert generator.should_publish(goal, None, None)
+    assert not generator.should_publish(goal, previous, 0.2)
+    assert generator.should_publish(replace(goal, x=goal.x + 0.1), previous, 0.2)
+    assert generator.should_publish(
+        replace(goal, yaw=math.radians(5.0)), previous, 0.2
+    )
+    assert generator.should_publish(goal, previous, 0.8)

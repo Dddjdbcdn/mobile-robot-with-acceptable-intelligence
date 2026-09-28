@@ -75,6 +75,7 @@ SMALL_BRAIN/vision_models/sam2_tools/sam2/
 **/openvino_models/
 **/*_openvino_model/
 **/*_openvino_model_*/
+SMALL_BRAIN/vision_models/hand_landmark_tools/hand_landmarker.task
 
 # Inference/compiler caches and runtime output
 **/.ov_cache*/

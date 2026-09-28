@@ -15,14 +15,14 @@ slam_toolbox:
     base_frame: base_footprint
     # The person tracker removes only the actively tracked person from this
     # stream. Nav2 still uses raw /scan for dynamic collision avoidance.
-    scan_topic: /scan_slam
+    scan_topic: /scan
     use_map_saver: true
     mode: mapping 
 
     debug_logging: false
     throttle_scans: 1
     transform_publish_period: 0.02 #if 0 never publishes odometry
-    map_update_interval: 10.0 # less frequent reduces jitter
+    map_update_interval: 5.0 # less frequent reduces jitter
     resolution: 0.05
     restamp_tf: false
     min_laser_range: 0.2 #for rastering images

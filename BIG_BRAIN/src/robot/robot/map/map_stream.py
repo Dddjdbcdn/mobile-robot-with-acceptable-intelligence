@@ -9,8 +9,9 @@ import math
 import cv2
 import zmq
 
-from robot.map_logic import MapLogic
-from robot.map_renderer import MapRenderer
+from robot.map.map_logic import MapLogic
+from robot.map.map_renderer import MapRenderer
+from robot.map.room_registry import RoomRegistry
 
 BASE_FRAME = "base_footprint"
 IMAGE_ENDPOINT = "tcp://127.0.0.1:5559"
@@ -42,6 +43,7 @@ class MapImageStream:
             raise ValueError("FIXED_HZ must be positive")
 
         self.logic = MapLogic()
+        self.room_registry = RoomRegistry(self.logic)
         self.renderer = MapRenderer()
         self.context = context
         self.socket = None
@@ -50,6 +52,8 @@ class MapImageStream:
         self.map_msg = None
         self.cost_msg = None
         self.prepared = None
+        self._map_revision = 0
+        self._map_received_at_unix_ns = 0
         self._not_ready_reason = "Waiting for /map and /global_costmap/costmap"
         self._last_render_error = None
         self._coverage_key = None
@@ -80,6 +84,8 @@ class MapImageStream:
     def _map(self, msg):
         with self.state_lock:
             self.map_msg = msg
+            self._map_revision += 1
+            self._map_received_at_unix_ns = time.time_ns()
 
     def _cost(self, msg):
         with self.state_lock:
@@ -114,10 +120,11 @@ class MapImageStream:
     @staticmethod
     def _overlay_pose(item):
         try:
+            yaw = item["yaw"] if "yaw" in item else item["angle"]
             return {
                 "x": float(item["x"]),
                 "y": float(item["y"]),
-                "yaw": float(item["yaw"]),
+                "yaw": float(yaw),
                 "frame_id": str(item.get("frame_id") or "map"),
             }
         except (KeyError, TypeError, ValueError):
@@ -146,7 +153,7 @@ class MapImageStream:
             and revision < int(self.search_overlay.get("revision", 0))
         ):
             return operation
-        mode = str(message.get("mode") or "goal")
+        mode = str(message.get("mode") or "exploration")
         observation = message.get("observation")
         normalized_observation = None
         if isinstance(observation, dict):
@@ -190,7 +197,7 @@ class MapImageStream:
             "mode": mode,
             "observation": normalized_observation,
             "search_poses": search_poses,
-            "camera_horizontal_fov_deg": float(message.get("camera_horizontal_fov_deg", 60.0)),
+            "camera_horizontal_fov_deg": float(message.get("camera_horizontal_fov_deg", 85.0)),
             "camera_reliable_range_m": float(message.get("camera_reliable_range_m", 2.0)),
         }
         self._encoded_cache = None
@@ -218,6 +225,8 @@ class MapImageStream:
         with self.state_lock:
             map_msg = self.map_msg
             cost_msg = self.cost_msg
+            map_revision = self._map_revision
+            map_received_at_unix_ns = self._map_received_at_unix_ns
         if map_msg is None:
             self._not_ready_reason = "Waiting for OccupancyGrid on /map"
             return 0.1
@@ -250,6 +259,9 @@ class MapImageStream:
         )
         prepared["prepared_at_monotonic"] = finished_at
         prepared["prepared_at_unix_ns"] = time.time_ns()
+        prepared["map_revision"] = map_revision
+        prepared["map_received_at_unix_ns"] = map_received_at_unix_ns
+        self.room_registry.ensure_startup_room(prepared, pose)
         with self.state_lock:
             self.prepared = prepared
         self._not_ready_reason = None
@@ -301,19 +313,41 @@ class MapImageStream:
                 self.socket.send_json({"ok": True, "operation": operation})
                 return
             crop_size_m = message.get("crop_size_m")
+            render_frontiers = bool(message.get("render_frontiers", False))
+            pending_navigation_pose = self._overlay_pose(
+                message.get("pending_navigation_pose")
+            )
             encoded = (
                 self._encoded_cache
-                if self.delivery_mode == "fixed_hz" and crop_size_m is None else None
+                if (
+                    self.delivery_mode == "fixed_hz"
+                    and crop_size_m is None
+                    and not render_frontiers
+                    and pending_navigation_pose is None
+                ) else None
             )
             if encoded is None:
-                encoded = self._encode_snapshot(crop_size_m=crop_size_m)
+                encoded = self._encode_snapshot(
+                    crop_size_m=crop_size_m,
+                    render_frontiers=render_frontiers,
+                    pending_navigation_pose=pending_navigation_pose,
+                )
                 # At startup a request can arrive before the first periodic
                 # analysis. Prepare immediately once instead of making the
                 # client wait for the background schedule.
                 if encoded is None and self.prepared is None:
                     self._refresh_analysis()
-                    encoded = self._encode_snapshot(crop_size_m=crop_size_m)
-                if self.delivery_mode == "fixed_hz" and crop_size_m is None:
+                    encoded = self._encode_snapshot(
+                        crop_size_m=crop_size_m,
+                        render_frontiers=render_frontiers,
+                        pending_navigation_pose=pending_navigation_pose,
+                    )
+                if (
+                    self.delivery_mode == "fixed_hz"
+                    and crop_size_m is None
+                    and not render_frontiers
+                    and pending_navigation_pose is None
+                ):
                     self._encoded_cache = encoded
             if encoded is None:
                 self.socket.send_json({
@@ -341,7 +375,8 @@ class MapImageStream:
             })
 
     def _compose_snapshot(
-        self, prepared, pose, camera_pan_angle, crop_size_m=None
+        self, prepared, pose, camera_pan_angle, crop_size_m=None,
+        render_frontiers=False, pending_navigation_pose=None,
     ):
         """Coordinate planning, visibility analysis, rendering, and metadata."""
         overlay = self.search_overlay
@@ -401,6 +436,8 @@ class MapImageStream:
                 observation=observation,
                 observation_mask=observation_mask,
                 pose_marker_scale=marker_scale,
+                frontiers=(prepared["frontiers"] if render_frontiers else None),
+                pending_navigation_pose=pending_navigation_pose,
             )
             return image, rendered["view"]
 
@@ -420,8 +457,7 @@ class MapImageStream:
             "robot_pose": pose,
             "candidates": candidates,
             "frontiers": prepared["frontiers"],
-            "doors": prepared["doors"],
-            "rooms": prepared["rooms"],
+            "pending_navigation_pose": pending_navigation_pose,
             "sample_radius_m": self.logic.cfg.sample_radius,
             "selection_mode": mode,
             "selection_policy": "vision",
@@ -538,7 +574,10 @@ class MapImageStream:
         return cropped, metadata
 
 
-    def _encode_snapshot(self, crop_size_m=None):
+    def _encode_snapshot(
+        self, crop_size_m=None, render_frontiers=False,
+        pending_navigation_pose=None,
+    ):
         self._last_render_error = None
         with self.state_lock:
             prepared = self.prepared
@@ -557,7 +596,9 @@ class MapImageStream:
         try:
             camera_pan_angle = self.logic.cfg.camera_center_pan_deg
             image, metadata, full_image = self._compose_snapshot(
-                prepared, pose, camera_pan_angle, crop_size_m=crop_size_m
+                prepared, pose, camera_pan_angle, crop_size_m=crop_size_m,
+                render_frontiers=render_frontiers,
+                pending_navigation_pose=pending_navigation_pose,
             )
             ok, jpeg = cv2.imencode(
                 ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]

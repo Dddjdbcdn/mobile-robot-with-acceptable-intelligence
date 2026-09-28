@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 
 from actions.action_result import ActionResult
-from actions.track_action import normalize_human_target
+from actions.tracking.target_catalog import normalize_human_target
 
 
-class FollowExecutor:
+class FollowPersonExecutor:
     """Acquire a person, then hand continuous following to the ROS bridge."""
 
-    def __init__(self, goal_executor, track_action, send_robot_command):
-        self.goal_executor = goal_executor
-        self.search_action = goal_executor.search_action
+    def __init__(self, find_target_executor, track_action, send_robot_command):
+        self.find_target_executor = find_target_executor
         self.track_action = track_action
         self.send_robot_command = send_robot_command
         self.active = False
@@ -25,7 +24,7 @@ class FollowExecutor:
     async def start(self, target, action_id) -> ActionResult:
         if self.active:
             return ActionResult(
-                action_id, "follow_action", "already_running", target=self.target,
+                action_id, "follow_person", "already_running", target=self.target,
                 outcome="already_running", reason_code="FOLLOW_BUSY", retryable=True,
                 data={"active_action_id": self.action_id},
             )
@@ -33,7 +32,7 @@ class FollowExecutor:
         normalized_target = normalize_human_target(target or "person")
         if normalized_target != "person":
             return ActionResult(
-                action_id, "follow_action", "failed", target=target,
+                action_id, "follow_person", "failed", target=target,
                 outcome="invalid_request", reason_code="FOLLOW_PERSON_REQUIRED",
             )
 
@@ -47,7 +46,7 @@ class FollowExecutor:
             self._run(), name=f"follow-person-{action_id}"
         )
         return ActionResult(
-            action_id, "follow_action", "running", target="person",
+            action_id, "follow_person", "running", target="person",
             outcome="acquiring_person",
         )
 
@@ -101,29 +100,62 @@ class FollowExecutor:
                 )
 
     async def _acquire_target(self):
-        search_result = await self.search_action.start_searching(
-            target="person",
-            action_id=f"{self.action_id}:search",
-            effort="best_effort",
-            initial_view_only=False,
+        acquisition_id = f"{self.action_id}:acquire-person"
+        tracking_action_id = f"{self.action_id}:track"
+        adopt_tracking = getattr(
+            self.track_action, "adopt_person_tracking", None
         )
-        search_result = await self._terminal_result(
-            self.search_action, search_result
+        person_tracking_active = bool(
+            self.track_action.active
+            and normalize_human_target(self.track_action.target) is not None
         )
-        if search_result.status != "succeeded":
-            return search_result
+        if (
+            person_tracking_active
+            and adopt_tracking is not None
+            and await adopt_tracking(
+                tracking_action_id,
+                continuous_person_reacquisition=True,
+            )
+        ):
+            tracking_session_id = self.track_action.action_id
+            seed = await self.track_action.wait_for_stable_target_seed(
+                self.track_action.TRACKED_TARGET_SEED_OWNER,
+                target=self.track_action.target,
+                session_id=tracking_session_id,
+                timeout=10.0,
+            )
+            if seed is not None:
+                return ActionResult(
+                    self.action_id, "follow_person", "succeeded",
+                    target="person", outcome="person_tracking_reused",
+                    data={
+                        "reused_person_tracking": True,
+                        "stable_seed": dict(seed),
+                    },
+                )
+            return ActionResult(
+                self.action_id, "follow_person", "failed", target="person",
+                outcome="stable_seed_timeout",
+                reason_code="STABLE_SEED_TIMEOUT",
+                retryable=True,
+            )
 
-        track_result = await self.track_action.start_tracking(
-            target="torso center",
-            action_id=f"{self.action_id}:track",
-            allow_grounding_dino=True,
+        result = await self.find_target_executor.start(
+            target="person",
+            action_id=acquisition_id,
+            target_kind="person",
+            approach=False,
             continuous_person_reacquisition=True,
         )
-        if track_result.status != "running":
-            return track_result
+        if result.status == "running":
+            result = await asyncio.shield(
+                self.find_target_executor.wait_until_finished()
+            )
+        if result.status != "succeeded":
+            return result
 
         return ActionResult(
-            self.action_id, "follow_action", "succeeded", target="person",
+            self.action_id, "follow_person", "succeeded", target="person",
             outcome="person_acquired",
         )
 
@@ -147,12 +179,6 @@ class FollowExecutor:
                 return True
             await asyncio.sleep(0.25)
         return False
-
-    @staticmethod
-    async def _terminal_result(action, result):
-        if result.status == "running":
-            return await action.wait_until_finished()
-        return result
 
     async def _stop_tracking(self, reason_code):
         if self.track_action.active:
@@ -202,8 +228,12 @@ class FollowExecutor:
         runner = self._runner
         if runner is not None and runner is not asyncio.current_task():
             runner.cancel()
-        if self.search_action.active:
-            await self.search_action.stop_searching(reason_code)
+        acquisition_id = f"{self.action_id}:acquire-person"
+        if (
+            self.find_target_executor.active
+            and self.find_target_executor.action_id == acquisition_id
+        ):
+            await self.find_target_executor.stop(reason_code)
         await self.send_robot_command({
             "command": "stop_follow_action",
             "action_id": self.action_id,
@@ -216,7 +246,7 @@ class FollowExecutor:
 
     def _finish(self, status, outcome, reason_code=None, data=None):
         result = ActionResult(
-            self.action_id or "unassigned", "follow_action", status,
+            self.action_id or "unassigned", "follow_person", status,
             target=self.target, outcome=outcome, reason_code=reason_code,
             retryable=status == "failed", data=data or {},
         )

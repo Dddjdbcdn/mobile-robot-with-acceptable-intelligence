@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import queue
-import signal
 import sys
 import threading
 import time
@@ -17,16 +16,14 @@ import zmq
 import zmq.asyncio
 from typing import Any
 
-from utilities.database_functions import load_json, update_memory, build_system_prompt
 from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
 
 from actions.approach_action import ApproachAction
-from actions.astra_approach_action import AstraApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackAction
-from actions.move_action import MoveAction
-from actions.navigate_action import NavigateAction
+from actions.explicit_navigation_action import ExplicitNavigationAction
+from actions.map_navigation_action import MapNavigationAction
 
 from services.audio_stream import AudioApp, send_mic_audio
 from services.camera_stream import CameraStream
@@ -36,14 +33,17 @@ from services.response_manager import ResponseManager
 from services.groundingdino_service import GroundingDINOService
 from services.csrt_tracker import CSRTTrackingManager
 from services.depthanything_service import DepthAnythingService # unused
+from services.hand_landmark_service import HAND_CONNECTIONS, HandLandmarkService
 from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
 from cognition.cognition_manager import CognitionManager
-from cognition.follow_executor import FollowExecutor
-from cognition.goal_executor import GoalExecutor
-from cognition.state import robot_state,update_state
-from cognition.semantic_memory import SemanticMemory
+from cognition.follow_person_executor import FollowPersonExecutor
+from cognition.find_target_executor import FindTargetExecutor
+from cognition.hand_guided_navigation import (
+    HandGuidedNavigation,
+)
+from cognition.state import update_state
 
 context = zmq.asyncio.Context()
 
@@ -66,14 +66,13 @@ person_tracker_pub_socket.connect(
 
 zmq_req_lock = asyncio.Lock()
 
-IDENTITY_PATH = "database/identity.json"
-MEMORY_PATH = "database/memory.json"
-SEMANTIC_MEMORY_PATH = "database/semantic_memory.json"
-ACTION_GUIDE_PATH = "database/action_guide.json"
+SMALL_BRAIN_ROOT = Path(__file__).resolve().parent
+IDENTITY_PATH = SMALL_BRAIN_ROOT / "database" / "identity.json"
+MEMORY_PATH = SMALL_BRAIN_ROOT / "database" / "memory.json"
+TOOL_ROUTING_PATH = SMALL_BRAIN_ROOT / "tools" / "tool_routing.json"
 TOOLS_PATHS = [
-    "tools/database_tools.json",
-    "tools/action_tools.json",
-    "tools/stop_tools.json",
+    SMALL_BRAIN_ROOT / "tools" / "action_tools.json",
+    SMALL_BRAIN_ROOT / "tools" / "stop_tools.json",
 ]
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -90,6 +89,10 @@ GROUNDING_DINO_CONFIG = Path("vision_models/groundingdino_tools/GroundingDINO/gr
 GROUNDING_DINO_MODEL = Path("vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml")
 
 tool_tasks: set[asyncio.Task[Any]] = set()
+
+def load_json(path):
+    with Path(path).open(encoding="utf-8") as json_file:
+        return json.load(json_file)
 
 def handle_task_done(task):
     tool_tasks.discard(task)
@@ -119,17 +122,19 @@ async def background_status_monitor(cognitive_manager):
 
             elif message.get("type") == "state":
                 update_state(message)
-                active_tracker = cognitive_manager._active_tracking_action()
+                active_tracker = cognitive_manager.track_action
+                stable_seed = (
+                    active_tracker.get_stable_target_seed(
+                        active_tracker.TRACKED_TARGET_SEED_OWNER,
+                        target=active_tracker.target,
+                        session_id=active_tracker.action_id,
+                    )
+                    if active_tracker is not None else None
+                )
                 await cognitive_manager.publish_world_state({
                     **message,
                     "track_action_active": active_tracker is not None,
-                    "tracking_stable": (
-                        active_tracker.stable if active_tracker is not None else False
-                    ),
-                    "person_tracking_stable": (
-                        getattr(active_tracker, "person_stable", False)
-                        if active_tracker is not None else False
-                    ),
+                    "stable_seed_ready": stable_seed is not None,
                     "tracked_target": (
                         active_tracker.target if active_tracker is not None else None
                     ),
@@ -283,32 +288,68 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
-async def camera_source_signal_loop(camera):
-    """Switch cameras from SSH without feeding characters to the text prompt."""
-    loop = asyncio.get_running_loop()
-    switch_requested = asyncio.Event()
-    handled_signals = (signal.SIGQUIT, signal.SIGUSR1)
+def draw_hand_landmark_overlay(frame, hand_guidance):
+    """Render full-frame hand landmarks plus the navigation gesture."""
+    status = hand_guidance.gesture_status()
+    if status is None:
+        return frame
 
-    for handled_signal in handled_signals:
-        loop.add_signal_handler(handled_signal, switch_requested.set)
+    height, width = frame.shape[:2]
+    landmarks = ((status.get("hand") or {}).get("landmarks") or {})
+    projected = {}
+    for name, point in landmarks.items():
+        normalized_x = point.get("normalized_x")
+        normalized_y = point.get("normalized_y")
+        if not isinstance(normalized_x, (int, float)) or not isinstance(
+            normalized_y, (int, float)
+        ):
+            continue
+        # The camera display is mirrored, while inference coordinates are not.
+        x = int(round((1.0 - float(normalized_x)) * (width - 1)))
+        y = int(round(float(normalized_y) * (height - 1)))
+        projected[name] = (
+            max(0, min(x, width - 1)),
+            max(0, min(y, height - 1)),
+        )
 
-    try:
-        while True:
-            await switch_requested.wait()
-            switch_requested.clear()
-            try:
-                selected = camera.toggle_source()
-                print(f"\n[System: Camera source switched to {selected}.]")
-            except RuntimeError as error:
-                print(f"\n[System: Camera switch refused: {error}.]")
-    finally:
-        for handled_signal in handled_signals:
-            loop.remove_signal_handler(handled_signal)
+    for start_name, end_name in HAND_CONNECTIONS:
+        start = projected.get(start_name)
+        end = projected.get(end_name)
+        if start is not None and end is not None:
+            cv2.line(frame, start, end, (0, 255, 255), 3, cv2.LINE_AA)
+
+    for point in projected.values():
+        cv2.circle(frame, point, 5, (0, 80, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, point, 5, (255, 255, 255), 1, cv2.LINE_AA)
+
+    gesture_label = str(status.get("gesture") or "unavailable").upper()
+    state_label = str(status.get("state") or "watching_person").upper()
+
+    panel_width = min(300, max(220, width // 4))
+    panel_height = 76
+    x1 = width - panel_width - 12
+    y1 = 12
+    cv2.rectangle(
+        frame, (x1, y1), (x1 + panel_width, y1 + panel_height),
+        (0, 0, 0), -1,
+    )
+    font_scale = max(0.58, min(0.9, width / 1400.0))
+    cv2.putText(
+        frame, gesture_label, (x1 + 10, y1 + 29),
+        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+        (0, 255, 255), 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, state_label, (x1 + 10, y1 + 60),
+        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.75,
+        (255, 255, 255), 2, cv2.LINE_AA,
+    )
+    return frame
 
 
-async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
-    print("[System: Camera switching ready: press Ctrl+\\ in SSH.]")
-
+async def display_camera_loop(
+    camera, csrt_tracker, yolo, track_action, hand_guidance
+):
     window_name = "Robot Vision"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
@@ -320,22 +361,16 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
             snapshot = camera.snapshot()
             display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
 
-            cv2.putText(
-                display_frame,
-                f"SOURCE: {snapshot.source.upper()}  |  CTRL+\\ TO SWITCH",
-                (20, display_frame.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
             display_frame = draw_tof_overlay(
                 display_frame,
                 tracking=track_action.active,
-                tracking_stable=track_action.stable,
-                person_tracking_stable=track_action.person_stable,
+                stable_seed_ready=(
+                    track_action.get_stable_target_seed(
+                        track_action.TRACKED_TARGET_SEED_OWNER,
+                        target=track_action.target,
+                        session_id=track_action.action_id,
+                    ) is not None
+                ),
             )
 
             tracking_update = csrt_tracker.tracking_update
@@ -344,7 +379,9 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
                 display_frame = draw_yolo_overlay(display_frame,yolo)
             if (tracking_update is not None and tracking_update.success):
                 display_frame = draw_csrt_overlay(display_frame,tracking_update.target,tracking_update.bbox_xywh)
-
+            display_frame = draw_hand_landmark_overlay(
+                display_frame, hand_guidance
+            )
             cv2.imshow(window_name, display_frame)
             cv2.waitKey(1)
 
@@ -365,15 +402,52 @@ async def display_camera_loop(camera, csrt_tracker, yolo, track_action):
 
         await asyncio.sleep(0.03)
 
+def build_system_prompt(identity, memory, tool_routing=None):
+    def format_value(value):
+        if isinstance(value, list):
+            return "\n".join(f"- {item}" for item in value)
+
+        if isinstance(value, dict):
+            parts = []
+            for name, nested_value in value.items():
+                prefix, separator, label = name.partition("_")
+                heading = label if separator and prefix.isdigit() else name
+                heading = heading.replace("_", " ").upper()
+                parts.append(f"### {heading} ###\n{format_value(nested_value)}")
+            return "\n".join(parts)
+
+        return str(value)
+
+    def section(heading, value):
+        return f"=== {heading} ===\n{format_value(value)}"
+
+    sections = [
+        section("WHO YOU ARE", identity.get("identity", [])),
+        section("YOUR CREATOR", identity.get("owner", [])),
+        section("HOW YOU ARE", identity.get("character", [])),
+        section("HARD RULES (NEVER BREAK THESE)", identity["rules"]),
+    ]
+
+    if tool_routing:
+        sections.append(section("TOOL ROUTING", tool_routing))
+
+    remembered = [
+        f"{key}: {'; '.join(value)}"
+        for key, value in memory.items()
+        if isinstance(value, list) and value
+    ]
+    if remembered:
+        sections.append("=== WHAT YOU REMEMBER ===\n" + "\n".join(remembered))
+
+    return "\n\n".join(sections)
+
 async def main():
     print("\n🤖 DJ STARTING TO CONNECT")
     cognitive_manager = None
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
-    action_guide_file = load_json(ACTION_GUIDE_PATH)
-    semantic_memory = SemanticMemory(SEMANTIC_MEMORY_PATH)
-
+    tool_routing_file = load_json(TOOL_ROUTING_PATH)
     tools_file = []
     for path in TOOLS_PATHS:
         tools_file.extend(load_json(path))
@@ -381,7 +455,7 @@ async def main():
     system_prompt = build_system_prompt(
         identity_file,
         memory_file,
-        action_guide_file,
+        tool_routing_file,
     )
 
     app = AudioApp()
@@ -402,8 +476,6 @@ async def main():
             tracking_height=360,
             history_frames=60,
             fps=30,
-            astra_endpoint="tcp://127.0.0.1:5558",
-            initial_source=os.environ.get("CAMERA_SOURCE", "usb").lower(),
             usb_controls=CameraStream.usb_controls_from_env(),
             usb_device=os.environ.get(
                 "USB_CAMERA_DEVICE",
@@ -431,12 +503,7 @@ async def main():
     yolo = YoloService(
         camera=camera
     )
-
-    def reset_vision_for_source_change(_previous_source, _new_source):
-        csrt_tracker.stop_tracking()
-        yolo.detections = []
-
-    camera.add_source_change_callback(reset_vision_for_source_change)
+    hand_landmarks = HandLandmarkService(camera)
 
     grounding_dino.start_background()
     yolo.start_background()
@@ -482,43 +549,42 @@ async def main():
                 zmq_pub_socket=zmq_pub_socket,
                 person_tracker_pub_socket=person_tracker_pub_socket,
                 send_robot_command=send_robot_command,
-                semantic_memory=semantic_memory,
             )
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
                 track_action=track_action,
             )
-            astra_action = AstraApproachAction(
-                csrt_tracker=csrt_tracker,
-                grounding_dino=grounding_dino,
-                yolo=yolo,
-                camera=camera,
-                send_robot_command=send_robot_command,
-            )
-            move_action = MoveAction(send_robot_command=send_robot_command)
             see_action = SeeAction(
                 ws=ws,
                 camera=camera,
                 send_robot_command=send_robot_command,
             )
-            navigate_action = NavigateAction(
+            explicit_navigation_action = ExplicitNavigationAction(
+                send_robot_command,
+                request_map_snapshot=map_client.request_snapshot,
+                save_map_snapshot=map_client.save_snapshot,
+            )
+            map_navigation_action = MapNavigationAction(
                 ws, camera, send_robot_command,
                 request_map_snapshot=map_client.request_snapshot,
+                save_map_snapshot=map_client.save_snapshot,
                 see_action=see_action,
                 send_map_overlay=send_map_overlay,
             )
-            goal_executor = GoalExecutor(
-                move_action=move_action,
+            find_target_executor = FindTargetExecutor(
                 search_action=search_action,
                 track_action=track_action,
                 approach_action=approach_action,
                 see_action=see_action,
-                semantic_memory=semantic_memory,
-                navigate_action=navigate_action,
+                map_navigation_action=map_navigation_action,
+                local_navigation_action=explicit_navigation_action,
                 send_map_overlay=send_map_overlay,
             )
-            follow_executor = FollowExecutor(
-                goal_executor=goal_executor,
+            hand_guided_navigation = HandGuidedNavigation(
+                hand_landmarks, track_action, send_robot_command
+            )
+            follow_person_executor = FollowPersonExecutor(
+                find_target_executor=find_target_executor,
                 track_action=track_action,
                 send_robot_command=send_robot_command,
             )
@@ -528,44 +594,22 @@ async def main():
                 search_action=search_action,
                 see_action=see_action,
                 track_action=track_action,
-                move_action=move_action,
-                navigate_action=navigate_action,
-                goal_executor=goal_executor,
-                follow_executor=follow_executor,
+                explicit_navigation_action=explicit_navigation_action,
+                map_navigation_action=map_navigation_action,
+                hand_guided_navigation=hand_guided_navigation,
+                find_target_executor=find_target_executor,
+                follow_person_executor=follow_person_executor,
                 response_manager=response_manager,
-                astra_action=astra_action,
             )
-
-            async def stop_actions_for_source_change(previous_source, new_source):
-                if follow_executor.active:
-                    await follow_executor.stop("CAMERA_SOURCE_CHANGED")
-                elif goal_executor.active:
-                    await goal_executor.stop("CAMERA_SOURCE_CHANGED")
-                elif navigate_action.active:
-                    await navigate_action.stop("CAMERA_SOURCE_CHANGED")
-                if previous_source == "usb":
-                    if approach_action.active:
-                        await approach_action.stop_approaching(
-                            "CAMERA_SOURCE_CHANGED"
-                        )
-                    if track_action.active:
-                        await track_action.stop_tracking(
-                            "CAMERA_SOURCE_CHANGED"
-                        )
-                elif previous_source == "astra":
-                    await astra_action.source_changed(
-                        previous_source, new_source
-                    )
-
-            def cancel_source_owned_actions(previous_source, new_source):
-                asyncio.create_task(
-                    stop_actions_for_source_change(
-                        previous_source, new_source
-                    ),
-                    name=f"camera-source-cleanup-{previous_source}",
-                )
-
-            camera.add_source_change_callback(cancel_source_owned_actions)
+            hand_guided_navigation.set_motion_allowed(lambda: not any((
+                getattr(approach_action, "active", False),
+                getattr(explicit_navigation_action, "active", False),
+                getattr(map_navigation_action, "active", False),
+                getattr(find_target_executor, "active", False),
+                getattr(follow_person_executor, "active", False),
+                getattr(search_action, "active", False),
+                getattr(see_action, "active", False),
+            )))
 
             session_update = {
                 "type": "session.update",
@@ -614,8 +658,11 @@ async def main():
                 receive_events(ws,app,response_manager,camera,cognitive_manager),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
-                display_camera_loop(camera,csrt_tracker,yolo,track_action),
-                camera_source_signal_loop(camera),
+                display_camera_loop(
+                    camera, csrt_tracker, yolo, track_action,
+                    hand_guided_navigation,
+                ),
+                hand_guided_navigation.run(yolo),
                 wait_for_dino(),
                 wait_for_yolo()
             )
@@ -633,6 +680,7 @@ async def main():
         csrt_tracker.stop_worker()
         await grounding_dino.close()
         await yolo.close()
+        await hand_landmarks.close()
         map_client.close()
 
 if __name__ == "__main__":

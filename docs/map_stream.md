@@ -1,11 +1,11 @@
 # Map images for exploration
 
-`LLMRosBridge` starts `robot/map_stream.py` automatically. No extra ROS
+`LLMRosBridge` starts `robot/map/map_stream.py` automatically. No extra ROS
 executable is needed. It refreshes expensive semantic map analysis in a
 background worker at 1 Hz, then draws the current TF pose and local candidates
 onto that cached background at a target 5 Hz. Publisher timing is logged every
 five seconds. SMALL BRAIN's `CameraStream` receives this independently of the selected
-USB/Astra camera and replaces these inspection files on incoming updates:
+USB camera and replaces these inspection files on incoming updates:
 
 - `SMALL_BRAIN/results/map/latest.jpg`
 - `SMALL_BRAIN/results/map/latest.json`
@@ -47,15 +47,15 @@ A missing/stale costmap or pose suppresses publication with a throttled log.
 The live camera-FOV debug layer is disabled. The `live_camera_fov` metadata
 still records pan, horizontal FOV, and center yaw.
 
-## Find-object overlay ownership
+## Find-target overlay ownership
 
-During `find_object`, GoalExecutor owns one ordered `search_poses` list. Each
+During `find_target`, `FindTargetExecutor` owns one ordered `search_poses` list. Each
 unique `(x, y, robot yaw)` stores a `views` list of camera pan/tilt captures.
 The overlay also carries the selected clue
 observation and current mode (`context` or `exploration`). It sends versioned,
 full-state `set` messages over a dedicated ZeroMQ PUSH socket.
 `MapImageStream` binds the matching PULL socket, plans and renders the matching
-candidate snapshot, and removes it after GoalExecutor sends `clear`. SMALL
+candidate snapshot, and removes it after `FindTargetExecutor` sends `clear`. SMALL
 BRAIN can override its connection with `MAP_OVERLAY_ENDPOINT`; it must match
 the static overlay endpoint.
 
@@ -75,16 +75,15 @@ Every streamed frame identifies the applied state under
 count, and pose count. NavigateAction waits for the requested action/revision
 before using the snapshot, preventing a decision against older planning state.
 In context mode, MapLogic creates candidates directly inside the selected clue
-cone at three ranges and three bearings and adds a reachable backward viewpoint
-(`CB`) that still looks toward the clue. Destination uses the same vision-chosen
-context candidates with a wider 4 metre radius. Neither mode offers frontiers.
+cone at three ranges and three bearings, then adds `CF`, the furthest reachable
+point on the center ray. Context mode never offers frontiers.
 An orange outline and ray show the source observation. In exploration mode,
 MapLogic samples reachable cells every 0.5 metres, shortlists cells near dense
 uncovered coverage, and tests eight camera headings. From the best pose it casts
 a 4 metre ray: an obstacle or covered cell keeps the original pose, while a
 clear or unknown-ending ray extends the goal to its furthest safe cell. The
 selected candidate reports coverage gain and ray-terminal metadata.
-GoalExecutor always captures the center, left, and right views at each
+`FindTargetExecutor` always captures the center, left, and right views at each
 inspection pose. Coverage is used to rank exploration viewpoints, not to gate
 camera sweep directions.
 
@@ -117,13 +116,12 @@ the robot footprint changes. The cost threshold is 65 on the OccupancyGrid
 
 The implementation is split into two modules:
 
-- `BIG_BRAIN/src/robot/robot/map_logic.py`: occupancy/costmap processing,
-  reachability, frontiers, doors, rooms, local samples, FOV/coverage sampling,
-  local and destination context filtering, and deterministic exploration-ray
-  ranking.
-- `BIG_BRAIN/src/robot/robot/map_renderer.py`: standalone OpenCV background and
+- `BIG_BRAIN/src/robot/robot/map/map_logic.py`: occupancy/costmap processing,
+  reachability, frontiers, geometric exit-room components, FOV/coverage
+  sampling, context filtering, and deterministic exploration-ray ranking.
+- `BIG_BRAIN/src/robot/robot/map/map_renderer.py`: standalone OpenCV background and
   overlay rendering from already-computed candidates and grid masks.
-- `BIG_BRAIN/src/robot/robot/map_stream.py`: MapLogic/renderer orchestration,
+- `BIG_BRAIN/src/robot/robot/map/map_stream.py`: MapLogic/renderer orchestration,
   overlay command consumption, ROS/TF integration, metadata, JPEG encoding, and
   ZeroMQ publication.
 
@@ -189,7 +187,7 @@ supported: set `MAP_STREAM_ENDPOINT` to that address and
 Protocol: ZeroMQ PUB/SUB, two frames: `map/image` and a payload containing a
 4-byte big-endian JSON length, UTF-8 JSON, then JPEG bytes. The publisher timer targets 5 Hz while semantic analysis refreshes at 1 Hz.
 The live robot pose and local candidates are redrawn for every publication;
-frontiers, doors, rooms, reachability, and the base raster use the newest
+frontiers, reachability, and the base raster use the newest
 completed analysis cache. Images are sent to the LLM only when its tool is
 called. Static stream settings can be changed at the top of `map_stream.py`.
 

@@ -2,7 +2,7 @@
   {
     "type": "function",
     "name": "stop_goal",
-    "description": "Cancel the active find_object goal and its current search, navigation, tracking, or approach step.",
+    "description": "Cancel only the active find_target goal and its search, navigation, tracking, or approach step. Trigger phrases include 'stop searching', 'stop looking for it', 'cancel the search', 'forget finding the bottle', and 'stop going to the kitchen'. Do not use this to stop following a person, passive person-looking, or an explicit movement.",
     "parameters": {
       "type": "object",
       "properties": {},
@@ -12,7 +12,7 @@
   {
     "type": "function",
     "name": "stop_navigation",
-    "description": "Cancel an active navigate_action during vision pose selection or Nav2 movement.",
+    "description": "Cancel active explicit or automatic hand-guided movement. Trigger phrases include 'stop moving', 'stop navigation', 'cancel that movement', 'don't go there', and 'halt'. Do not use this for continuous follow_person, find_target, or passive watch-target tracking.",
     "parameters": {
       "type": "object",
       "properties": {},
@@ -22,7 +22,7 @@
   {
     "type": "function",
     "name": "stop_follow",
-    "description": "Stop the active follow_action, including person tracking and Nav2 following.",
+    "description": "Stop only the active continuous follow_person operation, including its person tracking and Nav2 following. Trigger phrases include 'stop following me', 'don't follow me', 'wait here', 'stay here', and 'stop trailing that person'. Do not use this merely because the robot is looking at a person without following.",
     "parameters": {
       "type": "object",
       "properties": {},
@@ -31,8 +31,8 @@
   },
   {
     "type": "function",
-    "name": "stop_tracking",
-    "description": "Stop passive tracking started by watch_target. Use this when the robot should stop watching even if no other action follows.",
+    "name": "stop_watching_target",
+    "description": "Stop a watch_target acquisition or its passive camera tracking, and recenter the camera. Trigger phrases include 'stop looking', 'stop watching it', 'look away', 'don't track me', and 'you can stop watching now'. Do not interrupt tracking owned by find_target, follow_person, or automatic hand guidance.",
     "parameters": {
       "type": "object",
       "properties": {},

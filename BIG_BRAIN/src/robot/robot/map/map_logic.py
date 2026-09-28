@@ -1,11 +1,16 @@
 """Map analysis, candidate generation, coverage sampling, and search ranking."""
 
+from collections import deque
 from dataclasses import dataclass
 import math
 
 import cv2
 import numpy as np
 
+
+# =============================================================================
+# Configuration
+# =============================================================================
 @dataclass
 class LogicConfig:
     # Occupancy / costmap
@@ -17,13 +22,11 @@ class LogicConfig:
     approach_ray_radius_m: float = 0.15
     approach_obstacle_min_cells: int = 3
     approach_obstacle_standoff_m: float = 0.25
+    approach_cost_threshold: int = 253
 
-    # Local navigation samples
+    # Local navigation
     sample_radius: float = 3.0
-    sample_step: float = 0.5
-    sample_distances: tuple = (0.5, 1.0, 2.0, 3.0)
-    sample_angle_deg: float = 45.0
-    include_rotations: bool = True
+    nudge_distance_m: float = 0.25
     candidate_min_separation_m: float = 0.30
 
     # Frontiers
@@ -33,18 +36,19 @@ class LogicConfig:
     frontier_min_gain: float = 0.25
     frontier_min_separation: float = 0.75
     frontier_rays: int = 120
+    frontier_samples_per_component: int = 5
 
-    # Doors / rooms
-    enable_doors: bool = False
-    enable_rooms: bool = False
-    door_min_width: float = 0.5
-    door_max_width: float = 1.5
-    door_probe: float = 0.5
-    door_min_widening: float = 0.1
-    door_wall_min_length: float = 0.3
-    door_angles: int = 12
-    door_min_separation: float = 0.5
-    room_min_area: float = 1.0
+    # Geometric exit-room navigation
+    exit_open_clearance_m: float = 0.65
+    exit_component_min_area_m2: float = 1.0
+    exit_frontier_revisit_m: float = 0.60
+    exit_component_lookup_radius_m: float = 1.50
+    exit_wall_min_length_m: float = 1.00
+    exit_recovery_max_moves: int = 3
+    exit_recovery_min_move_m: float = 0.35
+    exit_recovery_max_move_m: float = 1.00
+    exit_recovery_revisit_m: float = 0.40
+    exit_frontier_travel_penalty_m2_per_m: float = 0.15
 
     # Search views
     camera_center_pan_deg: float = 95.0
@@ -52,12 +56,11 @@ class LogicConfig:
     camera_fov_max_range_m: float = 2.0
     context_radius_samples: int = 3
     context_bearing_fractions: tuple = (-0.75, 0.0, 0.75)
-    context_backup_distance_m: float = 0.5
-    destination_context_radius_m: float = 4.0
     exploration_step: float = 0.5
     exploration_headings: int = 8
     exploration_shortlist: int = 16
     exploration_ray_m: float = 4.0
+    visibility_min_rays: int = 31
 
 
 def yaw_of(q):
@@ -67,6 +70,9 @@ def yaw_of(q):
     )
 
 
+# =============================================================================
+# Occupancy-grid coordinate conversion
+# =============================================================================
 class Grid:
     def __init__(self, msg):
         self.resolution = float(msg.info.resolution)
@@ -114,30 +120,25 @@ class Grid:
         xs, ys = zip(*points)
         return {"xmin": min(xs), "xmax": max(xs), "ymin": min(ys), "ymax": max(ys)}
 
+
+# =============================================================================
+# Map analysis and navigation decisions
+# =============================================================================
 class MapLogic:
     def __init__(self, config=None):
         self.cfg = config if config is not None else LogicConfig()
 
+    # -------------------------------------------------------------------------
+    # Prepared map state
+    # -------------------------------------------------------------------------
     def prepare(self, map_msg, cost_msg, pose):
         grid = Grid(map_msg)
         costmap = Grid(cost_msg)
         costs = self._costs_on_map(grid, costmap)
         reachable = self._reachable(grid, costs, pose, self.cfg.clearance)
         frontiers, frontier_mask = self._frontiers(grid, costs, pose)
-        if self.cfg.enable_doors:
-            doors, door_candidate_mask = self._doors(grid, costs, pose)
-        else:
-            doors = []
-            door_candidate_mask = np.zeros_like(grid.data, dtype=bool)
-        if self.cfg.enable_rooms:
-            rooms, current_room_mask = self._rooms(grid, pose, doors)
-        else:
-            rooms = []
-            current_room_mask = np.zeros_like(grid.data, dtype=bool)
         for index, frontier in enumerate(frontiers, 1):
             frontier["id"] = f"F{index}"
-        for index, door in enumerate(doors, 1):
-            door["id"] = f"D{index}"
         return {
             "frame_id": pose["frame_id"],
             "grid": grid,
@@ -146,11 +147,80 @@ class MapLogic:
             "reachable": reachable,
             "frontiers": frontiers,
             "frontier_mask": frontier_mask,
-            "doors": doors,
-            "door_candidate_mask": door_candidate_mask,
-            "rooms": rooms,
-            "current_room_mask": current_room_mask,
         }
+
+    # -------------------------------------------------------------------------
+    # Target approach navigation
+    # -------------------------------------------------------------------------
+    def _approach_clearance(self, prepared):
+        """Return obstacle clearance in metres for approach-ray checks."""
+        grid = prepared["grid"]
+        obstacles = grid.data >= self.cfg.occupied
+        costs = prepared.get("costs")
+        if costs is None and prepared.get("costmap") is not None:
+            costs = self._costs_on_map(grid, prepared["costmap"])
+        if costs is not None:
+            obstacles |= np.asarray(costs) >= self.cfg.approach_cost_threshold
+
+        minimum_cells = max(1, self.cfg.approach_obstacle_min_cells)
+        if minimum_cells > 1 and np.any(obstacles):
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(
+                obstacles.astype(np.uint8), connectivity=8
+            )
+            keep = np.zeros(count, dtype=bool)
+            keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= minimum_cells
+            obstacles = keep[labels]
+
+        return cv2.distanceTransform(
+            (~obstacles).astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
+
+    @staticmethod
+    def _point_on_ray(origin, yaw, distance):
+        return (
+            float(origin["x"]) + distance * math.cos(yaw),
+            float(origin["y"]) + distance * math.sin(yaw),
+        )
+
+    def _ray_cells(self, grid, origin, yaw, distances):
+        xs, ys = self._point_on_ray(origin, yaw, distances)
+        cols, rows = grid.cells(xs, ys)
+        return xs, ys, cols, rows
+
+    def _first_approach_obstacle_distance(
+        self, prepared, origin, yaw, max_distance
+    ):
+        grid = prepared["grid"]
+        sample_count = max(
+            1, int(math.ceil(max_distance / (grid.resolution / 2.0)))
+        )
+        distances = np.linspace(0.0, max_distance, sample_count + 1)[1:]
+        _, _, cols, rows = self._ray_cells(grid, origin, yaw, distances)
+        valid = np.flatnonzero(grid.inside(cols, rows))
+        if not valid.size:
+            return None
+
+        clearance = self._approach_clearance(prepared)
+        hits = valid[
+            clearance[
+                np.asarray(rows[valid], dtype=int),
+                np.asarray(cols[valid], dtype=int),
+            ] <= self.cfg.approach_ray_radius_m
+        ]
+        return float(distances[int(hits[0])]) if hits.size else None
+
+    def _nearest_reachable_distance(
+        self, grid, reachable, origin, yaw, max_distance
+    ):
+        sample_count = max(
+            1, int(math.ceil(max_distance / (grid.resolution / 2.0)))
+        )
+        distances = np.linspace(max_distance, 0.0, sample_count + 1)
+        _, _, cols, rows = self._ray_cells(grid, origin, yaw, distances)
+        valid = np.flatnonzero(grid.inside(cols, rows))
+        if valid.size:
+            valid = valid[reachable[rows[valid], cols[valid]]]
+        return float(distances[int(valid[0])]) if valid.size else None
 
     def resolve_approach_destination(
         self, prepared, pose, target_x, target_y, standoff_m=None
@@ -164,54 +234,11 @@ class MapLogic:
         if not math.isfinite(target_distance) or target_distance <= 0.0:
             raise ValueError("approach target must be away from the robot")
 
-        obstacles = grid.data >= self.cfg.occupied
-        costs = prepared.get("costs")
-        if costs is None and prepared.get("costmap") is not None:
-            costs = self._costs_on_map(grid, prepared["costmap"])
-        if costs is not None:
-            obstacles |= (
-                np.asarray(costs) >= 253
-            )
-
-        # Keep only obstacle groups large enough to represent a real object.
-        minimum_cells = max(1, self.cfg.approach_obstacle_min_cells)
-        if minimum_cells > 1 and np.any(obstacles):
-            component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-                obstacles.astype(np.uint8), connectivity=8
-            )
-            keep = np.zeros(component_count, dtype=bool)
-            keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= minimum_cells
-            obstacles = keep[labels]
-
-        # Looking up this clearance along the center line is equivalent to
-        # casting a ray inflated by approach_ray_radius_m.
-        clearance = cv2.distanceTransform(
-            (~obstacles).astype(np.uint8), cv2.DIST_L2, 5
-        ) * grid.resolution
-
         local_bearing = math.atan2(target_y, target_x)
         map_yaw = self._angle(float(pose["yaw"]) + local_bearing)
-        sample_count = max(
-            1, int(math.ceil(target_distance / (grid.resolution / 2.0)))
+        hit_distance = self._first_approach_obstacle_distance(
+            prepared, pose, map_yaw, target_distance
         )
-        distances = np.linspace(0.0, target_distance, sample_count + 1)[1:]
-        xs = float(pose["x"]) + distances * math.cos(map_yaw)
-        ys = float(pose["y"]) + distances * math.sin(map_yaw)
-        cols, rows = grid.cells(xs, ys)
-        inside = grid.inside(cols, rows)
-
-        hit_distance = None
-        valid = np.flatnonzero(inside)
-        if valid.size:
-            ray_clearance = clearance[
-                np.asarray(rows[valid], dtype=int),
-                np.asarray(cols[valid], dtype=int),
-            ]
-            hits = valid[
-                ray_clearance <= self.cfg.approach_ray_radius_m
-            ]
-            if hits.size:
-                hit_distance = float(distances[int(hits[0])])
 
         if hit_distance is None:
             distance_limit = target_distance
@@ -228,60 +255,31 @@ class MapLogic:
             raise ValueError("approach standoff must be a non-negative finite number")
         resolved_distance = max(0.0, distance_limit - requested_standoff)
 
-        destination_x = (
-            float(pose["x"]) + resolved_distance * math.cos(map_yaw)
-        )
-        destination_y = (
-            float(pose["y"]) + resolved_distance * math.sin(map_yaw)
+        destination_x, destination_y = self._point_on_ray(
+            pose, map_yaw, resolved_distance
         )
 
         # If the desired cell is unreachable, walk backward toward the robot.
         # Geometric samples stay on the ray instead of shifting sideways.
-        col, row = (int(value) for value in grid.cells(
-            destination_x, destination_y
-        ))
-        moved_to_reachable = not (
-            grid.inside(col, row) and reachable[row, col]
+        moved_to_reachable = not self._valid_endpoint(
+            grid, reachable, destination_x, destination_y
         )
         if moved_to_reachable:
-            fallback_count = max(
-                1, int(math.ceil(resolved_distance / (grid.resolution / 2.0)))
+            reachable_distance = self._nearest_reachable_distance(
+                grid, reachable, pose, map_yaw, resolved_distance
             )
-            fallback_distances = np.linspace(
-                resolved_distance, 0.0, fallback_count + 1
-            )
-            fallback_x = (
-                float(pose["x"])
-                + fallback_distances * math.cos(map_yaw)
-            )
-            fallback_y = (
-                float(pose["y"])
-                + fallback_distances * math.sin(map_yaw)
-            )
-            fallback_cols, fallback_rows = grid.cells(fallback_x, fallback_y)
-            valid = np.flatnonzero(
-                grid.inside(fallback_cols, fallback_rows)
-            )
-            if valid.size:
-                valid = valid[reachable[
-                    fallback_rows[valid], fallback_cols[valid]
-                ]]
-            if not valid.size:
+            if reachable_distance is None:
                 raise ValueError("no reachable approach pose on target ray")
 
-            resolved_distance = float(fallback_distances[int(valid[0])])
-            destination_x = (
-                float(pose["x"]) + resolved_distance * math.cos(map_yaw)
-            )
-            destination_y = (
-                float(pose["y"]) + resolved_distance * math.sin(map_yaw)
+            resolved_distance = reachable_distance
+            destination_x, destination_y = self._point_on_ray(
+                pose, map_yaw, resolved_distance
             )
 
-        goal_yaw = map_yaw
         return {
             "x": float(destination_x),
             "y": float(destination_y),
-            "angle": float(goal_yaw),
+            "angle": float(map_yaw),
             "frame_id": str(prepared.get("frame_id") or pose["frame_id"]),
             "resolution": resolution,
             "was_clamped": hit_distance is not None,
@@ -292,6 +290,9 @@ class MapLogic:
             "standoff_m": requested_standoff,
         }
 
+    # -------------------------------------------------------------------------
+    # Camera view geometry
+    # -------------------------------------------------------------------------
     def live_camera_fov(self, pose, camera_pan_angle):
         if camera_pan_angle is None:
             return None
@@ -306,6 +307,19 @@ class MapLogic:
                 )
             ),
         }
+
+    def _camera_view_parameters(self, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        return (
+            float(payload.get(
+                "camera_horizontal_fov_deg",
+                self.cfg.camera_horizontal_fov_deg,
+            )),
+            float(payload.get(
+                "camera_reliable_range_m",
+                self.cfg.camera_fov_max_range_m,
+            )),
+        )
 
     def observation_fov(self, search_overlay):
         """Return the map-space FOV belonging to the selected clue frame."""
@@ -326,14 +340,9 @@ class MapLogic:
             pan = float(observation.get(
                 "pan_angle", self.cfg.camera_center_pan_deg
             ))
-            horizontal_fov = float(search_overlay.get(
-                "camera_horizontal_fov_deg",
-                self.cfg.camera_horizontal_fov_deg,
-            ))
-            max_range = float(search_overlay.get(
-                "camera_reliable_range_m",
-                self.cfg.camera_fov_max_range_m,
-            ))
+            horizontal_fov, max_range = self._camera_view_parameters(
+                search_overlay
+            )
         except (KeyError, TypeError, ValueError):
             return None
         return {
@@ -348,36 +357,429 @@ class MapLogic:
             ),
         }
 
+    # -------------------------------------------------------------------------
+    # Candidate planning entry point
+    # -------------------------------------------------------------------------
     def plan_candidates(
         self, prepared, pose, search_overlay=None, *, coverage=None
     ):
-        # Standalone goal navigation does not need search history in order to
-        # produce reachable local poses. Search-specific modes still receive
-        # their context through an overlay.
+        # Map-pose candidates belong only to the find loop.
         overlay = search_overlay if isinstance(search_overlay, dict) else {}
-        mode = str(overlay.get("mode") or "goal")
+        mode = str(overlay.get("mode") or "exploration")
 
-        if mode == "context":
+        if mode in {"context", "visual"}:
             candidates = self._context_candidates(prepared, pose, overlay)
-        elif mode == "destination":
-            candidates = self._context_candidates(
-                prepared, pose, overlay,
-                max_range_m=self.cfg.destination_context_radius_m,
-            )
         elif mode == "exploration":
             if coverage is None:
                 coverage = self.coverage_counts(prepared["grid"], overlay) > 0
             candidates = self._exploration_candidates(
                 prepared, pose, overlay, coverage
             )
-        elif mode == "goal":
-            candidates = self._local_candidates(
-                prepared["grid"], prepared["reachable"], pose
-            ) + [dict(item) for item in prepared["frontiers"]]
-            candidates = [self._describe(item, pose) for item in candidates]
         else:
             return []
         return self._deduplicate_candidates(candidates)
+
+    # -------------------------------------------------------------------------
+    # Deterministic local navigation
+    # -------------------------------------------------------------------------
+    def resolve_local_destination(
+        self, prepared, pose, command, *, previous_pose=None, person_pose=None
+    ):
+        """Resolve the fixed local-navigation vocabulary from map data."""
+        grid, reachable = prepared["grid"], prepared["reachable"]
+        yaw = float(pose["yaw"])
+        rotations = {
+            "rotate_left": math.pi / 2.0,
+            "rotate_right": -math.pi / 2.0,
+            "rotate_around": math.pi,
+        }
+        if command in rotations:
+            return self._local_goal(pose["x"], pose["y"], yaw + rotations[command], pose)
+        if command == "face_person":
+            if not isinstance(person_pose, dict):
+                raise ValueError("fresh person pose is unavailable")
+            person_yaw = math.atan2(
+                float(person_pose["y"]) - pose["y"],
+                float(person_pose["x"]) - pose["x"],
+            )
+            return self._local_goal(pose["x"], pose["y"], person_yaw, pose)
+        if command == "previous_position":
+            if not isinstance(previous_pose, dict):
+                raise ValueError("previous position is unavailable")
+            return self._local_goal(
+                previous_pose["x"], previous_pose["y"],
+                previous_pose.get("yaw", yaw), pose,
+            )
+
+        directions = {
+            "nudge_forward": (0.0, self.cfg.nudge_distance_m),
+            "nudge_backward": (math.pi, self.cfg.nudge_distance_m),
+            "nudge_left": (math.pi / 2.0, self.cfg.nudge_distance_m),
+            "nudge_right": (-math.pi / 2.0, self.cfg.nudge_distance_m),
+            "furthest_forward": (0.0, None),
+            "furthest_backward": (math.pi, None),
+        }
+        if command in directions:
+            offset, distance = directions[command]
+            endpoint = self._furthest_reachable_on_ray(
+                grid, reachable, pose, yaw + offset, max_distance=distance
+            )
+            if endpoint is None:
+                raise ValueError("no reachable point in the requested direction")
+            x, y, _ = endpoint
+            if math.hypot(x - pose["x"], y - pose["y"]) < grid.resolution:
+                raise ValueError("requested direction is blocked")
+            return self._local_goal(x, y, yaw, pose)
+
+        rows, cols = np.nonzero(reachable)
+        if not len(rows):
+            raise ValueError("no reachable map space")
+        xs, ys = grid.world(cols, rows)
+        local = np.hypot(xs - pose["x"], ys - pose["y"]) <= self.cfg.sample_radius
+        if np.any(local):
+            rows, cols, xs, ys = rows[local], cols[local], xs[local], ys[local]
+        if command == "open_space_middle":
+            obstacle = (grid.data < 0) | (grid.data >= self.cfg.occupied)
+            clearance = cv2.distanceTransform(
+                (~obstacle).astype(np.uint8), cv2.DIST_L2, 5
+            )
+            index = int(np.argmax(clearance[rows, cols]))
+        else:
+            raise ValueError(f"unknown local command: {command}")
+        x, y = float(xs[index]), float(ys[index])
+        goal_yaw = math.atan2(y - pose["y"], x - pose["x"])
+        return self._local_goal(x, y, goal_yaw, pose)
+
+    def resolve_exit_room_step(self, prepared, pose, state=None):
+        """Explore the starting chamber, then cross its narrow boundary."""
+        grid = prepared["grid"]
+        reachable = prepared["reachable"]
+        state = dict(state) if isinstance(state, dict) else {}
+        if not isinstance(state.get("origin"), dict):
+            state.update({
+                "origin": {"x": float(pose["x"]), "y": float(pose["y"])},
+                "visited_frontiers": [],
+                "recovery_points": [],
+                "recovery_moves": 0,
+                "passes": 0,
+            })
+        visited = [
+            point for point in state.get("visited_frontiers") or []
+            if isinstance(point, list) and len(point) == 2
+        ]
+        labels, component_areas = self._exit_open_components(grid, reachable)
+        origin_label = self._nearest_component_label(
+            grid, labels, state["origin"]["x"], state["origin"]["y"],
+            self.cfg.exit_component_lookup_radius_m,
+        )
+        # Before a core has ever been established, safe recovery motion may
+        # expose one near the new pose but outside the original lookup radius.
+        if origin_label == 0 and int(state.get("recovery_moves", 0)):
+            origin_label = self._nearest_component_label(
+                grid, labels, pose["x"], pose["y"],
+                self.cfg.exit_component_lookup_radius_m,
+            )
+            if origin_label:
+                state["origin"] = {
+                    "x": float(pose["x"]), "y": float(pose["y"])
+                }
+        if origin_label == 0:
+            recovery = self._exit_map_recovery_step(
+                prepared, pose, state, visited, "no_room_core"
+            )
+            if recovery is not None:
+                return recovery
+            raise ValueError(
+                "starting room has no sufficiently open interior after "
+                "bounded map recovery"
+            )
+
+        robot_col, robot_row = self._robot_cell(grid, pose)
+        current_label = (
+            int(labels[robot_row, robot_col])
+            if grid.inside(robot_col, robot_row) else 0
+        )
+        if current_label and current_label != origin_label:
+            return {"complete": True, "phase": "outside", "state": state}
+
+        other_labels = [
+            label for label, area in component_areas.items()
+            if label != origin_label
+            and area >= self.cfg.exit_component_min_area_m2
+        ]
+        # Frontiers are generated from connected traversable cells without the
+        # endpoint-clearance erosion used by `prepared["reachable"]`. Propagate
+        # room ownership over that same mask so valid boundary cells are not
+        # left unlabeled merely because they lie close to unknown space.
+        frontier_reachable = reachable
+        if prepared.get("costs") is not None:
+            frontier_reachable = self._reachable(
+                grid, prepared["costs"], pose
+            )
+        room_labels = self._exit_reachable_room_labels(
+            frontier_reachable, labels, [origin_label, *other_labels]
+        )
+        room_frontiers = []
+        for frontier in prepared.get("frontiers") or []:
+            frontier_col, frontier_row = (
+                int(value)
+                for value in grid.cells(frontier["x"], frontier["y"])
+            )
+            frontier_label = (
+                int(room_labels[frontier_row, frontier_col])
+                if grid.inside(frontier_col, frontier_row) else 0
+            )
+            already_visited = any(
+                math.hypot(frontier["x"] - point[0], frontier["y"] - point[1])
+                < self.cfg.exit_frontier_revisit_m
+                for point in visited
+            )
+            if frontier_label == origin_label and not already_visited:
+                room_frontiers.append(frontier)
+
+        if room_frontiers:
+            def frontier_rank(item):
+                distance = math.hypot(
+                    item["x"] - pose["x"], item["y"] - pose["y"]
+                )
+                gain = float(item.get("information_gain_m2") or 0.0)
+                utility = gain - (
+                    self.cfg.exit_frontier_travel_penalty_m2_per_m * distance
+                )
+                return -utility, distance, -gain
+
+            frontier = min(room_frontiers, key=frontier_rank)
+            visited.append([float(frontier["x"]), float(frontier["y"])])
+            state.update(
+                visited_frontiers=visited,
+                passes=int(state.get("passes", 0)) + 1,
+            )
+            destination = self._local_goal(
+                frontier["x"], frontier["y"], frontier["yaw"], pose
+            )
+            return {
+                "complete": False,
+                "phase": "explore_room_frontier",
+                "state": state,
+                "destination": destination,
+            }
+
+        if not other_labels:
+            recovery = self._exit_map_recovery_step(
+                prepared, pose, state, visited, "no_exit_evidence"
+            )
+            if recovery is not None:
+                return recovery
+            raise ValueError(
+                "room frontiers and bounded map recovery are exhausted but "
+                "no geometric exit is mapped"
+            )
+
+        mask = np.isin(labels, other_labels)
+        rows, cols = np.nonzero(mask)
+        xs, ys = grid.world(cols, rows)
+        index = int(np.argmin((xs - pose["x"]) ** 2 + (ys - pose["y"]) ** 2))
+        x, y = float(xs[index]), float(ys[index])
+        state["passes"] = int(state.get("passes", 0)) + 1
+        return {
+            "complete": False,
+            "phase": "cross_room_boundary",
+            "state": state,
+            "destination": self._local_goal(
+                x, y, math.atan2(y - pose["y"], x - pose["x"]), pose
+            ),
+        }
+
+    def _exit_map_recovery_step(
+        self, prepared, pose, state, visited_frontiers, reason
+    ):
+        """Choose one short, known-safe move to improve a noisy room map."""
+        recovery_moves = int(state.get("recovery_moves", 0))
+        if recovery_moves >= self.cfg.exit_recovery_max_moves:
+            return None
+
+        grid = prepared["grid"]
+        reachable = np.asarray(prepared["reachable"], dtype=bool)
+        rows, cols = np.nonzero(reachable)
+        if not rows.size:
+            return None
+        xs, ys = grid.world(cols, rows)
+        travel = np.hypot(xs - pose["x"], ys - pose["y"])
+        eligible = (
+            (travel >= self.cfg.exit_recovery_min_move_m)
+            & (travel <= self.cfg.exit_recovery_max_move_m)
+        )
+
+        recovery_points = [
+            point for point in state.get("recovery_points") or []
+            if isinstance(point, list) and len(point) == 2
+        ]
+        for point in recovery_points:
+            eligible &= (
+                np.hypot(xs - point[0], ys - point[1])
+                >= self.cfg.exit_recovery_revisit_m
+            )
+        if not np.any(eligible):
+            return None
+
+        rows, cols = rows[eligible], cols[eligible]
+        xs, ys, travel = xs[eligible], ys[eligible], travel[eligible]
+        known_free = (grid.data >= 0) & (grid.data < self.cfg.occupied)
+        clearance = cv2.distanceTransform(
+            known_free.astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
+        endpoint_clearance = clearance[rows, cols]
+
+        unvisited_frontiers = [
+            frontier for frontier in prepared.get("frontiers") or []
+            if not any(
+                math.hypot(
+                    frontier["x"] - point[0], frontier["y"] - point[1]
+                ) < self.cfg.exit_frontier_revisit_m
+                for point in visited_frontiers
+            )
+        ]
+        if unvisited_frontiers:
+            frontier_distance_sq = np.min(
+                np.stack([
+                    (xs - frontier["x"]) ** 2
+                    + (ys - frontier["y"]) ** 2
+                    for frontier in unvisited_frontiers
+                ]),
+                axis=0,
+            )
+            index = int(np.lexsort(
+                (-endpoint_clearance, frontier_distance_sq)
+            )[0])
+        else:
+            # Prefer the safest endpoint, using useful motion as the tie-break.
+            index = int(np.lexsort((-travel, -endpoint_clearance))[0])
+
+        x, y = float(xs[index]), float(ys[index])
+        recovery_points.append([x, y])
+        state.update(
+            recovery_points=recovery_points,
+            recovery_moves=recovery_moves + 1,
+            passes=int(state.get("passes", 0)) + 1,
+        )
+        return {
+            "complete": False,
+            "phase": "stabilize_room_map",
+            "state": state,
+            "recovery_reason": reason,
+            "destination": self._local_goal(
+                x, y, math.atan2(y - pose["y"], x - pose["x"]), pose
+            ),
+        }
+
+    def _exit_wall_mask(self, grid):
+        """Keep long occupied components as walls, ignoring small furniture."""
+        occupied = grid.data >= self.cfg.occupied
+        count, labels = cv2.connectedComponents(
+            occupied.astype(np.uint8), connectivity=8
+        )
+        keep = np.zeros(count, dtype=bool)
+        minimum_length = max(0.0, self.cfg.exit_wall_min_length_m)
+
+        for label in range(1, count):
+            rows, cols = np.nonzero(labels == label)
+            if not rows.size:
+                continue
+            if rows.size == 1:
+                length = grid.resolution
+            else:
+                points = np.column_stack((cols, rows)).astype(np.float32)
+                centered = points - points.mean(axis=0)
+                _, _, axes = np.linalg.svd(centered, full_matrices=False)
+                projection = centered @ axes[0]
+                length = (
+                    float(projection.max() - projection.min()) + 1.0
+                ) * grid.resolution
+            keep[label] = length >= minimum_length
+
+        return keep[labels]
+
+    def _exit_open_components(self, grid, reachable):
+        # Unknown space and structural walls bound rooms. Small occupied
+        # components remain excluded by `reachable`, but do not create the
+        # large clearance halo that can split one room around furniture.
+        classification_free = (grid.data >= 0) & ~self._exit_wall_mask(grid)
+        clearance = cv2.distanceTransform(
+            classification_free.astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
+        open_space = reachable & (clearance >= self.cfg.exit_open_clearance_m)
+        count, labels = cv2.connectedComponents(
+            open_space.astype(np.uint8), connectivity=8
+        )
+        areas = {
+            label: float(np.count_nonzero(labels == label) * grid.resolution ** 2)
+            for label in range(1, count)
+        }
+        return labels, areas
+
+    @staticmethod
+    def _exit_reachable_room_labels(reachable, open_labels, room_labels):
+        """Assign reachable floor to its nearest room core by path distance.
+
+        Expansion is constrained to reachable cells, so labels cannot pass
+        through walls. When multiple meaningful room cores exist, their waves
+        compete and split connecting doorway/corridor space between them.
+        """
+        reachable = np.asarray(reachable, dtype=bool)
+        open_labels = np.asarray(open_labels)
+        allowed = np.asarray(room_labels, dtype=open_labels.dtype)
+        owners = np.where(
+            reachable & np.isin(open_labels, allowed), open_labels, 0
+        ).astype(np.int32)
+        queue = deque(
+            (int(row), int(col))
+            for row, col in zip(*np.nonzero(owners))
+        )
+        height, width = owners.shape
+        neighbors = (
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1), (0, 1),
+            (1, -1), (1, 0), (1, 1),
+        )
+        while queue:
+            row, col = queue.popleft()
+            owner = owners[row, col]
+            for row_offset, col_offset in neighbors:
+                next_row = row + row_offset
+                next_col = col + col_offset
+                if not (
+                    0 <= next_row < height and 0 <= next_col < width
+                    and reachable[next_row, next_col]
+                    and owners[next_row, next_col] == 0
+                ):
+                    continue
+                owners[next_row, next_col] = owner
+                queue.append((next_row, next_col))
+        return owners
+
+    @staticmethod
+    def _nearest_component_label(grid, labels, x, y, max_distance_m):
+        col, row = (int(value) for value in grid.cells(x, y))
+        if grid.inside(col, row) and labels[row, col]:
+            return int(labels[row, col])
+        radius = max(1, math.ceil(max_distance_m / grid.resolution))
+        r0, r1 = max(0, row - radius), min(labels.shape[0], row + radius + 1)
+        c0, c1 = max(0, col - radius), min(labels.shape[1], col + radius + 1)
+        local_rows, local_cols = np.nonzero(labels[r0:r1, c0:c1])
+        if not len(local_rows):
+            return 0
+        distances = (local_rows + r0 - row) ** 2 + (local_cols + c0 - col) ** 2
+        index = int(np.argmin(distances))
+        return int(labels[local_rows[index] + r0, local_cols[index] + c0])
+
+    # -------------------------------------------------------------------------
+    # Shared goal, candidate, and ray helpers
+    # -------------------------------------------------------------------------
+    def _local_goal(self, x, y, yaw, pose):
+        return {
+            "x": float(x), "y": float(y), "angle": self._angle(float(yaw)),
+            "frame_id": str(pose.get("frame_id") or "map"),
+        }
 
     def _deduplicate_candidates(self, candidates):
         """Keep one useful marker per 30 cm cluster; H remains independent."""
@@ -389,7 +791,7 @@ class MapLogic:
             if item.get("kind") == "frontier":
                 return 4
             if (
-                item.get("id") in {"CB", "CF", "EF"}
+                item.get("id") in {"CF", "EF"}
                 or "furthest" in str(item.get("selection_reason") or "")
             ):
                 return 3
@@ -438,6 +840,9 @@ class MapLogic:
             grid.inside(col, row) and reachable[int(row), int(col)]
         )
 
+    def _known_free(self, grid):
+        return (grid.data >= 0) & (grid.data < self.cfg.occupied)
+
     def _furthest_reachable_on_ray(
         self, grid, reachable, origin, yaw, max_distance=None
     ):
@@ -451,8 +856,7 @@ class MapLogic:
         last_cell = None
 
         for distance in np.arange(0.0, max_distance + step, step):
-            x = origin["x"] + float(distance) * math.cos(yaw)
-            y = origin["y"] + float(distance) * math.sin(yaw)
+            x, y = self._point_on_ray(origin, yaw, float(distance))
             col, row = (int(value) for value in grid.cells(x, y))
             if not grid.inside(col, row) or not reachable[row, col]:
                 break
@@ -463,6 +867,9 @@ class MapLogic:
         x, y = grid.world(*last_cell)
         return float(x), float(y), last_cell
 
+    # -------------------------------------------------------------------------
+    # Context-clue candidates
+    # -------------------------------------------------------------------------
     def _context_candidates(
         self, prepared, pose, overlay, *, max_range_m=None
     ):
@@ -556,27 +963,15 @@ class MapLogic:
                 far_candidate.update(candidate_attributes)
                 candidates.append(far_candidate)
 
-        back_distance = self.cfg.context_backup_distance_m
-
-        x = pose["x"] - back_distance * math.cos(center)
-        y = pose["y"] - back_distance * math.sin(center)
-        if self._valid_endpoint(grid, reachable, x, y):
-            backup = self._describe({
-                "id": "CB",
-                "kind": "context",
-                "x": float(x),
-                "y": float(y),
-                "yaw": math.atan2(target[1] - y, target[0] - x),
-                "selection_reason": "reverse_for_wider_view",
-            }, pose)
-            backup.update(candidate_attributes)
-            candidates.append(backup)
         return candidates
 
+    # -------------------------------------------------------------------------
+    # Exploration candidates
+    # -------------------------------------------------------------------------
     def _exploration_candidates(self, prepared, pose, overlay, coverage):
         """Pick the best unseen view and optionally offer a farther move."""
         grid, reachable = prepared["grid"], prepared["reachable"]
-        known_free = (grid.data >= 0) & (grid.data < self.cfg.occupied)
+        known_free = self._known_free(grid)
         unseen = known_free & ~coverage
         rows, cols = self._exploration_samples(
             grid, reachable, unseen, coverage, pose
@@ -690,12 +1085,7 @@ class MapLogic:
 
     def _best_unseen_view(self, grid, pose, unseen, known_free, overlay):
         """Choose the heading whose camera cone contains most unseen cells."""
-        fov = float(overlay.get(
-            "camera_horizontal_fov_deg", self.cfg.camera_horizontal_fov_deg
-        ))
-        max_range = float(overlay.get(
-            "camera_reliable_range_m", self.cfg.camera_fov_max_range_m
-        ))
+        fov, max_range = self._camera_view_parameters(overlay)
         best = (float(pose["yaw"]), 0, 0.0)
         headings = np.linspace(
             0.0, 2 * math.pi, self.cfg.exploration_headings,
@@ -712,6 +1102,9 @@ class MapLogic:
                 best = float(yaw), gain, fraction
         return best
 
+    # -------------------------------------------------------------------------
+    # Costmap projection and reachability
+    # -------------------------------------------------------------------------
     def _costs_on_map(self, grid, costmap):
         rows, cols = np.indices(grid.data.shape)
         return costmap.sample(*grid.world(cols, rows))
@@ -766,78 +1159,9 @@ class MapLogic:
         )
         return connected & (safe | egress)
 
-    # ------------------------------------------------------------------
-    # Local samples
-    # ------------------------------------------------------------------
-    def _local_candidates(self, grid, reachable, pose):
-        out = []
-        angle_step = math.radians(self.cfg.sample_angle_deg)
-        angles = int(round(2 * math.pi / angle_step))
-        distances = [
-            float(distance) for distance in self.cfg.sample_distances
-            if 0.0 < float(distance) <= self.cfg.sample_radius
-        ]
-
-        # Sample straight visual rays. A ray stops at the first unsafe cell so
-        # the rendered choices never appear to pass through a wall. When the
-        # obstacle falls between configured rings, add its furthest safe point.
-        for angle_index in range(angles):
-            yaw = pose["yaw"] + angle_index * angle_step
-            furthest = self._furthest_reachable_on_ray(
-                grid, reachable, pose, yaw,
-                max_distance=self.cfg.sample_radius,
-            )
-            if furthest is None:
-                continue
-            furthest_x, furthest_y, _ = furthest
-            ray_limit = math.hypot(
-                furthest_x - pose["x"], furthest_y - pose["y"]
-            )
-            ray_candidates = []
-            for ring_index, radius in enumerate(distances):
-                if radius > ray_limit + grid.resolution / 2.0:
-                    continue
-                x = pose["x"] + radius * math.cos(yaw)
-                y = pose["y"] + radius * math.sin(yaw)
-                if not self._valid_endpoint(grid, reachable, x, y):
-                    continue
-                candidate = {
-                    "id": str(ring_index * angles + angle_index + 1),
-                    "kind": "local",
-                    "x": float(x), "y": float(y), "yaw": float(yaw),
-                }
-                out.append(candidate)
-                ray_candidates.append(candidate)
-
-            blocked = ray_limit < self.cfg.sample_radius - grid.resolution / 2.0
-            duplicate = any(
-                math.hypot(
-                    item["x"] - furthest_x, item["y"] - furthest_y
-                ) < grid.resolution
-                for item in ray_candidates
-            )
-            if blocked and ray_limit >= grid.resolution and not duplicate:
-                out.append({
-                    "id": f"B{angle_index + 1}",
-                    "kind": "local",
-                    "x": furthest_x,
-                    "y": furthest_y,
-                    "yaw": float(yaw),
-                    "selection_reason": "furthest_safe_point_on_blocked_ray",
-                })
-
-        if self.cfg.include_rotations and reachable.any():
-            out.append({
-                "id": "H",
-                "kind": "rotation",
-                "x": pose["x"], "y": pose["y"], "yaw": float(pose["yaw"]),
-                "selection_reason": "hold_position_and_choose_heading",
-            })
-        return out
-
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Frontiers
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     def _ray_gain(self, grid, row, col):
         visible = set()
         max_cells = self.cfg.frontier_gain_radius / grid.resolution
@@ -872,7 +1196,7 @@ class MapLogic:
             visible.update(zip(rows[values < 0].tolist(), cols[values < 0].tolist()))
 
         return len(visible) * grid.resolution ** 2
-    def _frontier_samples(self, rows, cols, max_samples=5):
+    def _frontier_samples(self, rows, cols, max_samples):
         points = np.column_stack((rows, cols)).astype(float)
 
         center = points.mean(axis=0)
@@ -946,7 +1270,9 @@ class MapLogic:
             if len(rows) < min_cells:
                 continue
 
-            samples = self._frontier_samples(rows, cols, 5)
+            samples = self._frontier_samples(
+                rows, cols, self.cfg.frontier_samples_per_component
+            )
 
             best = None
             for i in samples:
@@ -1008,14 +1334,14 @@ class MapLogic:
 
         return selected, accepted
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Camera coverage on the occupancy grid
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     def visibility_mask(self, grid, pose, center_yaw, fov_deg, max_range):
         """Return grid cells visible inside an obstacle-clipped camera cone."""
         visible = np.zeros_like(grid.data, dtype=bool)
         ray_count = max(
-            31,
+            self.cfg.visibility_min_rays,
             math.ceil(math.radians(fov_deg) * max_range / grid.resolution),
         )
         distances = np.arange(
@@ -1047,12 +1373,7 @@ class MapLogic:
         counts = np.zeros_like(grid.data, dtype=np.uint16)
         if not isinstance(overlay, dict):
             return counts
-        fov = float(overlay.get(
-            "camera_horizontal_fov_deg", self.cfg.camera_horizontal_fov_deg
-        ))
-        max_range = float(overlay.get(
-            "camera_reliable_range_m", self.cfg.camera_fov_max_range_m
-        ))
+        fov, max_range = self._camera_view_parameters(overlay)
         frame_id = str(overlay.get("frame_id") or "")
         for pose in overlay.get("search_poses") or []:
             if frame_id and pose.get("frame_id") != frame_id:
@@ -1065,287 +1386,3 @@ class MapLogic:
                     grid, pose, center, fov, max_range
                 ).astype(np.uint16)
         return counts
-
-        # ------------------------------------------------------------------
-    # Door detection
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _at(array, row, col, default=0.0):
-        r, c = int(round(row)), int(round(col))
-        if 0 <= r < array.shape[0] and 0 <= c < array.shape[1]:
-            return float(array[r, c])
-        return default
-
-    def _line_free(self, free, row, col, angle, distance):
-        for d in np.arange(0, distance + 0.5, 0.5):
-            r = row + math.sin(angle) * d
-            c = col + math.cos(angle) * d
-            if not self._at(free, r, c, 0):
-                return False
-        return True
-    def _obstacle_components(self, grid):
-        occupied = grid.data >= self.cfg.occupied
-
-        count, labels = cv2.connectedComponents(
-            occupied.astype(np.uint8),
-            connectivity=8,
-        )
-
-        lengths = np.zeros(count, dtype=np.float32)
-
-        for label in range(1, count):
-            rows, cols = np.nonzero(labels == label)
-            if len(rows) == 0:
-                continue
-
-            if len(rows) == 1:
-                lengths[label] = grid.resolution
-                continue
-
-            points = np.column_stack((cols, rows)).astype(np.float32)
-            centered = points - points.mean(axis=0)
-
-            _, _, axes = np.linalg.svd(centered, full_matrices=False)
-            axis = axes[0]
-            projection = centered @ axis
-
-            length_cells = float(projection.max() - projection.min()) + 1.0
-            lengths[label] = length_cells * grid.resolution
-
-        return labels, lengths
-    def _wall(self, grid, obstacle_labels, obstacle_lengths,
-            row, col, angle, max_distance_m):
-        max_cells = max_distance_m / grid.resolution
-        previous = None
-
-        for distance in np.arange(0.5, max_cells + 0.5, 0.5):
-            c = int(round(col + math.cos(angle) * distance))
-            r = int(round(row + math.sin(angle) * distance))
-
-            if not grid.inside(c, r) or grid.data[r, c] < 0:
-                return None
-
-            if (r, c) == previous:
-                continue
-            previous = (r, c)
-
-            if grid.data[r, c] < self.cfg.occupied:
-                continue
-
-            label = int(obstacle_labels[r, c])
-            wall_length = float(obstacle_lengths[label])
-
-            if wall_length < self.cfg.door_wall_min_length:
-                continue
-
-            return distance * grid.resolution, c, r, wall_length, label
-
-        return None
-    def _door_at(self, grid, free, clearance,
-                obstacle_labels, obstacle_lengths, row, col):
-        probe = self.cfg.door_probe / grid.resolution
-        wall_range = self.cfg.door_max_width / 2 + 0.35
-        center_clearance = float(clearance[row, col])
-
-        best = None
-
-        for passage in np.linspace(0, math.pi, self.cfg.door_angles, endpoint=False):
-            # Passage must be open in both directions.
-            if not self._line_free(free, row, col, passage, probe):
-                continue
-            if not self._line_free(free, row, col, passage + math.pi, probe):
-                continue
-
-            # Find walls perpendicular to passage.
-            cross = passage + math.pi / 2
-
-            a = self._wall(grid, obstacle_labels, obstacle_lengths,row, col, cross, wall_range,)
-            b = self._wall(grid, obstacle_labels, obstacle_lengths,row, col, cross + math.pi, wall_range)
-
-            if not a or not b:
-                continue
-
-            # Opening must be door-sized.
-            width = a[0] + b[0] - grid.resolution
-
-            if not self.cfg.door_min_width <= width <= self.cfg.door_max_width:
-                continue
-
-            # Space should widen beyond the bottleneck.
-            ar = row + math.sin(passage) * probe
-            ac = col + math.cos(passage) * probe
-            br = row - math.sin(passage) * probe
-            bc = col - math.cos(passage) * probe
-
-            side_a = self._at(clearance, ar, ac)
-            side_b = self._at(clearance, br, bc)
-
-            widening_a = float(side_a - center_clearance)
-            widening_b = float(side_b - center_clearance)
-            widening = max(widening_a, widening_b)
-
-            if widening < self.cfg.door_min_widening:
-                continue
-
-            # Only used to choose the best valid orientation.
-            balance = 1.0 - abs(a[0] - b[0]) / max(
-                a[0] + b[0],
-                grid.resolution,
-            )
-
-            candidate = {
-                "width": float(width),
-                "passage": float(passage),
-                "wall_a": [a[1], a[2]],
-                "wall_b": [b[1], b[2]],
-                "wall_a_length_m": float(a[3]),
-                "wall_b_length_m": float(b[3]),
-                "widening_a_m": widening_a,
-                "widening_b_m": widening_b,
-                "widening_m": widening,
-                "balance": float(balance),
-            }
-
-            if best is None or (
-                candidate["balance"],
-                candidate["widening_m"],
-            ) > (
-                best["balance"],
-                best["widening_m"],
-            ):
-                best = candidate
-
-        return best
-    def _doors(self, grid, costs, pose):
-        map_free = (grid.data >= 0) & (grid.data < self.cfg.occupied)
-        connected = self._reachable(grid, costs, pose)
-
-        clearance = cv2.distanceTransform(
-            map_free.astype(np.uint8), cv2.DIST_L2, 5
-        )
-        clearance *= grid.resolution
-
-        ridge = clearance >= cv2.dilate(
-            clearance, np.ones((3, 3), np.float32)
-        ) - 1e-6
-
-        candidates = (
-            connected
-            & ridge
-            & (clearance >= 0.5 * self.cfg.door_min_width)
-            & (clearance <= 0.5 * self.cfg.door_max_width)
-        )
-
-        obstacle_labels, obstacle_lengths = self._obstacle_components(grid)
-
-        _, labels = cv2.connectedComponents(
-            candidates.astype(np.uint8), connectivity=8
-        )
-
-        hypotheses = []
-
-        for label in range(1, labels.max() + 1):
-            rows, cols = np.nonzero(labels == label)
-            if not len(rows):
-                continue
-
-            samples = np.linspace(
-                0, len(rows) - 1, min(6, len(rows)), dtype=int
-            )
-
-            for i in np.unique(samples):
-                row, col = int(rows[i]), int(cols[i])
-
-                door = self._door_at(
-                    grid, map_free, clearance,
-                    obstacle_labels, obstacle_lengths,
-                    row, col,
-                )
-
-                if not door:
-                    continue
-
-                x, y = grid.world(col, row)
-                wa_x, wa_y = grid.world(*door["wall_a"])
-                wb_x, wb_y = grid.world(*door["wall_b"])
-                passage_yaw = grid.origin_yaw + door["passage"]
-
-                hypotheses.append({
-                    "x": float(x),
-                    "y": float(y),
-                    "cell": [col, row],
-                    "width": round(door["width"], 3),
-                    "confirmed": True,
-                    "passage_yaw": float(passage_yaw),
-                    "wall_a": door["wall_a"],
-                    "wall_b": door["wall_b"],
-                    "wall_a_xy": [float(wa_x), float(wa_y)],
-                    "wall_b_xy": [float(wb_x), float(wb_y)],
-                    "wall_a_length_m": round(door["wall_a_length_m"], 3),
-                    "wall_b_length_m": round(door["wall_b_length_m"], 3),
-                    "widening_m": round(door["widening_m"], 3),
-                    "balance": round(door["balance"], 3),
-                })
-
-        hypotheses.sort(
-            key=lambda d: (
-                min(d["wall_a_length_m"], d["wall_b_length_m"]),
-                d["widening_m"],
-                d["balance"],
-            ),
-            reverse=True,
-        )
-
-        doors = []
-
-        for door in hypotheses:
-            if any(
-                math.hypot(
-                    door["x"] - other["x"],
-                    door["y"] - other["y"],
-                ) < self.cfg.door_min_separation
-                for other in doors
-            ):
-                continue
-
-            doors.append(door)
-
-        return sorted(doors, key=lambda d: (d["y"], d["x"])), candidates
-
-    # ------------------------------------------------------------------
-    # Room segmentation
-    # ------------------------------------------------------------------
-    def _rooms(self, grid, pose, doors):
-        map_free = (grid.data >= 0) & (grid.data < self.cfg.occupied)
-        free = self._connected(map_free, *self._robot_cell(grid, pose)).astype(np.uint8)
-
-        for door in doors:
-            if door["confirmed"]:
-                cv2.line(
-                    free,
-                    tuple(door["wall_a"]),
-                    tuple(door["wall_b"]),
-                    0,
-                    max(1, round(0.12 / grid.resolution)),
-                )
-
-        count, labels, stats, centers = cv2.connectedComponentsWithStats(free, connectivity=4)
-        robot_col, robot_row = self._robot_cell(grid, pose)
-        robot_label = labels[robot_row, robot_col] if grid.inside(robot_col, robot_row) else 0
-        min_cells = self.cfg.room_min_area / grid.resolution ** 2
-
-        rooms = []
-        for label in range(1, count):
-            area = stats[label, cv2.CC_STAT_AREA]
-            if area < min_cells:
-                continue
-            x, y = grid.world(*centers[label])
-            rooms.append({
-                "id": f"R{len(rooms) + 1}",
-                "x": float(x), "y": float(y),
-                "area": round(float(area * grid.resolution ** 2), 2),
-                "current": bool(label == robot_label),
-            })
-
-        current_mask = labels == robot_label if robot_label else np.zeros_like(labels, bool)
-        return rooms, current_mask

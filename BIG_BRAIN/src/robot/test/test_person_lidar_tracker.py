@@ -3,17 +3,14 @@ import threading
 from unittest.mock import Mock
 
 import numpy as np
-from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import LaserScan
 
-from robot.person_lidar_tracker import (
+from robot.person_pose.person_lidar_tracker import (
     Cluster,
     Detection,
     PersonTrack,
-    SeedFilter,
     TrackerSettings,
     cluster_scan,
-    mask_person_returns,
     person_detections,
 )
 
@@ -31,48 +28,20 @@ def test_cluster_scan_splits_invalid_gap():
     assert [len(cluster) for cluster in clusters] == [3, 3]
 
 
-def test_slam_scan_masks_person_without_mutating_navigation_scan():
+def test_scan_processing_stays_dormant_until_first_seed():
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
+
+    tracker = PersonLidarTracker.__new__(PersonLidarTracker)
+    tracker.enabled = False
+    tracker._apply_pending_control = Mock()
+    tracker._publish_disabled = Mock()
+    tracker._lookup_transform = Mock()
     scan = LaserScan()
-    scan.angle_min = -0.2
-    scan.angle_increment = 0.1
-    scan.range_min = 0.1
-    scan.range_max = 10.0
-    scan.ranges = [4.0, 4.0, 2.0, 4.0, 4.0]
-    transform = TransformStamped()
-    transform.transform.rotation.w = 1.0
 
-    filtered = mask_person_returns(
-        scan,
-        transform,
-        person_position=np.array([2.0, 0.0]),
-        mask_radius=0.3,
-    )
+    tracker.scan_callback(scan)
 
-    assert math.isnan(filtered[2])
-    assert filtered[:2] == [4.0, 4.0]
-    assert filtered[3:] == [4.0, 4.0]
-    assert scan.ranges[2] == 2.0
-
-
-def test_slam_scan_mask_uses_tracking_frame_transform():
-    scan = LaserScan()
-    scan.angle_min = 0.0
-    scan.angle_increment = 0.1
-    scan.range_min = 0.1
-    scan.range_max = 10.0
-    scan.ranges = [2.0]
-    transform = TransformStamped()
-    transform.transform.translation.x = 1.0
-    transform.transform.rotation.w = 1.0
-
-    filtered = mask_person_returns(
-        scan,
-        transform,
-        person_position=np.array([3.0, 0.0]),
-        mask_radius=0.3,
-    )
-
-    assert math.isnan(filtered[0])
+    tracker._publish_disabled.assert_called_once_with(scan.header.stamp)
+    tracker._lookup_transform.assert_not_called()
 
 
 def test_person_detections_prefers_leg_pair_midpoint():
@@ -121,33 +90,8 @@ def test_track_starts_stationary_then_learns_motion():
     assert moving_prediction[0] > track.position[0]
 
 
-def test_seed_filter_accepts_smooth_motion_and_restarts_after_jump():
-    seed_filter = SeedFilter(
-        smoothing_gain=0.5,
-        velocity_gain=0.5,
-        max_speed=2.5,
-        max_prediction_seconds=0.3,
-        jump_tolerance=0.2,
-        confirmation_count=3,
-    )
-
-    _, trusted_1 = seed_filter.update(np.array([1.0, 0.0]), 1.0)
-    _, trusted_2 = seed_filter.update(np.array([1.1, 0.0]), 1.2)
-    filtered, trusted_3 = seed_filter.update(np.array([1.2, 0.0]), 1.4)
-
-    assert not trusted_1
-    assert not trusted_2
-    assert trusted_3
-    assert 1.0 < filtered[0] < 1.2
-
-    jumped, trusted_jump = seed_filter.update(np.array([4.0, 0.0]), 1.6)
-    assert not trusted_jump
-    assert np.allclose(jumped, [4.0, 0.0])
-    assert seed_filter.consistent_hits == 1
-
-
 def test_conflicting_seed_starts_handoff_without_dropping_active_track():
-    from robot.person_lidar_tracker import PersonLidarTracker
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.settings = TrackerSettings(
@@ -190,7 +134,7 @@ def test_conflicting_seed_starts_handoff_without_dropping_active_track():
 
 
 def test_seed_handoff_switches_only_after_lidar_confirmation():
-    from robot.person_lidar_tracker import PersonLidarTracker
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.settings = TrackerSettings(
@@ -236,7 +180,7 @@ def test_seed_handoff_switches_only_after_lidar_confirmation():
 
 
 def test_trusted_seed_biases_candidate_choice_without_becoming_pose():
-    from robot.person_lidar_tracker import PersonLidarTracker
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     chair = Detection(np.array([0.0, 0.0]), "partial")
     person = Detection(np.array([0.25, 0.0]), "pair")
@@ -251,8 +195,8 @@ def test_trusted_seed_biases_candidate_choice_without_becoming_pose():
     assert selected is person
 
 
-def test_disabling_session_clears_all_tracking_state():
-    from robot.person_lidar_tracker import PersonLidarTracker
+def test_disabling_camera_session_keeps_continuous_lidar_track():
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.seed_lock = threading.Lock()
@@ -266,7 +210,6 @@ def test_disabling_session_clears_all_tracking_state():
     tracker.latest_seed = {"x": 1.0, "y": 2.0}
     tracker.last_seed_position = np.array([1.0, 2.0])
     tracker.last_seed_at = 1.0
-    tracker.seed_filter = SeedFilter()
     tracker.seed_mismatch_hits = 1
     tracker.acquisition_state = "tracking"
     tracker.acquisition_started_at = None
@@ -274,18 +217,14 @@ def test_disabling_session_clears_all_tracking_state():
 
     tracker._apply_pending_control()
 
-    assert not tracker.enabled
-    assert tracker.session_id is None
-    assert tracker.track is None
-    assert tracker.pending_position is None
-    assert tracker.pending_hits == 0
-    assert tracker.latest_seed is None
-    assert tracker.last_seed_position is None
-    assert tracker.last_detections == []
+    assert tracker.enabled
+    assert tracker.session_id == "person-1"
+    assert tracker.track is not None
+    assert tracker.pending_hits == 2
 
 
-def test_new_session_resets_old_track_before_enabling():
-    from robot.person_lidar_tracker import PersonLidarTracker
+def test_new_camera_session_keeps_old_track_while_updating_session():
+    from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.seed_lock = threading.Lock()
@@ -299,7 +238,6 @@ def test_new_session_resets_old_track_before_enabling():
     tracker.latest_seed = None
     tracker.last_seed_position = np.array([1.0, 2.0])
     tracker.last_seed_at = 1.0
-    tracker.seed_filter = SeedFilter()
     tracker.seed_mismatch_hits = 1
     tracker.acquisition_state = "tracking"
     tracker.acquisition_started_at = None
@@ -309,6 +247,6 @@ def test_new_session_resets_old_track_before_enabling():
 
     assert tracker.enabled
     assert tracker.session_id == "person-2"
-    assert tracker.track is None
-    assert tracker.pending_hits == 0
-    assert tracker.last_seed_position is None
+    assert tracker.track is not None
+    assert tracker.pending_hits == 2
+    assert tracker.last_seed_position is not None

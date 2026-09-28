@@ -1,76 +1,84 @@
-# Vision-selected local navigation
+# Navigation actions
 
-The `navigate_action` tool takes a natural-language `query`, for example:
+Navigation is split into three small actions.
 
-```json
-{"query": "Move toward the opening on the left, keeping clear of the chair."}
-```
+## Explicit navigation
 
-`SMALL_BRAIN/actions/navigate_action.py` keeps one action active across local steps:
+`explicit_navigation` accepts one `local_command`:
 
-1. Read one fresh, atomic map JPEG and candidate table from `CameraStream`.
-   MapLogic has already generated, filtered, and ranked candidates for the
-   snapshot's selection mode.
-2. For normal navigation and contextual clue investigation, send the map plus
-   the selected USB/Astra camera frame to OOB vision. For exploration snapshots
-   marked `selection_policy=deterministic`, immediately use
-   `selected_pose_id` without encoding a camera frame or calling the model.
-3. When vision is used, it returns `decision`, `pose_id`, and `reason`.
-   `move` requires an ID
-   from this snapshot: a numeric local pose, an `F` frontier, or an `R` in-place
-   rotation. `goal_reached` and `blocked` require `pose_id: null`.
-4. Resolve the ID against the original frozen table. Check a fresh map before
-   moving: same frame, robot pose within 5 cm / 0.15 radians, and the selected
-   coordinates/yaw still represented by a candidate within those tolerances.
-   A new snapshot's ID cannot redirect the goal to another coordinate.
-5. Send `navigate_to_pose` through the existing ZeroMQ command callback, using
-   `frame_id`, `x`, `y`, and `angle` (the chosen yaw). Nav2 plans and executes it.
-6. Wait for the bridge's navigation event with the matching action ID. After `Goal Reached`, capture fresh images and reassess the complete original query inside the same action. No intermediate lifecycle result is sent to the realtime model.
-7. Finish successfully only when OOB vision returns `goal_reached`. `blocked`, selection errors, rejection, navigation failure, timeout, or a safety limit produce terminal results with a structured reason.
+- nudges: forward, backward, left, or right;
+- rotations: left, right, or around;
+- furthest reachable point forward or backward;
+- middle of local open space;
+- previous position; or
+- face the continuously tracked person;
+- stop when an exit crossing is identified;
+- cross into and register another room;
+- return to Room 1; or
+- navigate to a known numbered room.
 
-The existing realtime WebSocket handles OOB replies; `CognitionManager` routes
-`select_navigation_pose` to the action. No separate model client is needed.
-The images go to the OOB response, not the normal voice conversation.
+The realtime model never selects coordinates or a marker from a rendered map.
+`BIG_BRAIN/src/robot/robot/map/map_logic.py` resolves the named command against the current
+reachable occupancy grid and the bridge sends the resulting pose to Nav2.
 
-Before every selection, the exact JPEGs sent to vision and a JSON manifest are
-atomically refreshed under `SMALL_BRAIN/results/navigation/` as
-`latest_map.jpg`, `latest_vision.jpg`, and `latest_request.json`. Only the newest
-loop is retained. Set `NAVIGATION_DEBUG_DIR` to override this directory. Save
-failures are reported in the action result but do not stop navigation.
+Map logic treats sufficiently open reachable regions separated by narrow
+clearance bands as geometric chambers. The first observed chamber is retained
+as `Room 1`. Room-core labels expand through reachable floor by path distance,
+so a frontier can belong to a distant part of the same room but cannot be
+assigned through a wall; meaningful competing room cores divide doorway and
+corridor space between them. `exit_room` visits unprocessed frontiers belonging
+to the current room, then stops as soon as the `cross_room_boundary` phase and
+its crossing goal are available. It deliberately does not dispatch that final
+goal.
+After each frontier arrival, the next room decision waits for an occupancy-grid
+message received after Nav2 reported success. Re-analyzing an older map is not
+treated as a map refresh.
+If startup noise leaves no usable room core, or exploration temporarily leaves
+no frontier or adjacent-room evidence, the same action may perform up to three
+short map-stabilization moves. Each endpoint is already connected and safe in
+the current costmap; moves are limited to 0.35--1.0 metres, avoid prior recovery
+points, and prefer progress toward an unvisited frontier when one exists.
+When several current-room frontiers are available, selection maximizes expected
+unknown-area gain minus a modest travel penalty (0.15 square metres of gain per
+metre travelled). Distance therefore resolves similar choices without forcing
+the robot toward a nearby low-value pocket instead of a more informative open
+boundary.
 
-Each navigation call shows one yellow `S` at that call's starting pose and a
-magenta trail for motion within that call. Both are cleared and recreated on the
-next call; numbered session starts and terminal markers are not retained. During
-`find_object`, a light-blue camera-coverage overlay persists for the goal and is
-ray-clipped at map obstacles. Context candidates are sampled directly in the clue
-cone. Exploration samples camera-covered reachable cells (plus the robot's
-current cell) and immediately uses the pose and heading that expose the most
-uncovered known-free cells; frontiers are the fallback after coverage is exhausted.
-`stop_navigation` cancels this action during either OOB selection or Nav2 movement.
-Cancellation during vision prevents later replies from starting movement.
-Cancellation during command dispatch waits for the request/reply transaction to
-finish before sending stop. Camera switching, idle mode, and shutdown also stop
-this action. Other robot and camera actions cannot start while it owns the robot;
-it refuses to start while another robot action is active.
+`go_to_another_room` runs the same exploration, dispatches the crossing goal,
+and succeeds after a fresh map places the robot in a different open component.
+That component receives the next stable runtime ID (`Room 2`, `Room 3`, and so
+on), and its connection to the origin room is recorded. `go_to_room` sends
+Nav2 to a known room's stored anchor; `return_to_initial_place` is the explicit
+shortcut for Room 1. Multi-pass traversal is limited to 12 movements. Room
+identity is geometric and lasts for the bridge process; it is not a semantic
+room-name classifier or disk-backed map annotation.
 
-Tune `VISION_TIMEOUT` (15 s), `NAVIGATION_TIMEOUT` (90 s), `CAMERA_MAX_AGE` (2 s),
-`POSITION_TOLERANCE` (0.05 m), `YAW_TOLERANCE` (0.15 rad), `MAX_STEPS`
-(20), and `MAX_DURATION` (300 s) at the top of `NavigateAction`. Map freshness uses `CameraStream.map_snapshot()` (3 s).
-Candidate clearance settings remain in BIG BRAIN's `MapRenderSettings`.
+## Watching and automatic hand-guided navigation
 
-Numeric candidates translate to reachable 0.5, 1, 2, and 3 meter endpoints at
-45-degree bearings. Three metadata-only `R` candidates provide +90-degree,
--90-degree, and 180-degree in-place turns. During object search, previously used
-final rotation headings are filtered out. The selector is instructed to spin when
-that exposes an uninspected view and to translate only for a concrete reason.
+`watch_target` runs the find-target acquisition flow with approach disabled,
+then leaves camera tracking active for the requested person or object.
 
-One call may execute multiple local candidate poses. Reaching an individual waypoint is progress, not completion. The action retains the original query and completed-step history, and only reports success after a fresh OOB assessment confirms the complete goal. `MAX_STEPS` (20) and `MAX_DURATION` (300 seconds) bound the loop.
+While a person is tracked, `HandGuidedNavigation` automatically runs MediaPipe
+on a dynamic crop around the YOLO right wrist. A relaxed open hand tilted down
+arms hand tracking. The camera follows the palm while a stable ToF seed is
+accepted only when it remains close to the lidar person pose. An upward finger
+flick dispatches a close approach to that seed. After arrival, an upward hand
+and a small sustained ToF decrease return the robot to its pre-approach pose;
+the robot then faces the person again. This background behavior has no LLM tool
+call.
 
-Restart SMALL BRAIN to load the new tools and action. BIG BRAIN needs its existing
-map stream and Nav2 bridge running. No new ROS command is required.
+## Find-loop map navigation
 
-Run simulated checks without moving hardware or calling a model:
+`MapNavigationAction` is internal to `find_target`. It requests one map crop,
+uses the out-of-band selector when a pose choice is needed, executes at most one
+Nav2 goal, and returns control to the find loop.
 
-```bash
-python3 -m unittest discover -s tests -p 'test_navigate_action.py' -v
-```
+Context candidates are sampled within the observation's 85-degree cone and
+include `CF`, the furthest reachable point on its center ray. Context mode never
+offers a frontier. Exploration remains bounded by the find loop and may use its
+own coverage candidate and furthest forward extension. When map logic offers
+only one exploration pose, it is dispatched directly with its sampled viewing
+heading; vision selection is used only when there is a choice.
+
+`stop_navigation` cancels explicit or active hand-guided navigation. `stop_goal` cancels the
+find loop and its internal map navigation.

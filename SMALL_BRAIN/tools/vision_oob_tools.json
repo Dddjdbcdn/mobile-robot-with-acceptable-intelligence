@@ -16,9 +16,9 @@
           ]
         },
         "candidate_type": {
-          "description": "For candidate only: visual means an object closely matches the target visually, or a target-specific part is visible, but the target cannot yet be confirmed. local means specific target-linked evidence is visible nearby, and a short movement may reveal the target; generic containers or ordinary nearby objects are not local evidence. destination means a recognized or mapped place or route has a strong semantic relationship to the target, such as a recognized kitchen when searching for a fridge; an unidentified hallway alone is not a destination. speculative means only a generic possibility with no target-specific evidence. Speculative clues are stored while the robot explores unseen local space first. Use visual, local, or destination only when the visible evidence closely supports that definition; otherwise use speculative. Use null for found and not_found.",
+          "description": "For candidate only: visual means an object closely matches the target but is not confirmed. context means specific target-linked evidence or a recognized related place is visible within the current 85-degree view. speculative means only a generic possibility. Use null for found and not_found.",
           "type": ["string", "null"],
-          "enum": ["visual", "local", "destination", "speculative", null]
+          "enum": ["visual", "context", "speculative", null]
         },
         "candidate_image": {
           "type": "string",
@@ -86,9 +86,9 @@
           ]
         },
         "candidate_type": {
-          "description": "For candidate only: visual means an object closely matches the target visually, or a target-specific part is visible, but the target cannot yet be confirmed. local means specific target-linked evidence is visible nearby, and a short movement may reveal the target; generic containers or ordinary nearby objects are not local evidence. destination means a recognized or mapped place or route has a strong semantic relationship to the target, such as a recognized kitchen when searching for a fridge; an unidentified hallway alone is not a destination. speculative means only a generic possibility with no target-specific evidence. Speculative clues are stored while the robot explores unseen local space first. Use visual, local, or destination only when the visible evidence closely supports that definition; otherwise use speculative. Use null for found and not_found.",
+          "description": "For candidate only: visual means an object closely matches the target but is not confirmed. context means specific target-linked evidence or a recognized related place is visible within the current 85-degree view. speculative means only a generic possibility. Use null for found and not_found.",
           "type": ["string", "null"],
-          "enum": ["visual", "local", "destination", "speculative", null]
+          "enum": ["visual", "context", "speculative", null]
         },
         "target_position": {
           "description": "For found only, a normalized point touching the target, using exactly x and y. x and y must be normalized between 0 and 1. (0,0) means top left corner, (1.0,1.0) means bottom right. Use null otherwise.",
@@ -117,7 +117,7 @@
   {
     "type": "function",
     "name": "select_navigation_pose",
-    "description": "On the first navigation assessment, choose one safe pose and heading. On the second and final assessment, compare the original and arrival evidence and return only goal_reached or blocked.",
+    "description": "Choose exactly one safe listed pose and final heading for this one-shot navigation call, or return blocked when no listed pose satisfies the mode contract.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -125,18 +125,16 @@
           "type": "string",
           "enum": [
             "move",
-            "move_and_finish",
-            "goal_reached",
             "blocked"
           ],
-          "description": "move selects the single permitted waypoint before the final arrival assessment; move_and_finish is only for one-shot bounded commands such as a nudge, short move, backup, or rotation; goal_reached confirms the query from current evidence; blocked means the goal cannot be confirmed or no listed pose can help."
+          "description": "move selects the one permitted waypoint; blocked means no listed pose can satisfy the current mode. There is no later reassessment or correction."
         },
         "pose_id": {
           "type": [
             "string",
             "null"
           ],
-          "description": "Exact candidate ID for a move decision. Numeric and B-prefixed IDs are local ray poses, F-prefixed IDs are frontier goals, and H holds position for a rotation. Use only an ID listed for the current snapshot. Use null for every terminal decision."
+          "description": "Exact candidate ID for move. Use only an ID listed for the current snapshot. Use null for blocked."
         },
         "heading": {
           "type": [
@@ -154,23 +152,18 @@
             "forward_right",
             null
           ],
-          "description": "Final centered-camera direction in the robot-upright map: forward is map up, left/right match the image, and backward is map down. Required for move and move_and_finish; null for terminal decisions."
+          "description": "Final centered-camera direction in the robot-upright map: forward is map up, left/right match the image, and backward is map down. Required for move and null for blocked."
         },
         "reasoning": {
           "type": "string",
-          "description": "Briefly cite concrete goal progress or contradictory evidence. Do not justify motion merely as a way to gain confidence or collect another view."
-        },
-        "next_intent": {
-          "type": "string",
-          "description": "For the first move, state the concrete goal condition that the second and final call must judge. Do not plan corrections or exploration because no further movement call is available. For move_and_finish or a terminal decision, state that no further assessment is needed and why."
+          "description": "Briefly explain why the selected pose directly satisfies the current one-shot mode, or why every listed pose is blocked."
         }
       },
       "required": [
         "decision",
         "pose_id",
         "heading",
-        "reasoning",
-        "next_intent"
+        "reasoning"
       ],
       "additionalProperties": false
     }

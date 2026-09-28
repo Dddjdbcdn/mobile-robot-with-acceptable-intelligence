@@ -55,7 +55,6 @@ others use `main`, a compatibility branch, or the GroundingDINO OpenVINO branch.
 | Repository | Installed path | Purpose |
 |---|---|---|
 | micro_ros_setup (`jazzy`) | `BIG_BRAIN/src/micro_ros_setup` | ROS-side micro-ROS tooling |
-| ros2_astra_camera (Jazzy PR branch) | `BIG_BRAIN/src/ros2_astra_camera` | Orbbec Astra camera |
 | sllidar_ros2 (`main`) | `BIG_BRAIN/src/sllidar_ros2` | RPLIDAR C1 |
 | topic_based_ros2_control (`main`) | `BIG_BRAIN/src/topic_based_ros2_control` | ROS control transport |
 | micro-ROS-Agent (`jazzy`) | `BIG_BRAIN/src/uros/micro-ROS-Agent` | STM32-to-ROS serial agent |
@@ -75,15 +74,6 @@ vcs import . < third_party.repos
 `sensor_msgs/JointState` type for wheel commands and states. The Agent requires
 `micro_ros_msgs`, but Jazzy provides that dependency as an apt package in
 section 2.3, so its source repository is not cloned either.
-
-The official Astra `master` branch does not yet contain its Jazzy/Kilted build
-fix. This manifest follows Robert Gruberski's `fix/astra-kilted-build` branch
-from upstream pull request #20:
-
-<https://github.com/orbbec/ros2_astra_camera/pull/20>
-
-The separate `patches/astra-camera.patch` only disables the driver's TF
-publication so the robot's own TF tree remains authoritative.
 
 ### 1.4 Clone only the required Nav2 packages
 
@@ -129,9 +119,6 @@ cd "$ROBOT_ROOT"
 
 git -C BIG_BRAIN/src/nav2_src apply \
   ../../../patches/nav2-jazzy.patch
-
-git -C BIG_BRAIN/src/ros2_astra_camera apply \
-  ../../../patches/astra-camera.patch
 
 git -C BIG_BRAIN/src/topic_based_ros2_control apply \
   ../../../patches/topic-based-ros2-control.patch
@@ -329,7 +316,6 @@ ros2 pkg prefix robot
 ros2 pkg prefix custom_nav2_plugins
 ros2 pkg prefix micro_ros_agent
 ros2 pkg prefix sllidar_ros2
-ros2 pkg prefix astra_camera
 ros2 pkg prefix topic_based_ros2_control
 ```
 
@@ -563,13 +549,6 @@ sudo nano /etc/udev/rules.d/rplidar.rules
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0660", GROUP:="dialout", SYMLINK+="rplidar"
 ```
 
-### 6.3 Orbbec Astra
-
-```bash
-cd "$ROBOT_ROOT/BIG_BRAIN/src/ros2_astra_camera/astra_camera/scripts"
-sudo bash install.sh
-```
-
 Reload rules, unplug the devices, and reconnect them:
 
 ```bash
@@ -624,14 +603,7 @@ ros2 launch sllidar_ros2 sllidar_c1_launch.py serial_port:=/dev/rplidar
 ros2 topic hz /scan
 ```
 
-### 7.3 Astra depth camera
-
-```bash
-ros2 launch astra_camera astra.launch.xml
-ros2 topic hz /camera/depth/points
-```
-
-### 7.4 RGB camera and audio
+### 7.3 RGB camera and audio
 
 ```bash
 v4l2-ctl --list-devices
@@ -726,9 +698,9 @@ Do not publish a map if it reveals a private home, laboratory, or facility.
 - [ ] Required models exist beside their matching OpenVINO `.bin` files.
 - [ ] CubeMX regenerates the STM32 vendor source.
 - [ ] The micro-ROS static library and STM32 firmware build successfully.
-- [ ] ST-Link, RPLIDAR, Astra, RGB camera, microphone, and speakers are detected.
+- [ ] ST-Link, RPLIDAR, RGB camera, microphone, and speakers are detected.
 - [ ] STM32 topics publish at stable rates.
-- [ ] Lidar publishes `/scan` and Astra publishes `/camera/depth/points`.
+- [ ] Lidar publishes `/scan`.
 - [ ] The ROS robot starts before `SMALL_BRAIN/main.py`.
 - [ ] `git status --short` shows no models, environments, builds, or runtime data.
 

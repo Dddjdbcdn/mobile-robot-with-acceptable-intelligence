@@ -34,9 +34,7 @@ class MapRenderer:
     def render_background(self, prepared, pose, view_size_m=None):
         return self._render(
             prepared["grid"], prepared["costmap"], pose, [], [],
-            prepared["frontier_mask"], prepared["doors"],
-            prepared["door_candidate_mask"], prepared["rooms"],
-            prepared["current_room_mask"], draw_robot=False,
+            prepared["frontier_mask"], draw_robot=False,
             view_size_m=view_size_m,
         )
 
@@ -44,7 +42,8 @@ class MapRenderer:
         self, prepared, pose, candidates, coverage_counts,
         search_overlay=None, live_fov_mask=None,
         observation=None, observation_mask=None,
-        pose_marker_scale=1.0,
+        pose_marker_scale=1.0, frontiers=None,
+        pending_navigation_pose=None,
     ):
         image = prepared["background"].copy()
         view = prepared["view"]
@@ -59,9 +58,10 @@ class MapRenderer:
         )
 
         mode = str((search_overlay or {}).get("mode") or "")
-        frontiers = [
-            item for item in candidates if item.get("kind") == "frontier"
-        ]
+        if frontiers is None:
+            frontiers = [
+                item for item in candidates if item.get("kind") == "frontier"
+            ]
         self._draw_frontier_candidates(
             image, view, frontiers, marker_scale=pose_marker_scale
         )
@@ -70,12 +70,41 @@ class MapRenderer:
             [item for item in candidates if item.get("kind") != "frontier"],
             marker_scale=pose_marker_scale,
         )
+        if pending_navigation_pose is not None:
+            self._draw_pending_navigation_pose(
+                image, view, pending_navigation_pose,
+                marker_scale=pose_marker_scale,
+            )
         self._draw_orientation_legend(image)
         if mode == "exploration" and len(candidates) == 1:
             self._draw_selected_pose(
                 image, view, candidates[0], marker_scale=pose_marker_scale
             )
         return image
+
+    def _draw_pending_navigation_pose(
+        self, image, view, pose, marker_scale=1.0
+    ):
+        """Draw the destination currently being resolved or driven toward."""
+        point = self._pixel(view, pose["x"], pose["y"])
+        yaw = float(pose.get("yaw", pose.get("angle", 0.0)))
+        arrow_length_m = max(0.25, 28.0 / float(view["ppm"]))
+        tip = self._pixel(
+            view,
+            float(pose["x"]) + arrow_length_m * math.cos(yaw),
+            float(pose["y"]) + arrow_length_m * math.sin(yaw),
+        )
+        color = (0, 165, 255)
+        radius = max(4, round(22 * marker_scale))
+        thickness = max(1, round(4 * marker_scale))
+        cv2.circle(image, point, radius, color, thickness, cv2.LINE_AA)
+        cv2.arrowedLine(
+            image, point, tip, color, thickness, cv2.LINE_AA, tipLength=0.35
+        )
+        self._outlined_label(
+            image, (point[0] + radius, point[1] - radius),
+            "PENDING", color, scale=0.54,
+        )
 
     def pose_marker_scale_for_crop(self, view, crop_size_m):
         """Scale pose badges to a fixed fraction of the delivered crop."""
@@ -421,8 +450,7 @@ class MapRenderer:
                 "H", robot_color, scale=0.5,
             )
     def _render(self, grid, costmap, pose, locals_, frontiers,
-                frontier_mask, doors, door_candidate_mask, rooms, room_mask,
-                draw_robot=True, view_size_m=None):
+                frontier_mask, draw_robot=True, view_size_m=None):
         """Render a clean metric map intended for VLM waypoint selection."""
         view = self._make_view(grid, pose, view_size_m=view_size_m)
         rights = view["xmin"] + (np.arange(view["width"]) + 0.5) / view["ppm"]
@@ -450,7 +478,7 @@ class MapRenderer:
         free = (occupancy >= 0) & (occupancy < self.cfg.occupied)
 
         # Keep the base map nearly monochrome. Candidate colors then have one
-        # unambiguous meaning instead of competing with the costmap and rooms.
+        # unambiguous meaning instead of competing with the costmap.
         image = np.full((view["height"], view["width"], 3), (62, 62, 62), np.uint8)
         image[map_inside & (occupancy < 0)] = (112, 112, 112)
         image[free] = (246, 246, 246)
@@ -458,39 +486,6 @@ class MapRenderer:
         image[free & (costs > 0)] = (224, 232, 244)
         image[free & (costs >= self.cfg.cost_limit)] = (185, 198, 232)
         image[free & (costs < 0)] = (190, 190, 190)
-
-        # Current-room tint remains subtle so walls and costmap stay legible.
-        room_pixels = map_inside & room_mask[map_rows_clipped, map_cols_clipped]
-        if np.any(room_pixels):
-            tint = np.full_like(image, (225, 238, 225))
-            image[room_pixels] = cv2.addWeighted(
-                image[room_pixels], 0.88, tint[room_pixels], 0.12, 0
-            )
-
-        # Show the exact ridge/clearance candidate mask used by _doors(). A
-        # fixed-width halo keeps the usually one-cell-wide ridges visible after
-        # the full map is down-scaled and JPEG-compressed.
-        door_candidate_pixels = (
-            map_inside
-            & door_candidate_mask[map_rows_clipped, map_cols_clipped]
-        )
-        door_candidate_core = door_candidate_pixels.astype(np.uint8)
-        door_candidate_halo = cv2.dilate(
-            door_candidate_core, np.ones((7, 7), np.uint8)
-        ) > 0
-        door_candidate_halo_only = door_candidate_halo & ~door_candidate_pixels
-        if np.any(door_candidate_halo_only):
-            halo_tint = np.full_like(image, (225, 150, 225))
-            image[door_candidate_halo_only] = cv2.addWeighted(
-                image[door_candidate_halo_only], 0.70,
-                halo_tint[door_candidate_halo_only], 0.30, 0,
-            )
-        if np.any(door_candidate_pixels):
-            candidate_tint = np.full_like(image, (205, 55, 205))
-            image[door_candidate_pixels] = cv2.addWeighted(
-                image[door_candidate_pixels], 0.45,
-                candidate_tint[door_candidate_pixels], 0.55, 0,
-            )
 
         frontier_pixels = map_inside & frontier_mask[map_rows_clipped, map_cols_clipped]
         # A fixed-width halo survives down-scaling and JPEG compression even
@@ -550,17 +545,6 @@ class MapRenderer:
             else:
                 color = (220, 105, 15)
                 self._circle_badge(image, p, item["id"], color)
-
-        # Accepted doors use saturated color and a strong white keyline so they
-        # remain distinct from the faint raw candidate mask.
-        for door in doors:
-            a = self._pixel(view, *door["wall_a_xy"])
-            b = self._pixel(view, *door["wall_b_xy"])
-            center = self._pixel(view, door["x"], door["y"])
-            color = (225, 30, 225) if door["confirmed"] else (0, 145, 255)
-            cv2.line(image, a, b, (255, 255, 255), 7, cv2.LINE_AA)
-            cv2.line(image, a, b, color, 4, cv2.LINE_AA)
-            self._outlined_label(image, center, door["id"], color)
 
         if draw_robot:
             self._draw_dynamic(image, view, pose, locals_)

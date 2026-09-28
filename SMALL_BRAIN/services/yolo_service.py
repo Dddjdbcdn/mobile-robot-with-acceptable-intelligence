@@ -38,6 +38,8 @@ class YoloService():
         self._owner_modes = {}
         self._mode_revision = 0
         self._inference_sequence = 0
+        self._inference_frame_bgr = None
+        self._inference_full_frame_bgr = None
         self._inference_source_captured_at = None
         self._inference_started_at = None
         self._inference_completed_at = None
@@ -58,6 +60,21 @@ class YoloService():
             return (
                 self._inference_sequence,
                 list(self.detections),
+                {
+                    "source_captured_at": self._inference_source_captured_at,
+                    "inference_started_at": self._inference_started_at,
+                    "inference_completed_at": self._inference_completed_at,
+                },
+            )
+
+    def detection_snapshot_with_frame(self):
+        """Return detections and their exact full-resolution source frame."""
+        with self._state_condition:
+            frame = self._inference_full_frame_bgr
+            return (
+                self._inference_sequence,
+                list(self.detections),
+                None if frame is None else frame.copy(),
                 {
                     "source_captured_at": self._inference_source_captured_at,
                     "inference_started_at": self._inference_started_at,
@@ -94,6 +111,8 @@ class YoloService():
             self._owner_modes[owner] = mode
             self._mode_revision += 1
             self.detections = []
+            self._inference_frame_bgr = None
+            self._inference_full_frame_bgr = None
             if self._effective_mode_locked() == "none":
                 self._active_event.clear()
             else:
@@ -110,6 +129,8 @@ class YoloService():
                 return
             self._mode_revision += 1
             self.detections = []
+            self._inference_frame_bgr = None
+            self._inference_full_frame_bgr = None
             if self._effective_mode_locked() == "none":
                 self._active_event.clear()
             else:
@@ -193,7 +214,7 @@ class YoloService():
                 continue
 
             frame = latest.tracking_bgr
-            source_generation = latest.source_generation
+            full_frame = latest.full_bgr
             source_captured_at = latest.captured_at
             inference_started_at = time.monotonic()
 
@@ -224,11 +245,12 @@ class YoloService():
             with self._state_condition:
                 if (
                     current is not None
-                    and current.source_generation == source_generation
                     and mode_revision == self._mode_revision
                     and self._effective_mode_locked() != "none"
                 ):
                     self.detections = detections
+                    self._inference_frame_bgr = frame
+                    self._inference_full_frame_bgr = full_frame
                     self._inference_source_captured_at = source_captured_at
                     self._inference_started_at = inference_started_at
                     self._inference_completed_at = inference_completed_at
@@ -348,6 +370,10 @@ class YoloService():
                     "y1": round(y1, 1),
                     "x2": round(x2, 1),
                     "y2": round(y2, 1),
+                    "normalized_x1": round(float(x1) / frame_width, 4),
+                    "normalized_y1": round(float(y1) / frame_height, 4),
+                    "normalized_x2": round(float(x2) / frame_width, 4),
+                    "normalized_y2": round(float(y2) / frame_height, 4),
                     "normalized_center_x": round(
                         ((x1 + x2) * 0.5) / frame_width, 4
                     ),

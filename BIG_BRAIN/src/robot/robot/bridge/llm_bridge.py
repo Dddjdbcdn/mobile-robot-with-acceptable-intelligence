@@ -1,219 +1,57 @@
 import math
 import threading
 import json
-import struct
 from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PointStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import String
 from std_msgs.msg import Float32
-from sensor_msgs.msg import CameraInfo, Image, Imu, Range, PointCloud2
+from sensor_msgs.msg import Range
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid
 import zmq
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-import tf2_geometry_msgs
+# Registers geometry message conversions with tf2's Python transform system.
+import tf2_geometry_msgs  # noqa: F401
 import time
-from geometry_msgs.msg import PoseStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from robot.follow_goal_generator import FollowGoalGenerator, FollowGoalSettings
-from robot.room_geometry import RoomGeometryEstimator
-from robot.map_stream import MapImageStream
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from robot.map.map_stream import MapImageStream
+from robot.utilities.camera_servo import CameraServo
+from robot.person_pose.follow_goal_generator import FollowGoalGenerator
 
-class CameraServo():
-    def __init__(self, pan_pub, tilt_pub, logger=None):
-        self.servo_pan_pub = pan_pub
-        self.servo_tilt_pub = tilt_pub
-        self.logger = logger
-        self.reset_pan_angle = 95.0
-        self.reset_tilt_angle = 90.0
-        
-        self.pan_angle = self.reset_pan_angle
-        self.tilt_angle = self.reset_tilt_angle 
-        
-        self.min_pan_angle = 30.0
-        self.max_pan_angle = 160.0
-        self.min_tilt_angle = 30.0
-        self.max_tilt_angle = 120.0
 
-        self.delta_pan_angle = 0.0
-        self.delta_tilt_angle = 0.0
-        self.tracking_sequence = None
-        self.tracking_timing = None
-        self.tracking_received_at = None
-        self.tracking_received_unix_ns = None
-        self.last_visual_pan_error = 0.0
-        self.last_visual_at = None
-        self.last_applied_tracking_sequence = None
-        self.command_lock = threading.Lock()
-        self._latency_window_started = time.monotonic()
-        self._latency_samples = []
-        self.Kp = 0.15
+def _yaw_from_quaternion(rotation):
+    return math.atan2(
+        2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+        1.0 - 2.0 * (rotation.y ** 2 + rotation.z ** 2),
+    )
 
-        self.deadband_degrees = 0.5
-        self.max_step_degrees = 4
 
-    def set_error(self, pan, tilt, tracking_sequence=None, tracking_timing=None):
-        with self.command_lock:
-            self.delta_pan_angle = float(pan)
-            self.delta_tilt_angle = float(tilt)
-            self.tracking_sequence = tracking_sequence
-            self.tracking_timing = tracking_timing
-            self.tracking_received_at = time.monotonic()
-            self.tracking_received_unix_ns = time.time_ns()
-            if tracking_sequence is not None:
-                self.last_visual_pan_error = float(pan)
-                self.last_visual_at = self.tracking_received_at
+def _planar_pose_from_transform(transform, frame_id):
+    translation = transform.transform.translation
+    return {
+        "x": float(translation.x),
+        "y": float(translation.y),
+        "yaw": _yaw_from_quaternion(transform.transform.rotation),
+        "frame_id": str(frame_id),
+    }
 
-    def tracking_snapshot(self):
-        with self.command_lock:
-            return {
-                "pan_angle": self.pan_angle,
-                "pan_error": self.last_visual_pan_error,
-                "observed_at": self.last_visual_at,
-            }
 
-    @staticmethod
-    def _latency_percentile(values, fraction):
-        ordered = sorted(values)
-        index = max(0, math.ceil(len(ordered) * fraction) - 1)
-        return ordered[index]
+def _make_pose_stamped(x, y, yaw, frame_id, stamp):
+    pose = PoseStamped()
+    pose.header.frame_id = str(frame_id)
+    pose.header.stamp = stamp
+    pose.pose.position.x = float(x)
+    pose.pose.position.y = float(y)
+    pose.pose.position.z = 0.0
+    pose.pose.orientation.z = math.sin(float(yaw) * 0.5)
+    pose.pose.orientation.w = math.cos(float(yaw) * 0.5)
+    return pose
 
-    def _record_tracking_latency(self, timing, received_at, received_unix_ns):
-        if not isinstance(timing, dict) or received_at is None:
-            return
-
-        capture_to_send_ms = timing.get("capture_to_send_ms")
-        sent_at_unix_ns = timing.get("sent_at_unix_ns")
-        if not isinstance(capture_to_send_ms, (int, float)):
-            return
-
-        published_at = time.monotonic()
-        queue_ms = max(0.0, (published_at - received_at) * 1000.0)
-        transport_ms = 0.0
-        if isinstance(sent_at_unix_ns, int) and received_unix_ns is not None:
-            transport_ms = max(
-                0.0, (received_unix_ns - sent_at_unix_ns) / 1_000_000.0
-            )
-
-        self._latency_samples.append({
-            "total": float(capture_to_send_ms) + transport_ms + queue_ms,
-            "capture_wait": float(timing.get("capture_wait_ms") or 0.0),
-            "inference": float(timing.get("inference_ms") or 0.0),
-            "post_inference": float(timing.get("post_inference_ms") or 0.0),
-            "transport": transport_ms,
-            "queue": queue_ms,
-        })
-
-        now = time.monotonic()
-        if now - self._latency_window_started < 1.0:
-            return
-
-        samples = self._latency_samples
-        self._latency_samples = []
-        self._latency_window_started = now
-        if not samples or self.logger is None:
-            return
-
-        def average(name):
-            return sum(sample[name] for sample in samples) / len(samples)
-
-        totals = [sample["total"] for sample in samples]
-        self.logger.info(
-            "[TRACK LATENCY] capture->ROS-servo-publish "
-            f"avg={average('total'):.1f}ms "
-            f"p95={self._latency_percentile(totals, 0.95):.1f}ms "
-            f"max={max(totals):.1f}ms; stage averages: "
-            f"camera-wait={average('capture_wait'):.1f}ms, "
-            f"YOLO={average('inference'):.1f}ms, "
-            f"tracking={average('post_inference'):.1f}ms, "
-            f"ZMQ={average('transport'):.1f}ms, "
-            f"timer-queue={average('queue'):.1f}ms (n={len(samples)})"
-        )
-
-    def publish_servo_command(self,tracking=False):
-        remaining_pan_angle = 0.0
-
-        with self.command_lock:
-            if (
-                tracking
-                and self.tracking_sequence is not None
-                and self.tracking_sequence
-                == self.last_applied_tracking_sequence
-            ):
-                self.delta_pan_angle = 0.0
-                self.delta_tilt_angle = 0.0
-                return remaining_pan_angle
-
-            delta_pan_angle = self.delta_pan_angle
-            delta_tilt_angle = self.delta_tilt_angle
-            tracking_timing = self.tracking_timing
-            tracking_received_at = self.tracking_received_at
-            tracking_received_unix_ns = self.tracking_received_unix_ns
-            if tracking and self.tracking_sequence is not None:
-                self.last_applied_tracking_sequence = self.tracking_sequence
-            self.delta_pan_angle = 0.0
-            self.delta_tilt_angle = 0.0
-            self.tracking_timing = None
-            self.tracking_received_at = None
-            self.tracking_received_unix_ns = None
-
-        if abs(delta_pan_angle) < self.deadband_degrees:
-            delta_pan_angle = 0.0
-        if abs(delta_tilt_angle) < self.deadband_degrees:
-            delta_tilt_angle = 0.0
-
-        step_pan = delta_pan_angle
-        step_tilt = delta_tilt_angle
-
-        if tracking:
-            step_pan = delta_pan_angle * self.Kp
-            step_tilt = delta_tilt_angle * self.Kp
-
-            step_pan = max(min(step_pan, self.max_step_degrees), -self.max_step_degrees)
-            step_tilt = max(min(step_tilt, self.max_step_degrees), -self.max_step_degrees)
-
-        self.pan_angle = self.pan_angle + step_pan
-        self.tilt_angle = self.tilt_angle + step_tilt
-
-        if self.pan_angle < self.min_pan_angle: 
-            remaining_pan_angle = self.pan_angle - self.min_pan_angle
-            self.pan_angle = self.min_pan_angle
-
-        if self.pan_angle > self.max_pan_angle: 
-            remaining_pan_angle = self.pan_angle - self.max_pan_angle
-            self.pan_angle = self.max_pan_angle
-
-        if self.tilt_angle < self.min_tilt_angle: 
-            self.tilt_angle = self.min_tilt_angle
-
-        if self.tilt_angle > self.max_tilt_angle: 
-            self.tilt_angle = self.max_tilt_angle
-
-        pan_msg = Float32()
-        tilt_msg = Float32()
-        reset_tilt_msg = Float32()
-
-        pan_msg.data = self.pan_angle
-        tilt_msg.data = self.tilt_angle
-        reset_tilt_msg.data = self.reset_tilt_angle
-
-        self.servo_tilt_pub.publish(tilt_msg)
-        self.servo_pan_pub.publish(pan_msg)
-        # if tracking:
-        #     self._record_tracking_latency(
-        #         tracking_timing,
-        #         tracking_received_at,
-        #         tracking_received_unix_ns,
-        #     )
-
-        return remaining_pan_angle
-        
 
 class LLMRosBridge(Node):
     def __init__(self):
@@ -232,11 +70,6 @@ class LLMRosBridge(Node):
         self.sub_socket.bind("tcp://*:5557")
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.camera_pub_socket = self.zmq_context.socket(zmq.PUB)
-        # Keep live camera frames on this machine only.
-        self.camera_pub_socket.setsockopt(zmq.SNDHWM, 2)
-        self.camera_pub_socket.bind("tcp://127.0.0.1:5558")
-        
         self.pub_lock = threading.Lock()
 
         self.cmd_pub = self.create_publisher(TwistStamped, '/diff_drive_controller/cmd_vel', 10)
@@ -261,66 +94,28 @@ class LLMRosBridge(Node):
         self.declare_parameter("follow_heading_comfort_deg", 20.0)
         self.declare_parameter("follow_heading_critical_deg", 45.0)
         self.follow_goal_generator = FollowGoalGenerator(
-            FollowGoalSettings(
-                standoff_m=float(
-                    self.get_parameter("follow_standoff_m").value
-                ),
-                camera_center_deg=self.servo.reset_pan_angle,
-                heading_comfort_deg=float(
-                    self.get_parameter("follow_heading_comfort_deg").value
-                ),
-                heading_critical_deg=float(
-                    self.get_parameter("follow_heading_critical_deg").value
-                ),
-            )
+            standoff_m=float(self.get_parameter("follow_standoff_m").value),
+            camera_center_deg=self.servo.reset_pan_angle,
+            heading_comfort_deg=float(
+                self.get_parameter("follow_heading_comfort_deg").value
+            ),
+            heading_critical_deg=float(
+                self.get_parameter("follow_heading_critical_deg").value
+            ),
         )
         self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
 
         self.camera_tof_range = 0.0
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Range, '/camera_tof', self.camera_tof_callback, qos)
-        self.create_subscription(
-            Image,
-            '/camera/color/image_raw',
-            self.astra_color_callback,
-            qos,
-        )
-        self.create_subscription(
-            Image,
-            '/camera/depth/image_raw',
-            self.astra_depth_callback,
-            qos,
-        )
-        self.create_subscription(
-            CameraInfo,
-            '/camera/color/camera_info',
-            self.astra_camera_info_callback,
-            qos,
-        )
-
-        map_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self.map_message = None
         self.robot_pose = None
         self.robot_pose_at = None
-        self.room_geometry = None
-        self.room_geometry_estimator = RoomGeometryEstimator()
-        self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, map_qos
-        )
 
         self.state_timer = self.create_timer(0.05, self.state_pub_loop)
         self.robot_pose_timer = self.create_timer(0.1, self.update_robot_pose)
-        self.room_geometry_timer = self.create_timer(
-            1.0, self.update_room_geometry
-        )
 
         self.current_nav_goal_handle = None
         self.current_nav_action_id = None
-        self.move_action_timer = None
         self.track_action_timer = None
         self.navigation_active = False
         self.navigation_mode = None
@@ -334,7 +129,7 @@ class LLMRosBridge(Node):
         self.pending_person_pose = None
         self.last_follow_goal = None
         self.last_follow_goal_at = None
-        self.moving_active = False
+        self.previous_navigation_pose = None
         self.tracking_body_active = False
         self.max_tracking_time = 10.0
         self.create_subscription(
@@ -359,26 +154,6 @@ class LLMRosBridge(Node):
         self.background_listener_thread = threading.Thread(target=self.background_listener, daemon=True)
         self.background_listener_thread.start()
 
-        self.reset_semantic_memory()
-
-    def reset_semantic_memory(self):
-        semantic_memory_path = next(
-            (
-                parent / "SMALL_BRAIN" / "database" / "semantic_memory.json"
-                for parent in Path(__file__).resolve().parents
-                if (parent / "SMALL_BRAIN" / "database").is_dir()
-            ),
-            None,
-        )
-        if semantic_memory_path is None:
-            raise FileNotFoundError("Could not locate semantic_memory.json")
-
-        with semantic_memory_path.open("w", encoding="utf-8") as file:
-            json.dump({"objects": {}, "version": 1}, file, indent=2)
-            file.write("\n")
-
-        self.get_logger().info("Semantic memory cleared for the new map")
-
     def publish_cmd(self, linear_x, angular_z):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -396,7 +171,8 @@ class LLMRosBridge(Node):
                 "servo_pan_angle": self.servo.pan_angle,
                 "servo_tilt_angle": self.servo.tilt_angle,
                 "robot_pose": self.robot_pose,
-                "room_geometry": self.room_geometry,
+                "person_pose": self._person_state(),
+                "person_tracker_state": self.person_tracker_state,
                 }
             )
 
@@ -409,25 +185,17 @@ class LLMRosBridge(Node):
         except Exception:
             return None
 
-        translation = transform.transform.translation
-        rotation = transform.transform.rotation
-        yaw = math.atan2(
-            2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
-            1.0 - 2.0 * (rotation.y ** 2 + rotation.z ** 2),
-        )
-        pose = {
-            "x": translation.x,
-            "y": translation.y,
-            "yaw": yaw,
-            "frame_id": "map",
+        self.robot_pose = _planar_pose_from_transform(transform, "map")
+        self.robot_pose_at = time.monotonic()
+
+    def _person_state(self):
+        if self.latest_person_pose_map is None or self.latest_person_pose_at is None:
+            return None
+        position = self.latest_person_pose_map.pose.position
+        return {
+            "x": float(position.x), "y": float(position.y), "frame_id": "map",
+            "age_seconds": max(0.0, time.monotonic() - self.latest_person_pose_at),
         }
-
-        if pose is not None:
-            self.robot_pose = pose
-            self.robot_pose_at = time.monotonic()
-
-    def map_callback(self, msg):
-        self.map_message = msg
 
     def person_pose_callback(self, msg):
         """Keep the newest lidar pose until its map transform is available."""
@@ -489,14 +257,6 @@ class LLMRosBridge(Node):
         self.latest_person_pose_map = pose_map
         self.latest_person_pose_at = time.monotonic()
 
-    @staticmethod
-    def _angle_distance(first, second):
-        return abs((first - second + math.pi) % (2.0 * math.pi) - math.pi)
-
-    @staticmethod
-    def _angle_distance_signed(first, second):
-        return (first - second + math.pi) % (2.0 * math.pi) - math.pi
-
     def update_follow_goal(self):
         """Publish a stable standoff goal with adaptive camera-cone yaw."""
         if not self.follow_enabled:
@@ -522,26 +282,6 @@ class LLMRosBridge(Node):
         # physical camera has completed its next servo step.
         camera_pan = camera["pan_angle"] + camera["pan_error"]
         person = self.latest_person_pose_map.pose.position
-        if not camera_fresh:
-            lidar_deviation = self._angle_distance_signed(
-                math.atan2(
-                    float(person.y) - float(self.robot_pose["y"]),
-                    float(person.x) - float(self.robot_pose["x"]),
-                ),
-                float(self.robot_pose["yaw"]),
-            )
-            desired_pan = self.servo.reset_pan_angle + math.degrees(
-                lidar_deviation
-            )
-            desired_pan = max(
-                self.servo.min_pan_angle,
-                min(self.servo.max_pan_angle, desired_pan),
-            )
-            self.servo.set_error(
-                desired_pan - float(camera["pan_angle"]),
-                0.0,
-            )
-            self.servo.publish_servo_command(tracking=True)
         generated = self.follow_goal_generator.generate(
             person_x=float(person.x),
             person_y=float(person.y),
@@ -554,31 +294,38 @@ class LLMRosBridge(Node):
         if generated is None:
             return
 
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = "map"
-        goal_pose.header.stamp = self.get_clock().now().to_msg()
-        goal_pose.pose.position.x = generated.x
-        goal_pose.pose.position.y = generated.y
-        goal_pose.pose.orientation.z = math.sin(generated.yaw * 0.5)
-        goal_pose.pose.orientation.w = math.cos(generated.yaw * 0.5)
+        if not camera_fresh:
+            desired_pan = max(
+                self.servo.min_pan_angle,
+                min(
+                    self.servo.max_pan_angle,
+                    generated.camera_pan_target_deg,
+                ),
+            )
+            self.servo.set_error(
+                desired_pan - float(camera["pan_angle"]),
+                0.0,
+            )
+            self.servo.publish_servo_command(tracking=True)
 
-        should_publish = self.last_follow_goal is None
-        if self.last_follow_goal is not None:
-            previous_x, previous_y, previous_yaw = self.last_follow_goal
-            position_change = math.hypot(
-                generated.x - previous_x,
-                generated.y - previous_y,
-            )
-            yaw_change = self._angle_distance(generated.yaw, previous_yaw)
-            refresh_due = (
-                self.last_follow_goal_at is None
-                or now - self.last_follow_goal_at >= 0.8
-            )
-            should_publish = (
-                position_change >= 0.10
-                or yaw_change >= math.radians(5.0)
-                or refresh_due
-            )
+        goal_pose = _make_pose_stamped(
+            generated.x,
+            generated.y,
+            generated.yaw,
+            "map",
+            self.get_clock().now().to_msg(),
+        )
+
+        elapsed_since_publish = (
+            None
+            if self.last_follow_goal_at is None
+            else now - self.last_follow_goal_at
+        )
+        should_publish = self.follow_goal_generator.should_publish(
+            generated,
+            self.last_follow_goal,
+            elapsed_since_publish,
+        )
 
         if not self.navigation_active:
             self.start_follow_navigation(goal_pose)
@@ -594,69 +341,8 @@ class LLMRosBridge(Node):
             )
             self.last_follow_goal_at = now
 
-    def update_room_geometry(self):
-        pose = self.robot_pose
-        if self.map_message is None or pose is None:
-            return
-        try:
-            self.room_geometry = self.room_geometry_estimator.estimate(
-                self.map_message, pose["x"], pose["y"], pose["yaw"]
-            )
-        except Exception as error:
-            self.get_logger().warning(
-                f"Could not estimate room geometry: {error}"
-            )
-
     def camera_tof_callback(self, msg):
         self.camera_tof_range = msg.range
-
-    @staticmethod
-    def _serialize_ros_image(msg):
-        metadata = json.dumps(
-            {
-                "width": msg.width,
-                "height": msg.height,
-                "step": msg.step,
-                "encoding": msg.encoding,
-                "is_bigendian": msg.is_bigendian,
-                "frame_id": msg.header.frame_id,
-                "stamp_sec": msg.header.stamp.sec,
-                "stamp_nanosec": msg.header.stamp.nanosec,
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return struct.pack("!I", len(metadata)) + metadata + bytes(msg.data)
-
-    def _publish_astra_stream(self, topic, payload):
-        """Publish a typed camera payload without blocking ROS callbacks."""
-        try:
-            self.camera_pub_socket.send_multipart(
-                [topic, payload], flags=zmq.NOBLOCK
-            )
-        except zmq.Again:
-            pass
-
-    def astra_color_callback(self, msg):
-        self._publish_astra_stream(
-            b"astra/color", self._serialize_ros_image(msg)
-        )
-
-    def astra_depth_callback(self, msg):
-        self._publish_astra_stream(
-            b"astra/depth", self._serialize_ros_image(msg)
-        )
-
-    def astra_camera_info_callback(self, msg):
-        payload = json.dumps(
-            {
-                "width": msg.width,
-                "height": msg.height,
-                "frame_id": msg.header.frame_id,
-                "k": list(msg.k),
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        self._publish_astra_stream(b"astra/camera_info", payload)
 
     def send_event(self, event_name, status_msg, action_id=None):
         with self.pub_lock:
@@ -669,31 +355,6 @@ class LLMRosBridge(Node):
                 payload["action_id"] = action_id
             self.pub_socket.send_json(payload)
             self.get_logger().info(f"Broadcasted to LLM: {payload}")
-
-    def move_action_loop(
-        self,
-        lin_vel,
-        ang_vel,
-        fwd_dur,
-        rot_dur,
-        start_time,
-        action_id,
-        send_event=False,
-    ):
-        elapsed = (self.get_clock().now() - start_time).nanoseconds / 1e9
-        
-        if elapsed >= max(fwd_dur,rot_dur):
-            self.publish_cmd(0.0, 0.0)
-            self.move_action_timer.cancel()
-            self.move_action_timer = None
-            if send_event:
-                self.send_event("move_action", "completed", action_id)
-            self.moving_active = False
-            return
-
-        lin = lin_vel if elapsed < fwd_dur else 0.0
-        ang = ang_vel if elapsed < rot_dur else 0.0
-        self.publish_cmd(lin, ang)
 
     def nav_goal_response_cb(
         self, future, action_id, navigation_mode, generation
@@ -753,10 +414,6 @@ class LLMRosBridge(Node):
             )
 
     def stop_all_motion(self):
-        if self.move_action_timer:
-            self.move_action_timer.cancel()
-            self.move_action_timer = None
-            self.moving_active = False
         self.nav_goal_generation += 1
         if self.current_nav_goal_handle:
             self.current_nav_goal_handle.cancel_goal_async()
@@ -795,12 +452,12 @@ class LLMRosBridge(Node):
             )
         )
 
-    def track_action_loop(self, start_time):
+    def track_action_loop(self):
         remaining_pan_angle = self.servo.publish_servo_command(
             tracking=True
         )
 
-        if self.navigation_active or self.moving_active:
+        if self.navigation_active:
             self.tracking_body_active = False
             return
 
@@ -837,9 +494,6 @@ class LLMRosBridge(Node):
     def shutdown(self):
         self.get_logger().info("Shutting down LLM ROS Bridge...")
 
-        if self.move_action_timer is not None:
-            self.move_action_timer.cancel()
-
         if self.track_action_timer is not None:
             self.track_action_timer.cancel()
 
@@ -847,7 +501,6 @@ class LLMRosBridge(Node):
 
         self.rep_socket.close(linger=0)
         self.pub_socket.close(linger=0)
-        self.camera_pub_socket.close(linger=0)
         self.map_image_stream.close()
         self.sub_socket.close(linger=0)
 
@@ -874,37 +527,11 @@ class LLMRosBridge(Node):
                         }
                     )
                 
-                elif cmd == "move_action":
-                    self.stop_all_motion()
-                    action_id = request.get("action_id")
-                    
-                    lin_vel = float(request.get("linear_velocity", 0.0))
-                    dist = float(request.get("distance", 0.0))
-                    ang_vel = float(request.get("angular_velocity", 0.0))
-                    angle = float(request.get("angle", 0.0))
-                    fwd_dur = abs(dist / lin_vel) if lin_vel != 0 else 0.0
-                    rot_dur = abs(angle / ang_vel) if ang_vel != 0 else 0.0
-                    start_time = self.get_clock().now()
-        
-                    self.move_action_timer = self.create_timer(
-                        0.05,
-                        lambda: self.move_action_loop(
-                            lin_vel,
-                            ang_vel,
-                            fwd_dur,
-                            rot_dur,
-                            start_time,
-                            action_id,
-                            True,
-                        ),
-                    )
-                    self.moving_active = True
-                    self.rep_socket.send_json({"status": "accepted", "message": "Blind move started"})
-
                 elif cmd == "track_action":
-                    start_time = self.get_clock().now()
                     if self.track_action_timer is None:
-                        self.track_action_timer = self.create_timer(0.01, lambda: self.track_action_loop(start_time))
+                        self.track_action_timer = self.create_timer(
+                            0.01, self.track_action_loop
+                        )
 
                     self.rep_socket.send_json({"status": "accepted", "message": "Object is being tracked"})
 
@@ -941,11 +568,6 @@ class LLMRosBridge(Node):
                     self.follow_enabled = True
                     self.follow_action_id = request.get("action_id")
                     self.follow_had_person_track = False
-                    # A new follow session must wait for a pose produced after
-                    # this command, never reuse the previous person's last pose.
-                    self.latest_person_pose_map = None
-                    self.latest_person_pose_at = None
-                    self.pending_person_pose = None
                     self.last_follow_goal = None
                     self.last_follow_goal_at = None
                     self.rep_socket.send_json({
@@ -960,20 +582,54 @@ class LLMRosBridge(Node):
                         "message": "Following stopped",
                     })
 
-                elif cmd in {"navigate_to_pose", "navigate_to_approach"}:
+                elif cmd in {
+                    "navigate_to_pose", "navigate_to_approach",
+                    "navigate_local",
+                }:
                     x = float(request.get("x", 0.0))
                     y = float(request.get("y", 0.0))
                     angle = float(request.get("angle", 0.0))
                     frame_id = str(request.get("frame_id", "base_footprint"))
                     destination = None
 
-                    if cmd == "navigate_to_approach":
+                    if cmd in {"navigate_to_approach", "navigate_local"}:
                         with self.map_image_stream.state_lock:
                             prepared = self.map_image_stream.prepared
                         if prepared is None:
                             self.rep_socket.send_json({
                                 "status": "error", "message": "Map is not ready"
                             })
+                            continue
+                        after_revision = request.get("after_map_revision")
+                        after_map_received_at = request.get(
+                            "after_map_received_at_unix_ns"
+                        )
+                        map_revision = int(prepared.get(
+                            "map_revision",
+                            prepared.get("prepared_at_unix_ns", 0),
+                        ))
+                        map_received_at = int(prepared.get(
+                            "map_received_at_unix_ns", 0
+                        ))
+                        room_step_commands = {
+                            "exit_room", "go_to_another_room"
+                        }
+                        if (
+                            cmd == "navigate_local"
+                            and request.get("local_command") in room_step_commands
+                            and (
+                                (
+                                    after_revision is not None
+                                    and map_revision <= int(after_revision)
+                                )
+                                or (
+                                    after_map_received_at is not None
+                                    and map_received_at
+                                    <= int(after_map_received_at)
+                                )
+                            )
+                        ):
+                            self.rep_socket.send_json({"status": "map_updating"})
                             continue
                         map_frame = str(prepared.get("frame_id") or "map")
                         pose = self.map_image_stream._pose(map_frame)
@@ -984,10 +640,86 @@ class LLMRosBridge(Node):
                             })
                             continue
                         try:
-                            destination = self.map_image_stream.logic.resolve_approach_destination(
-                                prepared, pose, x, y,
-                                standoff_m=request.get("standoff_m"),
-                            )
+                            if cmd == "navigate_to_approach":
+                                destination = self.map_image_stream.logic.resolve_approach_destination(
+                                    prepared, pose, x, y,
+                                    standoff_m=request.get("standoff_m"),
+                                )
+                            elif cmd == "navigate_local":
+                                local_command = str(
+                                    request.get("local_command") or ""
+                                )
+                                if local_command in room_step_commands:
+                                    exit_state = dict(
+                                        request.get("exit_state") or {}
+                                    )
+                                    if exit_state.get("origin_room_id") is None:
+                                        current_room = (
+                                            self.map_image_stream.room_registry.room_at(
+                                                prepared, pose
+                                            )
+                                            or self.map_image_stream.room_registry.ensure_startup_room(
+                                                prepared, pose
+                                            )
+                                        )
+                                        if current_room is not None:
+                                            exit_state["origin_room_id"] = current_room[
+                                                "room_id"
+                                            ]
+                                    exit_step = self.map_image_stream.logic.resolve_exit_room_step(
+                                        prepared, pose, exit_state
+                                    )
+                                    if exit_step["complete"]:
+                                        room = None
+                                        if local_command == "go_to_another_room":
+                                            room = self.map_image_stream.room_registry.observe_room(
+                                                prepared,
+                                                pose,
+                                                connected_from=exit_step["state"].get(
+                                                    "origin_room_id"
+                                                ),
+                                            )
+                                        self.rep_socket.send_json({
+                                            "status": "complete",
+                                            "exit_phase": exit_step["phase"],
+                                            "exit_state": exit_step["state"],
+                                            "map_revision": map_revision,
+                                            "map_received_at_unix_ns": map_received_at,
+                                            "room": room,
+                                            "room_graph": self.map_image_stream.room_registry.snapshot(),
+                                        })
+                                        continue
+                                    if (
+                                        local_command == "exit_room"
+                                        and exit_step["phase"] == "cross_room_boundary"
+                                    ):
+                                        self.rep_socket.send_json({
+                                            "status": "complete",
+                                            "exit_phase": "crossing_ready",
+                                            "exit_state": exit_step["state"],
+                                            "crossing_destination": exit_step["destination"],
+                                            "map_revision": map_revision,
+                                            "map_received_at_unix_ns": map_received_at,
+                                            "room_graph": self.map_image_stream.room_registry.snapshot(),
+                                        })
+                                        continue
+                                    destination = exit_step["destination"]
+                                elif local_command in {
+                                    "go_to_room", "return_to_initial_place"
+                                }:
+                                    room_id = (
+                                        1 if local_command == "return_to_initial_place"
+                                        else request.get("room_id")
+                                    )
+                                    destination = self.map_image_stream.room_registry.destination(
+                                        room_id
+                                    )
+                                else:
+                                    destination = self.map_image_stream.logic.resolve_local_destination(
+                                        prepared, pose, local_command,
+                                        previous_pose=self.previous_navigation_pose,
+                                        person_pose=self._person_state(),
+                                    )
                         except (KeyError, TypeError, ValueError) as error:
                             self.rep_socket.send_json({
                                 "status": "error", "message": str(error)
@@ -998,15 +730,10 @@ class LLMRosBridge(Node):
                         angle = destination["angle"]
                         frame_id = destination["frame_id"]
 
-                    pose_in = PoseStamped()
-                    pose_in.header.frame_id = frame_id
                     # A zero stamp requests the latest complete TF chain.
-                    pose_in.header.stamp = rclpy.time.Time().to_msg()
-                    pose_in.pose.position.x = x
-                    pose_in.pose.position.y = y
-                    pose_in.pose.position.z = 0.0
-                    pose_in.pose.orientation.z = math.sin(angle / 2.0)
-                    pose_in.pose.orientation.w = math.cos(angle / 2.0)
+                    pose_in = _make_pose_stamped(
+                        x, y, angle, frame_id, rclpy.time.Time().to_msg()
+                    )
 
                     if pose_in.header.frame_id == "map":
                         pose_map = pose_in
@@ -1027,6 +754,7 @@ class LLMRosBridge(Node):
                     # to decide whether an update is newer than the seed goal.
                     pose_map.header.stamp = self.get_clock().now().to_msg()
 
+                    start_pose = dict(self.robot_pose) if isinstance(self.robot_pose, dict) else None
                     self.stop_all_motion()
                     if not self.nav_client.wait_for_server(timeout_sec=1.0):
                         self.rep_socket.send_json({
@@ -1051,6 +779,8 @@ class LLMRosBridge(Node):
                             completed, action_id, navigation_mode, generation
                         )
                     )
+                    if start_pose is not None:
+                        self.previous_navigation_pose = start_pose
 
                     response = {
                         "status": "accepted",
@@ -1058,6 +788,20 @@ class LLMRosBridge(Node):
                     }
                     if destination is not None:
                         response["destination"] = destination
+                    if (
+                        cmd == "navigate_local"
+                        and request.get("local_command") in room_step_commands
+                    ):
+                        response.update({
+                            "exit_phase": exit_step["phase"],
+                            "exit_state": exit_step["state"],
+                            "map_revision": map_revision,
+                            "map_received_at_unix_ns": map_received_at,
+                        })
+                        if exit_step.get("recovery_reason") is not None:
+                            response["recovery_reason"] = exit_step[
+                                "recovery_reason"
+                            ]
                     self.rep_socket.send_json(response)
 
                 elif cmd == "stop_moving":

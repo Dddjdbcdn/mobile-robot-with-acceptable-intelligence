@@ -2,7 +2,7 @@ import math,time
 
 robot_state = {
     "pose": None,
-    "room_geometry": None,
+    "person": None,
     "camera": {
         "camera_tof_range": 0.0,
         "pan_angle": 0.0,
@@ -21,7 +21,7 @@ def update_state(message):
     pan_angle = float(message.get("servo_pan_angle") or 95.0)
     tilt_angle = float(message.get("servo_tilt_angle") or 90.0)
     robot_pose = message.get("robot_pose")
-    room_geometry = message.get("room_geometry")
+    person_pose = message.get("person_pose")
 
     zenith = math.radians(tilt_angle)
     azimuth = math.radians(pan_angle - 95)
@@ -45,7 +45,12 @@ def update_state(message):
         )
 
     robot_state["pose"] = robot_pose
-    robot_state["room_geometry"] = room_geometry
+    if isinstance(person_pose, dict):
+        robot_state["person"] = {
+            **person_pose,
+            "timestamp": time.monotonic() - float(person_pose.get("age_seconds") or 0.0),
+            "tracking_state": message.get("person_tracker_state"),
+        }
 
     robot_state["camera"].update({
         "camera_tof_range": camera_tof_range,
@@ -58,4 +63,3 @@ def update_state(message):
         "object_map_y": object_map_y,
         "timestamp": time.monotonic()
     })
-

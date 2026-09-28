@@ -121,7 +121,6 @@ class UsbCameraRecoveryTests(unittest.TestCase):
             device, stream_module.cv2.CAP_V4L2
         )
         self.assertEqual(camera.set.call_count, 4)
-        stream._zmq_context.term()
 
     def test_capture_loop_reopens_after_repeated_read_failures(self):
         device = "/dev/v4l/by-id/test-camera-video-index0"
@@ -153,18 +152,17 @@ class UsbCameraRecoveryTests(unittest.TestCase):
         failed_camera.release.assert_called_once()
         recovered_camera.release.assert_called_once()
         self.assertEqual(stream.sequence, 1)
-        stream._zmq_context.term()
 
 
     def test_wait_for_frame_captured_after_ignores_pre_move_frame(self):
         stream = CameraStream()
         frame = np.zeros((4, 4, 3), dtype=np.uint8)
-        stream._record_frame("usb", frame)
+        stream._record_frame(frame)
         move_completed_at = time.monotonic()
 
         def publish_new_frame():
             time.sleep(0.02)
-            stream._record_frame("usb", frame)
+            stream._record_frame(frame)
 
         publisher = threading.Thread(target=publish_new_frame)
         publisher.start()
@@ -175,22 +173,15 @@ class UsbCameraRecoveryTests(unittest.TestCase):
             ))
         finally:
             publisher.join()
-            stream._zmq_context.term()
 
     def test_wait_for_frame_captured_after_times_out_on_stale_frame(self):
         stream = CameraStream()
-        stream._record_frame(
-            "usb",
-            np.zeros((4, 4, 3), dtype=np.uint8),
-        )
+        stream._record_frame(np.zeros((4, 4, 3), dtype=np.uint8))
 
-        try:
-            self.assertFalse(stream.wait_for_frame_captured_after(
-                time.monotonic(),
-                timeout=0.01,
-            ))
-        finally:
-            stream._zmq_context.term()
+        self.assertFalse(stream.wait_for_frame_captured_after(
+            time.monotonic(),
+            timeout=0.01,
+        ))
 
 
 if __name__ == "__main__":

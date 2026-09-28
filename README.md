@@ -38,7 +38,7 @@ The AI is grounded in explicit tools, sensor feedback, action preconditions, and
 | Localization | Wheel odometry + MPU6050 yaw-rate fusion through `robot_localization` EKF |
 | Mapping | SLAM Toolbox with an included saved occupancy map |
 | Navigation | Nav2, MPPI controller, NavFn planner, custom behavior-tree plugins |
-| Obstacle perception | RPLIDAR C1, Orbbec Astra point cloud, 8×8 VL53L7CX ToF, side range sensors |
+| Obstacle perception | RPLIDAR C1, 8×8 VL53L7CX ToF, side range sensors |
 | AI perception | YOLO detection/pose, GroundingDINO, CSRT, Depth Anything V2; experimental SAM2 service |
 | Interaction | Full-duplex microphone/speaker pipeline with server-side voice activity detection |
 | Agent | OpenAI Realtime over WebSocket with typed function tools and action results |
@@ -64,7 +64,7 @@ flowchart TB
         Nav[Nav2 + custom BT nodes]
         State[EKF · SLAM · AMCL]
         Control[ros2_control<br/>diff drive]
-        Sensors[Lidar · Astra · ToF/range]
+        Sensors[Lidar · ToF/range]
     end
     subgraph MR[MICRO_ROS · real-time edge]
         Link[micro-ROS serial]
@@ -93,7 +93,11 @@ flowchart TB
 | `search_action` | Checks the current frame, sweeps the pan/tilt camera, evaluates image batches, and centers the best candidate |
 | `track_action` | Tracks known objects, arbitrary text-described objects, people, or selected body parts |
 | `approach_action` | Waits for stable tracking, computes a local pose from servo angles and ToF range, then dispatches a Nav2 goal |
-| `move_action` | Executes a bounded timed translation/rotation for short blind or expressive movement |
+| `explicit_navigation` | Executes a directly stated movement command |
+| `watch_target` | Finds a person or object without approaching and continuously tracks it |
+| automatic hand guidance | Tracks a welcomed hand, approaches its stable ToF position after an upward flick, then returns when pushed back |
+| `find_target` | Finds and approaches objects, or finds and enters recognizable places |
+| `follow_person` | Acquires and continuously follows a person |
 
 Long-running actions return an immediate structured result and later publish a separate completion event. The cognition manager attaches unique action IDs, rejects conflicting starts, exposes matching stop tools, and feeds outcomes back to the agent before another decision is made.
 
@@ -117,7 +121,13 @@ The perception pipeline is adaptive:
 - Nav2 with MPPI local control and NavFn global planning
 - Lidar, depth-camera, ToF point-cloud, and range-sensor obstacle layers
 - ZeroMQ AI commands, state, tracking corrections, and completion events
-- Utility nodes for trajectories, servo teleoperation, and BLE ring control
+- Utility nodes for trajectories, one-shot servo testing, and BLE ring control
+
+Test an absolute camera pose without starting the bridge:
+
+```bash
+ros2 run robot test_servo.py --pan 95 --tilt 90
+```
 
 #### Custom Nav2 behavior
 
@@ -163,7 +173,7 @@ A request such as **“find the bottle and go near it”** crosses the whole sta
 | Controller | STM32G474 with FreeRTOS |
 | Drive | Two encoded DC motors in differential drive |
 | 2D ranging | Slamtec RPLIDAR C1 |
-| RGB-D sensing | Orbbec Astra plus a separate RGB camera stream |
+| RGB sensing | USB RGB camera stream |
 | Short-range 3D | ST VL53L7CX 8×8 ToF array |
 | Target distance | Benewake TFmini-S aligned with the movable camera |
 | Proximity | Left and right serial range sensors |
@@ -294,7 +304,6 @@ st-flash --reset write build/DJ_AMR_CUBEMX.bin 0x08000000
 | `/stm32/tof_raw_data` → `/tof_pointcloud` | MCU → bridge → Nav2 | 64-cell ToF frame projected into 3D obstacle points |
 | `/camera_tof` | Bridge → AI/Nav | Target-aligned metric range |
 | `/scan` | RPLIDAR → ROS | Laser scan for SLAM, localization, and costmaps |
-| `/camera/depth/points` | Astra → Nav2 | Depth points for the spatio-temporal voxel layer |
 | `/diff_drive_controller/cmd_vel` | Nav/AI → control | Stamped base velocity command |
 | `/stm32/servo_pan`, `/stm32/servo_tilt` | ROS → MCU | Active-camera commands |
 | `navigate_to_pose` | AI bridge → Nav2 | Collision-aware approach action |
@@ -304,7 +313,7 @@ st-flash --reset write build/DJ_AMR_CUBEMX.bin 0x08000000
 
 - `third_party.repos` records external repositories and compatibility branches.
 - Only required Nav2 packages are populated through sparse checkout.
-- Nav2, Astra, topic-based `ros2_control`, and micro-ROS changes are committed as patches.
+- Nav2, topic-based `ros2_control`, and micro-ROS changes are committed as patches.
 - Python runtime dependencies are pinned.
 - Runtime memory starts from `memory.example.json`; real `memory.json` stays local.
 - Maps should be committed only when they reveal no private space.

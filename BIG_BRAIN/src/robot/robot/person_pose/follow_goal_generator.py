@@ -10,13 +10,16 @@ def wrap_angle(angle: float) -> float:
 
 
 @dataclass(frozen=True)
-class FollowGoalSettings:
+class _FollowGoalSettings:
     standoff_m: float = 0.50
     camera_center_deg: float = 95.0
     camera_weight: float = 0.35
     camera_agreement_deg: float = 25.0
     heading_comfort_deg: float = 20.0
     heading_critical_deg: float = 45.0
+    position_update_m: float = 0.10
+    yaw_update_deg: float = 5.0
+    refresh_interval_s: float = 0.80
 
 
 @dataclass(frozen=True)
@@ -26,14 +29,39 @@ class FollowGoal:
     yaw: float
     person_bearing: float
     heading_correction: float
+    camera_pan_target_deg: float
     used_camera: bool
 
 
 class FollowGoalGenerator:
     """Create a standoff goal while keeping the person in a camera cone."""
 
-    def __init__(self, settings: FollowGoalSettings | None = None):
-        self.settings = settings or FollowGoalSettings()
+    def __init__(
+        self,
+        *,
+        standoff_m: float = 0.50,
+        camera_center_deg: float = 95.0,
+        camera_weight: float = 0.35,
+        camera_agreement_deg: float = 25.0,
+        heading_comfort_deg: float = 20.0,
+        heading_critical_deg: float = 45.0,
+        position_update_m: float = 0.10,
+        yaw_update_deg: float = 5.0,
+        refresh_interval_s: float = 0.80,
+    ):
+        # Callers provide values without depending on this utility's config
+        # representation.
+        self.settings = _FollowGoalSettings(
+            standoff_m=float(standoff_m),
+            camera_center_deg=float(camera_center_deg),
+            camera_weight=float(camera_weight),
+            camera_agreement_deg=float(camera_agreement_deg),
+            heading_comfort_deg=float(heading_comfort_deg),
+            heading_critical_deg=float(heading_critical_deg),
+            position_update_m=float(position_update_m),
+            yaw_update_deg=float(yaw_update_deg),
+            refresh_interval_s=float(refresh_interval_s),
+        )
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -117,5 +145,33 @@ class FollowGoalGenerator:
             yaw=wrap_angle(robot_yaw + correction),
             person_bearing=fused_bearing,
             heading_correction=correction,
+            camera_pan_target_deg=(
+                self.settings.camera_center_deg
+                + math.degrees(lidar_deviation)
+            ),
             used_camera=used_camera,
+        )
+
+    def should_publish(
+        self,
+        goal: FollowGoal,
+        previous_goal: tuple[float, float, float] | None,
+        elapsed_s: float | None,
+    ) -> bool:
+        """Return whether movement or elapsed time warrants a goal update."""
+        if previous_goal is None:
+            return True
+        previous_x, previous_y, previous_yaw = previous_goal
+        position_change = math.hypot(
+            goal.x - previous_x,
+            goal.y - previous_y,
+        )
+        yaw_change = abs(wrap_angle(goal.yaw - previous_yaw))
+        tolerance = 1e-9
+        return (
+            position_change + tolerance >= self.settings.position_update_m
+            or yaw_change + tolerance
+            >= math.radians(self.settings.yaw_update_deg)
+            or elapsed_s is None
+            or elapsed_s >= self.settings.refresh_interval_s
         )

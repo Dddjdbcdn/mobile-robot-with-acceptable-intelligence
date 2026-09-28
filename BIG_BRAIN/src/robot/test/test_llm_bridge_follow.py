@@ -4,11 +4,36 @@ from unittest.mock import Mock
 
 import pytest
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from std_msgs.msg import String
 
-from robot.llm_bridge import LLMRosBridge
-from robot.follow_goal_generator import FollowGoalGenerator, FollowGoalSettings
+from robot.bridge.llm_bridge import (
+    LLMRosBridge,
+    _make_pose_stamped,
+    _planar_pose_from_transform,
+)
+from robot.person_pose.follow_goal_generator import FollowGoalGenerator
+
+
+def test_bridge_pose_helpers_convert_planar_ros_geometry():
+    transform = TransformStamped()
+    transform.transform.translation.x = 1.5
+    transform.transform.translation.y = -0.5
+    transform.transform.rotation.z = math.sin(math.pi / 4.0)
+    transform.transform.rotation.w = math.cos(math.pi / 4.0)
+
+    planar = _planar_pose_from_transform(transform, "map")
+    stamped = _make_pose_stamped(
+        planar["x"], planar["y"], planar["yaw"], "map", transform.header.stamp
+    )
+
+    assert planar["x"] == pytest.approx(1.5)
+    assert planar["y"] == pytest.approx(-0.5)
+    assert planar["yaw"] == pytest.approx(math.pi / 2.0)
+    assert planar["frame_id"] == "map"
+    assert stamped.header.frame_id == "map"
+    assert stamped.pose.position.x == pytest.approx(1.5)
+    assert stamped.pose.orientation.z == pytest.approx(math.sin(math.pi / 4.0))
 
 
 class FakeClock:
@@ -30,9 +55,7 @@ def bridge_for_pose_callback():
     bridge.pending_person_pose = None
     bridge.robot_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
     bridge.robot_pose_at = time.monotonic()
-    bridge.follow_goal_generator = FollowGoalGenerator(
-        FollowGoalSettings(standoff_m=0.9)
-    )
+    bridge.follow_goal_generator = FollowGoalGenerator(standoff_m=0.9)
     bridge.last_follow_goal = None
     bridge.last_follow_goal_at = None
     bridge.servo = Mock()

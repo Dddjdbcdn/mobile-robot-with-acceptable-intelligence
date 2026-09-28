@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+from pathlib import Path
 import time
+import uuid
 
 import zmq
 
@@ -13,12 +15,39 @@ class MapClient:
         context,
         endpoint="tcp://127.0.0.1:5559",
         timeout=8.0,
+        save_dir=None,
     ):
         self.context = context
         self.endpoint = endpoint
         self.timeout = float(timeout)
+        self.save_dir = Path(save_dir) if save_dir is not None else (
+            Path(__file__).resolve().parents[1] / "results" / "navigation"
+        )
         self._lock = asyncio.Lock()
         self._socket = None
+
+    @staticmethod
+    def _atomic_write(path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(data)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def save_snapshot(self, snapshot):
+        """Save the newest action's map renders, replacing older renders."""
+        crop = bytes(snapshot["jpeg_bytes"])
+        full = bytes(snapshot.get("full_jpeg_bytes", crop))
+        crop_path = self.save_dir / "latest_map_crop.jpg"
+        full_path = self.save_dir / "latest_map_full.jpg"
+        self._atomic_write(crop_path, crop)
+        self._atomic_write(full_path, full)
+        return {
+            "map_crop": str(crop_path),
+            "map_full": str(full_path),
+        }
 
     def _reset_socket(self):
         if self._socket is not None:

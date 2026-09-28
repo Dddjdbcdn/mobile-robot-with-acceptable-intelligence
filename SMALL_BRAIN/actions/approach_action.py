@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import math
-
 from actions.action_result import ActionResult
-from actions.track_action import normalize_human_target, normalize_object_target
-from cognition.state import robot_state
+from actions.tracking.target_catalog import (
+    normalize_human_target,
+    normalize_object_target,
+)
 
 
 class ApproachAction:
@@ -51,48 +51,29 @@ class ApproachAction:
                 retryable=True,
             )
 
-        if not self.track_action.stable:
-            stable = await self.track_action.wait_until_stable(timeout=10.0)
-            if not stable:
-                return ActionResult(
-                    action_id=action_id,
-                    action_type="approach_action",
-                    status="failed",
-                    target=target,
-                    outcome="precondition_failed",
-                    reason_code="TRACKING_STABILITY_TIMEOUT",
-                    retryable=True,
-                    data={"tracking_stable": False},
-                )
-
-        camera_state = robot_state.get("camera") or {}
-        values = (
-            camera_state.get("object_x"),
-            camera_state.get("object_y"),
-            camera_state.get("object_angle"),
-            camera_state.get("camera_tof_range"),
+        tracking_session_id = self.track_action.action_id
+        seed = await self.track_action.wait_for_stable_target_seed(
+            self.track_action.TRACKED_TARGET_SEED_OWNER,
+            target=normalized_target,
+            session_id=tracking_session_id,
+            timeout=10.0,
         )
-        if (
-            not all(isinstance(value, (int, float)) for value in values)
-            or not all(math.isfinite(value) for value in values)
-            or float(values[3]) <= 0.05
-        ):
+        if seed is None:
             return ActionResult(
                 action_id=action_id,
                 action_type="approach_action",
                 status="failed",
                 target=target,
-                outcome="range_invalid",
-                reason_code="APPROACH_RANGE_INVALID",
+                outcome="stable_seed_timeout",
+                reason_code="STABLE_SEED_TIMEOUT",
                 retryable=True,
             )
 
-        x, y, angle, tof_range = (float(value) for value in values)
         raw_destination = {
-            "x": x,
-            "y": y,
-            "angle": angle,
-            "tof_range": tof_range,
+            "x": seed["x"],
+            "y": seed["y"],
+            "angle": seed["angle"],
+            "tof_range": seed["tof_range"],
         }
 
         self.completion_future = asyncio.get_running_loop().create_future()
@@ -139,10 +120,7 @@ class ApproachAction:
             target=target,
             outcome="approaching",
             data={
-                "tracking_stable": self.track_action.stable,
-                "person_tracking_stable": getattr(
-                    self.track_action, "person_stable", False
-                ),
+                "stable_seed": dict(seed),
                 "raw_destination": dict(raw_destination),
                 "destination": dict(self._last_destination or raw_destination),
             },
