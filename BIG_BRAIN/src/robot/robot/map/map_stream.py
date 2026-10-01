@@ -15,11 +15,6 @@ from robot.map.room_registry import RoomRegistry
 
 BASE_FRAME = "base_footprint"
 IMAGE_ENDPOINT = "tcp://127.0.0.1:5559"
-ANALYSIS_HZ = 0.5
-# "on_request" renders only when a snapshot is requested. "fixed_hz" keeps
-# an encoded snapshot warm at FIXED_HZ and returns it to requesters.
-DELIVERY_MODE = "on_request"
-FIXED_HZ = 2.0
 # The navigation model only consumes the robot-centred crop. Keep the costly
 # second full-map render disabled unless a debugging session explicitly needs it.
 INCLUDE_FULL_IMAGE = False
@@ -33,14 +28,7 @@ class MapImageStream:
         self.node = node
         self.tf = tf_buffer
         self.base_frame = BASE_FRAME
-        self.analysis_hz = ANALYSIS_HZ
-        self.delivery_mode = DELIVERY_MODE
-        self.fixed_hz = FIXED_HZ
         self.include_full_image = INCLUDE_FULL_IMAGE
-        if self.delivery_mode not in {"on_request", "fixed_hz"}:
-            raise ValueError(f"Unknown map delivery mode: {self.delivery_mode}")
-        if self.fixed_hz <= 0.0:
-            raise ValueError("FIXED_HZ must be positive")
 
         self.logic = MapLogic()
         self.room_registry = RoomRegistry(self.logic)
@@ -59,11 +47,11 @@ class MapImageStream:
         self._coverage_key = None
         self._coverage_counts = None
         self._coverage_mask = None
+        self.analysis_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sequence = 0
 
         self.search_overlay = None
-        self._encoded_cache = None
         qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -141,7 +129,6 @@ class MapImageStream:
         if operation == "clear":
             if self.search_overlay and action_id == self.search_overlay.get("action_id"):
                 self.search_overlay = None
-                self._encoded_cache = None
             return operation
         if operation != "set" or not action_id:
             raise ValueError(f"unsupported map operation: {operation!r}")
@@ -200,7 +187,6 @@ class MapImageStream:
             "camera_horizontal_fov_deg": float(message.get("camera_horizontal_fov_deg", 85.0)),
             "camera_reliable_range_m": float(message.get("camera_reliable_range_m", 2.0)),
         }
-        self._encoded_cache = None
         return operation
 
     @staticmethod
@@ -219,86 +205,68 @@ class MapImageStream:
                 normalized[key] = view[key]
         return normalized
 
-    def _refresh_analysis(self):
-        """Refresh the prepared map and return the delay before retrying."""
-        period = 1.0 / self.analysis_hz
-        with self.state_lock:
-            map_msg = self.map_msg
-            cost_msg = self.cost_msg
-            map_revision = self._map_revision
-            map_received_at_unix_ns = self._map_received_at_unix_ns
-        if map_msg is None:
-            self._not_ready_reason = "Waiting for OccupancyGrid on /map"
-            return 0.1
-        if cost_msg is None:
-            self._not_ready_reason = (
-                "Waiting for OccupancyGrid on /global_costmap/costmap"
-            )
-            return 0.1
+    def prepare_on_demand(self):
+        """Analyze the latest map once for a requesting consumer."""
+        with self.analysis_lock:
+            with self.state_lock:
+                map_msg = self.map_msg
+                cost_msg = self.cost_msg
+                map_revision = self._map_revision
+                map_received_at_unix_ns = self._map_received_at_unix_ns
+            if map_msg is None:
+                self._not_ready_reason = "Waiting for OccupancyGrid on /map"
+                return None
+            if cost_msg is None:
+                self._not_ready_reason = (
+                    "Waiting for OccupancyGrid on /global_costmap/costmap"
+                )
+                return None
 
-        pose = self._pose(map_msg.header.frame_id)
-        if pose is None:
-            self._not_ready_reason = (
-                f"TF unavailable: {map_msg.header.frame_id} -> {self.base_frame}"
-            )
-            return 0.1
+            pose = self._pose(map_msg.header.frame_id)
+            if pose is None:
+                self._not_ready_reason = (
+                    f"TF unavailable: {map_msg.header.frame_id} -> {self.base_frame}"
+                )
+                return None
 
-        started_at = time.monotonic()
-        try:
-            prepared = self.logic.prepare(map_msg, cost_msg, pose)
-        except Exception as error:
-            self._not_ready_reason = (
-                f"Map analysis failed: {type(error).__name__}: {error}"
-            )
-            self.node.get_logger().warning(f"Map analysis: {error}")
-            return period
+            started_at = time.monotonic()
+            try:
+                prepared = self.logic.prepare(map_msg, cost_msg, pose)
+            except Exception as error:
+                self._not_ready_reason = (
+                    f"Map analysis failed: {type(error).__name__}: {error}"
+                )
+                self.node.get_logger().warning(f"Map analysis: {error}")
+                return None
 
-        finished_at = time.monotonic()
-        prepared["analysis_ms"] = round(
-            (finished_at - started_at) * 1000, 1
-        )
-        prepared["prepared_at_monotonic"] = finished_at
-        prepared["prepared_at_unix_ns"] = time.time_ns()
-        prepared["map_revision"] = map_revision
-        prepared["map_received_at_unix_ns"] = map_received_at_unix_ns
-        self.room_registry.ensure_startup_room(prepared, pose)
-        with self.state_lock:
-            self.prepared = prepared
-        self._not_ready_reason = None
-        return period
+            finished_at = time.monotonic()
+            prepared["analysis_ms"] = round(
+                (finished_at - started_at) * 1000, 1
+            )
+            prepared["prepared_at_monotonic"] = finished_at
+            prepared["prepared_at_unix_ns"] = time.time_ns()
+            prepared["map_revision"] = map_revision
+            prepared["map_received_at_unix_ns"] = map_received_at_unix_ns
+            self.room_registry.ensure_startup_room(prepared, pose)
+            with self.state_lock:
+                self.prepared = prepared
+            self._not_ready_reason = None
+            return prepared
 
     def _stream_loop(self):
-        """Analyze continuously and serve ordered map requests."""
+        """Serve ordered map requests without background map analysis."""
         self.socket = self.context.socket(zmq.REP)
         self.socket.setsockopt(zmq.LINGER, 0)
 
         try:
             self.socket.bind(IMAGE_ENDPOINT)
-            next_analysis = time.monotonic()
-            next_fixed_render = time.monotonic()
+            poller = zmq.Poller()
+            poller.register(self.socket, zmq.POLLIN)
 
             while not self.stop_event.is_set():
-                try:
-                    message = self.socket.recv_json(flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    message = None
-                if message is not None:
-                    self._handle_request(message)
-
-                now = time.monotonic()
-                if now >= next_analysis:
-                    retry_delay = self._refresh_analysis()
-                    next_analysis = time.monotonic() + retry_delay
-
-                if self.delivery_mode == "fixed_hz" and now >= next_fixed_render:
-                    self._encoded_cache = self._encode_snapshot()
-                    next_fixed_render = time.monotonic() + 1.0 / self.fixed_hz
-
-                delay = max(
-                    0.0,
-                    min(next_analysis - time.monotonic(), 0.02),
-                )
-                self.stop_event.wait(delay)
+                events = dict(poller.poll(timeout=100))
+                if self.socket in events:
+                    self._handle_request(self.socket.recv_json())
         except Exception as error:
             if not self.stop_event.is_set():
                 self.node.get_logger().error(f"Map stream: {error}")
@@ -317,38 +285,13 @@ class MapImageStream:
             pending_navigation_pose = self._overlay_pose(
                 message.get("pending_navigation_pose")
             )
-            encoded = (
-                self._encoded_cache
-                if (
-                    self.delivery_mode == "fixed_hz"
-                    and crop_size_m is None
-                    and not render_frontiers
-                    and pending_navigation_pose is None
-                ) else None
-            )
-            if encoded is None:
+            encoded = None
+            if self.prepare_on_demand() is not None:
                 encoded = self._encode_snapshot(
                     crop_size_m=crop_size_m,
                     render_frontiers=render_frontiers,
                     pending_navigation_pose=pending_navigation_pose,
                 )
-                # At startup a request can arrive before the first periodic
-                # analysis. Prepare immediately once instead of making the
-                # client wait for the background schedule.
-                if encoded is None and self.prepared is None:
-                    self._refresh_analysis()
-                    encoded = self._encode_snapshot(
-                        crop_size_m=crop_size_m,
-                        render_frontiers=render_frontiers,
-                        pending_navigation_pose=pending_navigation_pose,
-                    )
-                if (
-                    self.delivery_mode == "fixed_hz"
-                    and crop_size_m is None
-                    and not render_frontiers
-                    and pending_navigation_pose is None
-                ):
-                    self._encoded_cache = encoded
             if encoded is None:
                 self.socket.send_json({
                     "ok": False,
@@ -617,8 +560,7 @@ class MapImageStream:
             self.sequence += 1
             metadata.update({
                 "sequence": self.sequence,
-                "publish_mode": self.delivery_mode,
-                "analysis_hz": self.analysis_hz,
+                "publish_mode": "on_request",
                 "analysis_ms": prepared["analysis_ms"],
                 "analysis_age_ms": round(
                     (started_at - prepared["prepared_at_monotonic"]) * 1000, 1

@@ -1,15 +1,13 @@
 from pathlib import Path
 from ultralytics import YOLO
-import json
-import struct
-import math
-import zmq
 import threading
 import numpy as np
 import time
 import asyncio
 
-class YoloService():
+class YoloService:
+    """Run person-pose inference continuously from startup to shutdown."""
+
     def __init__(self, camera):
         model_dir = (
             Path(__file__).resolve().parents[1]
@@ -17,9 +15,7 @@ class YoloService():
             / "yolo_tools"
         )
         pose_model_path = model_dir / "yolo11n-pose_openvino_model"
-        DJ_custom_model_path = model_dir / "yoloe-11m_openvino_model"
 
-        self.DJ_custom_model = YOLO(DJ_custom_model_path, task="detect")
         self.pose_model = YOLO(pose_model_path, task="pose")
 
         self.conf_threshold = 0.3
@@ -29,14 +25,7 @@ class YoloService():
         self.inference_thread = threading.Thread(target=self.timer_callback, daemon=True)
         self.running = False
         self.fps = 10.0
-        self.current_fps = 0.0
-        self._fps_window_started = time.monotonic()
-        self._fps_frame_count = 0
-        self._fps_mode_revision = -1
-        self._active_event = threading.Event()
         self._state_condition = threading.Condition()
-        self._owner_modes = {}
-        self._mode_revision = 0
         self._inference_sequence = 0
         self._inference_frame_bgr = None
         self._inference_full_frame_bgr = None
@@ -46,8 +35,7 @@ class YoloService():
 
     @property
     def active(self):
-        with self._state_condition:
-            return bool(self._owner_modes)
+        return self.running
 
     def detection_snapshot(self):
         """Return one inference generation and its detections atomically."""
@@ -82,67 +70,11 @@ class YoloService():
                 },
             )
 
-    def _effective_mode_locked(self):
-        modes = set(self._owner_modes.values()) - {"none"}
-        if "both" in modes or {"dj", "pose"}.issubset(modes):
-            return "both"
-        if "pose" in modes:
-            return "pose"
-        if "dj" in modes:
-            return "dj"
-        return "none"
-
-    @property
-    def vision_mode(self):
-        with self._state_condition:
-            return self._effective_mode_locked()
-
-    @vision_mode.setter
-    def vision_mode(self, mode):
-        # Compatibility for older callers. Action code should use owner modes.
-        self.set_owner_mode("legacy", mode)
-
-    def activate(self, owner, mode="dj"):
-        """Enable inference for one action and return the current sequence."""
-        owner = str(owner)
-        if mode not in {"dj", "pose", "both", "none"}:
-            raise ValueError(f"Unknown YOLO mode: {mode}")
-        with self._state_condition:
-            self._owner_modes[owner] = mode
-            self._mode_revision += 1
-            self.detections = []
-            self._inference_frame_bgr = None
-            self._inference_full_frame_bgr = None
-            if self._effective_mode_locked() == "none":
-                self._active_event.clear()
-            else:
-                self._active_event.set()
-            return self._inference_sequence
-
-    def set_owner_mode(self, owner, mode):
-        return self.activate(owner, mode)
-
-    def deactivate(self, owner):
-        """Release one action's inference lease."""
-        with self._state_condition:
-            if self._owner_modes.pop(str(owner), None) is None:
-                return
-            self._mode_revision += 1
-            self.detections = []
-            self._inference_frame_bgr = None
-            self._inference_full_frame_bgr = None
-            if self._effective_mode_locked() == "none":
-                self._active_event.clear()
-            else:
-                self._active_event.set()
-            self._state_condition.notify_all()
-
     def _wait_for_inference_after(self, sequence, timeout):
         with self._state_condition:
             return self._state_condition.wait_for(
                 lambda: (
                     self._inference_sequence > sequence
-                    or not self._owner_modes
                     or not self.running
                 ),
                 timeout=timeout,
@@ -159,13 +91,7 @@ class YoloService():
             (320, 640, 3),
             dtype=np.uint8
         )
-        # Multiple passes help ensure compilation/caching is complete
-        for _ in range(3):
-            self.DJ_custom_model.predict(
-                source=dummy_frame,
-                device="intel:gpu",
-                verbose=False,
-            )
+        # Multiple passes help ensure compilation/caching is complete.
         for _ in range(3):
             self.pose_model.predict(
                 source=dummy_frame,
@@ -180,31 +106,8 @@ class YoloService():
         while not self.running:
             await asyncio.sleep(0.05)
 
-    def _record_fps(self, mode):
-        self._fps_frame_count += 1
-        now = time.monotonic()
-        elapsed = now - self._fps_window_started
-        if elapsed < 1.0:
-            return
-
-        self.current_fps = self._fps_frame_count / elapsed
-        print(f"[FPS] YOLO ({mode}): {self.current_fps:.1f}", flush=True)
-        self._fps_window_started = now
-        self._fps_frame_count = 0
-
     def timer_callback(self):
         while self.running:
-            if not self._active_event.wait(timeout=0.1):
-                continue
-            with self._state_condition:
-                mode = self._effective_mode_locked()
-                mode_revision = self._mode_revision
-            if mode == "none":
-                continue
-            if mode_revision != self._fps_mode_revision:
-                self._fps_window_started = time.monotonic()
-                self._fps_frame_count = 0
-                self._fps_mode_revision = mode_revision
             loop_start = time.perf_counter()
 
             latest = self.camera.latest
@@ -218,36 +121,17 @@ class YoloService():
             source_captured_at = latest.captured_at
             inference_started_at = time.monotonic()
 
-            detections = []
-
-            if mode in ("dj", "both"):
-                dj_results = self.DJ_custom_model.predict(
-                    source=frame,
-                    device="intel:gpu",
-                    verbose=False,
-                )
-                detections.extend(
-                    self.parse_dj(dj_results[0])
-                )
-
-            if mode in ("pose", "both"):
-                pose_results = self.pose_model.predict(
-                    source=frame,
-                    device="intel:gpu",
-                    verbose=False,
-                )
-                detections.extend(
-                    self.parse_pose(pose_results[0])
-                )
+            pose_results = self.pose_model.predict(
+                source=frame,
+                device="intel:gpu",
+                verbose=False,
+            )
+            detections = self.parse_pose(pose_results[0])
 
             inference_completed_at = time.monotonic()
             current = self.camera.latest
             with self._state_condition:
-                if (
-                    current is not None
-                    and mode_revision == self._mode_revision
-                    and self._effective_mode_locked() != "none"
-                ):
+                if current is not None and self.running:
                     self.detections = detections
                     self._inference_frame_bgr = frame
                     self._inference_full_frame_bgr = full_frame
@@ -257,8 +141,6 @@ class YoloService():
                     self._inference_sequence += 1
                     self._state_condition.notify_all()
 
-            # self._record_fps(mode)
-
             elapsed = time.perf_counter() - loop_start
             remaining = 1/self.fps - elapsed
 
@@ -267,43 +149,9 @@ class YoloService():
 
     async def close(self):
         self.running = False
-        self._active_event.set()
         with self._state_condition:
             self._state_condition.notify_all()
         await asyncio.to_thread(self.inference_thread.join, 2)
-
-    def parse_dj(self, result):
-        detections = []
-
-        for box in result.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-
-            if conf < self.conf_threshold:
-                continue
-
-            class_name = result.names[cls_id]
-
-            # Pose model owns person detections
-            if self.vision_mode == "both" and class_name == "person":
-                continue
-
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-            detections.append({
-                "class": class_name,
-                "class_id": cls_id,
-                "confidence": round(conf, 3),
-
-                "bbox": {
-                    "x1": round(x1, 1),
-                    "y1": round(y1, 1),
-                    "x2": round(x2, 1),
-                    "y2": round(y2, 1),
-                },
-            })
-
-        return detections
 
     def parse_pose(self, result):
         keypoint_names = [

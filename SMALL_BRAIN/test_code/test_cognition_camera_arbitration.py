@@ -49,6 +49,7 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
         manager.track_action = inactive_action(
             start_tracking=AsyncMock(),
             stop_tracking=AsyncMock(),
+            wait_until_finished=AsyncMock(),
             set_visual_target_override=Mock(),
             clear_visual_target_override=Mock(),
             stable_seeds=Mock(),
@@ -175,6 +176,19 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("stable_seed", context)
         self.assertEqual(manager._hand_location, seed)
 
+    async def test_hand_dropout_does_not_immediately_clear_camera_override(self):
+        manager = self.make_manager()
+        manager.track_action.active = True
+        manager.track_action.target = "person"
+        manager.track_action.stable_seeds.get.return_value = None
+
+        await manager.handle_hand_command(
+            "observe_gesture",
+            {"gesture": "unavailable", "palm_center": None},
+        )
+
+        manager.track_action.clear_visual_target_override.assert_not_called()
+
     async def test_hand_approach_uses_silent_tool_request(self):
         manager = self.make_manager()
         seed = {"x": 1.0, "y": 0.1, "angle": 0.1, "tof_range": 1.0}
@@ -250,12 +264,8 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
              manager.explicit_navigation_action.start.await_args_list],
             ["previous_position", "face_person"],
         )
-        manager.track_action.stop_tracking.assert_awaited_once_with(
-            reason_code="REPLACED",
-            status="cancelled",
-            outcome="replaced_by_navigation_sequence",
-            reset_camera=True,
-        )
+        manager.track_action.stop_tracking.assert_not_awaited()
+        self.assertTrue(manager.track_action.active)
 
     @staticmethod
     def request(name, arguments=None):
@@ -432,15 +442,11 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
         )
         manager.find_target_executor.start.assert_not_awaited()
 
-    async def test_explicit_navigation_replaces_passive_tracking(self):
+    async def test_explicit_navigation_keeps_passive_tracking(self):
         manager = self.make_manager()
         manager.track_action.active = True
         manager.track_action.target = "person"
 
-        async def stop_tracking(**_kwargs):
-            manager.track_action.active = False
-
-        manager.track_action.stop_tracking.side_effect = stop_tracking
         expected = ActionResult("action-1", "explicit_navigation", "running")
         manager.explicit_navigation_action.start.return_value = expected
 
@@ -450,18 +456,76 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
         ))
 
         self.assertIs(result, expected)
-        manager.track_action.stop_tracking.assert_awaited_once_with(
-            reason_code="REPLACED",
-            status="cancelled",
-            outcome="replaced_by_explicit_navigation",
-            reset_camera=True,
-        )
+        manager.track_action.stop_tracking.assert_not_awaited()
+        self.assertTrue(manager.track_action.active)
         manager.explicit_navigation_action.start.assert_awaited_once_with(
             "rotate_left", "action-1"
         )
 
-    async def test_watch_target_runs_find_without_approaching(self):
+    async def test_approach_keeps_passive_tracking(self):
         manager = self.make_manager()
+        manager.track_action.active = True
+        manager.track_action.target = "person"
+        location = {"x": 1.0, "y": 0.0, "angle": 0.0, "tof_range": 1.5}
+        expected = ActionResult("action-1", "approach_action", "running")
+        manager.approach_action.start.return_value = expected
+
+        result = await manager.execute_request(self.request(
+            "approach_target",
+            {"target": "hand", "location": location},
+        ))
+
+        self.assertIs(result, expected)
+        manager.track_action.stop_tracking.assert_not_awaited()
+        self.assertTrue(manager.track_action.active)
+        manager.approach_action.start.assert_awaited_once_with(
+            location=location,
+            action_id="action-1",
+            target="hand",
+            standoff_m=None,
+        )
+
+    def test_navigation_does_not_take_camera_from_tracking(self):
+        manager = self.make_manager()
+        manager.track_action.active = True
+        manager.track_action.target = "person"
+        manager.explicit_navigation_action.active = True
+
+        self.assertEqual(
+            manager.action_state.camera_owner,
+            "target_tracking",
+        )
+
+    async def test_watch_target_uses_direct_tracker_without_dino(self):
+        manager = self.make_manager()
+        manager.track_action.start_tracking.return_value = ActionResult(
+            "action-1", "track_action", "running", target="person",
+            outcome="tracking",
+        )
+
+        result = await manager.execute_request(self.request(
+            "watch_target",
+            {"target": "person", "target_kind": "person"},
+        ))
+
+        self.assertEqual(result.action_type, "watch_target")
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.data["watch_source"], "direct_tracker")
+        manager.track_action.start_tracking.assert_awaited_once_with(
+            target="person",
+            action_id="action-1",
+            allow_grounding_dino=False,
+            continuous_person_reacquisition=True,
+        )
+        manager.find_target_executor.start.assert_not_awaited()
+
+    async def test_watch_target_falls_back_to_find_without_approaching(self):
+        manager = self.make_manager()
+        manager.track_action.start_tracking.return_value = ActionResult(
+            "action-1", "track_action", "failed", target="person",
+            outcome="target_not_detected",
+            reason_code="PERSON_DETECTION_FAILED",
+        )
         expected = ActionResult("action-1", "watch_target", "running")
         manager.find_target_executor.start.return_value = expected
 
@@ -480,6 +544,34 @@ class CognitionCameraArbitrationTests(unittest.IsolatedAsyncioTestCase):
             action_type="watch_target",
         )
         manager.explicit_navigation_action.start.assert_not_awaited()
+
+    async def test_direct_watch_uses_tracker_lifecycle(self):
+        manager = self.make_manager()
+        request = self.request(
+            "watch_target",
+            {"target": "person", "target_kind": "person"},
+        )
+        manager.current_action = request
+        manager.track_action.wait_until_finished.return_value = ActionResult(
+            "action-1", "track_action", "failed", target="person",
+            outcome="person_lost", reason_code="PERSON_LOST",
+        )
+        started = ActionResult(
+            "action-1", "watch_target", "running", target="person",
+            outcome="tracking", data={"watch_source": "direct_tracker"},
+        )
+
+        await manager.handle_action_executed(SimpleNamespace(
+            request=request,
+            result=started,
+            error=None,
+        ))
+        lifecycle = await asyncio.wait_for(manager.events.get(), timeout=1.0)
+
+        manager.track_action.wait_until_finished.assert_awaited_once_with()
+        await manager.handle_lifecycle_finished(lifecycle)
+        self.assertEqual(manager.action_results[-1].action_type, "watch_target")
+        self.assertEqual(manager.action_results[-1].reason_code, "PERSON_LOST")
 
     async def test_stop_watching_stops_only_passive_target_tracking(self):
         manager = self.make_manager()

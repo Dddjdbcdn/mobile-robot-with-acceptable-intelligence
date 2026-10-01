@@ -2433,7 +2433,6 @@ class SearchFrameExportTests(unittest.IsolatedAsyncioTestCase):
         search.pan_angle = 95.0
         search.tilt_angle = 30.0
         search.last_detection_source = None
-        search._yolo_owner = None
         search.completion_future = asyncio.get_running_loop().create_future()
         pose = {"x": 1.0, "y": 2.0, "yaw": 0.0, "frame_id": "map"}
         middle = {
@@ -2613,35 +2612,6 @@ class LiveCameraFovTests(unittest.TestCase):
         self.assertAlmostEqual(forward[0], robot[0], delta=1)
         self.assertLess(left[0], robot[0])
         self.assertAlmostEqual(left[1], robot[1], delta=1)
-
-class DetectorFirstTests(unittest.TestCase):
-    def test_search_uses_best_matching_yolo_box(self):
-        search = SearchAction.__new__(SearchAction)
-        search.target = "water bottle"
-        search.camera = type("Camera", (), {"tracking_size": (640, 360)})()
-        search.yolo = type(
-            "Yolo",
-            (),
-            {
-                "detections": [
-                    {
-                        "class": "bottle",
-                        "confidence": 0.6,
-                        "bbox": {"x1": 0, "y1": 0, "x2": 64, "y2": 36},
-                    },
-                    {
-                        "class": "bottle",
-                        "confidence": 0.9,
-                        "bbox": {"x1": 288, "y1": 162, "x2": 352, "y2": 198},
-                    },
-                ]
-            },
-        )()
-        result = search._best_yolo_candidate()
-        self.assertEqual(result["confidence"], 0.9)
-        self.assertAlmostEqual(result["position"]["x"], 0.5)
-        self.assertAlmostEqual(result["position"]["y"], 0.5)
-
 
 class FoundTransitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_successful_search_returns_found_without_starting_tracking(self):

@@ -629,8 +629,7 @@ class LLMRosBridge(Node):
                     destination = None
 
                     if cmd in {"navigate_to_approach", "navigate_local"}:
-                        with self.map_image_stream.state_lock:
-                            prepared = self.map_image_stream.prepared
+                        prepared = self.map_image_stream.prepare_on_demand()
                         if prepared is None:
                             self.rep_socket.send_json({
                                 "status": "error", "message": "Map is not ready"

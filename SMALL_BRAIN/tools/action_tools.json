@@ -69,7 +69,7 @@
   {
     "type": "function",
     "name": "watch_target",
-    "description": "Continuously watch a person or object without approaching it. Trigger phrases include 'look at me', 'face me', 'watch me', 'keep looking at me', 'watch the bottle', and 'keep your eyes on the door'. The robot runs the normal find-target search with approach disabled, aligns the camera, and leaves TrackAction active until stop_watching_target or another camera-owning action. Do not use this for a one-shot visual question, person-indicated navigation, or following a moving person with the robot base.",
+    "description": "Continuously watch a person or object without approaching it. Trigger phrases include 'look at me', 'face me', 'watch me', 'keep looking at me', 'watch the bottle', and 'keep your eyes on the door'. The robot first tries immediate tracking without Grounding DINO; if that fails, it runs the normal find-target search with approach disabled. Once acquired, TrackAction remains active until stop_watching_target or another camera-owning action. Do not use this for a one-shot visual question, person-indicated navigation, or following a moving person with the robot base.",
     "parameters": {
       "type": "object",
       "properties": {

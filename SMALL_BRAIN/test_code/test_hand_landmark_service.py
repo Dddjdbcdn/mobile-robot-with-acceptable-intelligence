@@ -54,6 +54,32 @@ class RetryLandmarker(FakeLandmarker):
         return super().detect_for_video(image, timestamp_ms)
 
 
+class TwoHandLandmarker(FakeLandmarker):
+    def detect_for_video(self, image, timestamp_ms):
+        self.timestamps.append(timestamp_ms)
+        self.image_shapes.append(image.shape)
+        first = [Point(0.45, 0.50) for _ in range(21)]
+        second = [Point(0.75, 0.50) for _ in range(21)]
+        return type("Result", (), {
+            "hand_landmarks": [first, second],
+            "handedness": [
+                [Category("Left", 0.91)],
+                [Category("Right", 0.87)],
+            ],
+        })()
+
+
+class LeftHandLandmarker(FakeLandmarker):
+    def detect_for_video(self, image, timestamp_ms):
+        self.timestamps.append(timestamp_ms)
+        self.image_shapes.append(image.shape)
+        points = [Point(0.50, 0.50) for _ in range(21)]
+        return type("Result", (), {
+            "hand_landmarks": [points],
+            "handedness": [[Category("Left", 0.96)]],
+        })()
+
+
 def person_detection():
     return {
         "keypoints": {
@@ -64,6 +90,10 @@ def person_detection():
 
 
 class HandLandmarkServiceTests(unittest.TestCase):
+    def test_hand_confidence_thresholds_are_sixty_percent(self):
+        self.assertEqual(HandLandmarkService.MIN_HAND_DETECTION_CONFIDENCE, 0.60)
+        self.assertEqual(HandLandmarkService.MIN_HAND_PRESENCE_CONFIDENCE, 0.60)
+
     def test_video_mode_timestamps_are_strictly_increasing(self):
         landmarker = FakeLandmarker()
         service = HandLandmarkService(
@@ -219,6 +249,43 @@ class HandLandmarkServiceTests(unittest.TestCase):
         self.assertIn("pinky_tip", result["landmarks"])
         self.assertEqual(result["handedness"], "Right")
         self.assertAlmostEqual(result["handedness_score"], 0.95)
+
+    def test_returns_handedness_for_both_detected_hands(self):
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=TwoHandLandmarker(),
+            image_factory=lambda image: image,
+        )
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        result = service._detect(frame, person_detection())
+
+        detected = result["mediapipe_hands"]
+        self.assertEqual(len(detected), 2)
+        self.assertEqual(
+            [item["handedness"] for item in detected], ["Left", "Right"]
+        )
+        self.assertEqual(sum(item["selected"] for item in detected), 1)
+        self.assertTrue(detected[1]["selected"])
+        self.assertEqual(result["handedness"], "Right")
+
+    def test_left_hand_is_visible_for_debug_but_not_returned_for_gestures(self):
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=LeftHandLandmarker(),
+            image_factory=lambda image: image,
+        )
+
+        result = service._detect(
+            np.zeros((360, 640, 3), dtype=np.uint8), person_detection()
+        )
+
+        self.assertEqual(result["landmarks"], {})
+        self.assertIsNone(result["handedness"])
+        self.assertEqual(
+            result["mediapipe_hands"][0]["handedness"], "Left"
+        )
+        self.assertFalse(result["mediapipe_hands"][0]["selected"])
 
     def test_saves_annotated_crop_for_debugging(self):
         service = HandLandmarkService(

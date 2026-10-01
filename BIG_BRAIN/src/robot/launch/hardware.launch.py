@@ -49,27 +49,7 @@ def generate_launch_description():
     depth_camera_node = IncludeLaunchDescription(
         XMLLaunchDescriptionSource(
             os.path.join(get_package_share_directory('astra_camera'), 'launch', 'astra.launch.xml')
-        ),
-        launch_arguments={
-            'camera_name': 'camera',
-            'enable_color': 'true',
-            'enable_depth': 'true',
-            'enable_ir': 'false',
-            # Register depth onto the color pixel grid for RGB detections.
-            'depth_registration': 'true',
-            'color_depth_synchronization': 'true',
-            'enable_point_cloud': 'true',
-            # robot_state_publisher owns the camera TF declared in the URDF.
-            'publish_tf': 'false',
-            'color_width': '640',
-            'color_height': '480',
-            'color_fps': '30',
-            'depth_width': '640',
-            'depth_height': '480',
-            'depth_fps': '30',
-            # Avoid immediately reopening Mini-series firmware after failure.
-            'connection_delay': '1000',
-        }.items(),
+        )
     )
 
     return LaunchDescription([

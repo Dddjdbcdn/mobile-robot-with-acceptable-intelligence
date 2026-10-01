@@ -1,8 +1,11 @@
 #include "imu.h"
 #include "microros_app.h"
 #include "main.h"
+#include "cmsis_os.h"
 #include <math.h>
 #include <stdint.h>
+
+extern void I2C1_Clear_Busy_Flag(void);
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

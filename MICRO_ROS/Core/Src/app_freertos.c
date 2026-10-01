@@ -167,7 +167,9 @@ void Hardware_Task(void *argument)
     // Configure and initialize the ToF sensor
     Dev.platform.address = 0x52; 
     
-    vl53l7cx_is_alive(&Dev, &tof_alive_status);
+    uint8_t tof_is_alive = 0;
+    vl53l7cx_is_alive(&Dev, &tof_is_alive);
+    tof_alive_status = tof_is_alive;
     
     if(tof_alive_status) {
         vl53l7cx_init(&Dev);

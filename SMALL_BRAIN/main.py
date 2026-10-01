@@ -420,7 +420,6 @@ async def main():
                 ws=ws,
                 send_robot_command=send_robot_command,
                 camera=camera,
-                yolo=yolo,
             )
             track_action = TrackAction(
                 csrt_tracker=csrt_tracker,

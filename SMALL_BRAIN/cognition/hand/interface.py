@@ -12,46 +12,68 @@ from cognition.hand.gestures import FrameConfirmation, HandGestureClassifier
 class HandGestureInterface:
     """Recognize gestures without owning any robot action state."""
 
-    MONITOR_HZ = 30.0
+    MONITOR_HZ = 15.0
     STATUS_MAX_AGE_SECONDS = 1.0
-    IDLE_WELCOME_CONFIRM_FRAMES = 10
-    TRACKING_STOP_CONFIRM_FRAMES = 10
-    FOLLOW_STOP_CONFIRM_FRAMES = 10
-    APPROACHING_STOP_CONFIRM_FRAMES = 10
+    IDLE_WELCOME_CONFIRM_FRAMES = 5
+    TRACKING_STOP_CONFIRM_FRAMES = 5
+    FOLLOW_STOP_CONFIRM_FRAMES = 5
+    APPROACHING_STOP_CONFIRM_FRAMES = 5
     MODIFIER_CONFIRM_FRAMES = 3
     COMMAND_CONFIRM_FRAMES = 2
     COMMAND_TIMEOUT_FRAMES = 45
-    YOLO_OWNER = "hand-gesture-interface"
+    MISS_TOLERANCE = 3
 
     def __init__(self, hand_landmarks):
         self.hand_landmarks = hand_landmarks
         self._dispatch_handler = None
         self._running = False
         self._last_frame_sequence = None
+        self._inference_sequence = 0
         self._latest_status = None
         self._armed_gesture = None
         self._armed_frames_remaining = 0
-        self._last_command_gesture = None
+        self._approach_was_requested = False
 
         self._idle_welcome = FrameConfirmation(
-            "welcome", self.IDLE_WELCOME_CONFIRM_FRAMES
+            "welcome",
+            self.IDLE_WELCOME_CONFIRM_FRAMES,
+            miss_tolerance=self.MISS_TOLERANCE,
         )
         self._tracking_thumb_up = FrameConfirmation(
-            "thumb_up", self.TRACKING_STOP_CONFIRM_FRAMES
+            "thumb_up",
+            self.TRACKING_STOP_CONFIRM_FRAMES,
+            miss_tolerance=self.MISS_TOLERANCE,
         )
         self._following_push = FrameConfirmation(
-            "push", self.FOLLOW_STOP_CONFIRM_FRAMES
+            "push",
+            self.FOLLOW_STOP_CONFIRM_FRAMES,
+            miss_tolerance=self.MISS_TOLERANCE,
         )
         self._approaching_push = FrameConfirmation(
-            "push", self.APPROACHING_STOP_CONFIRM_FRAMES
+            "push",
+            self.APPROACHING_STOP_CONFIRM_FRAMES,
+            miss_tolerance=self.MISS_TOLERANCE,
         )
         self._modifier_confirmations = {
-            name: FrameConfirmation(name, self.MODIFIER_CONFIRM_FRAMES)
+            name: FrameConfirmation(
+                name,
+                self.MODIFIER_CONFIRM_FRAMES,
+                miss_tolerance=self.MISS_TOLERANCE,
+            )
             for name in ("welcome", "push")
         }
         self._command_confirmations = {
-            name: FrameConfirmation(name, self.COMMAND_CONFIRM_FRAMES)
-            for name in ("fingers_up", "fingers_down", "index_finger")
+            name: FrameConfirmation(
+                name,
+                self.COMMAND_CONFIRM_FRAMES,
+                miss_tolerance=self.MISS_TOLERANCE,
+            )
+            for name in (
+                "finger_curl_up",
+                "finger_curl_down",
+                "follow",
+                "get_space",
+            )
         }
 
         self._debug_image_interval = 1.0
@@ -94,7 +116,7 @@ class HandGestureInterface:
         self._tracking_thumb_up.reset()
 
     def _reset_all(self):
-        self._last_command_gesture = None
+        self._approach_was_requested = False
         self._reset_sequence()
         self._idle_welcome.reset()
         self._following_push.reset()
@@ -148,6 +170,7 @@ class HandGestureInterface:
             hand = await self.hand_landmarks.detect_right_hand(
                 frame_bgr, person, debug_path=debug_path
             )
+            self._inference_sequence += 1
 
         pose = HandGestureClassifier.classify(hand)
         context = await self._observe_gesture(
@@ -156,6 +179,7 @@ class HandGestureInterface:
         self._latest_status = {
             "updated_at": time.monotonic(),
             "sequence": sequence,
+            "inference_sequence": self._inference_sequence,
             "state": context.get("mode", "watching_person"),
             "gesture": pose.get("gesture"),
             "person": person,
@@ -228,36 +252,42 @@ class HandGestureInterface:
         return context
 
     async def _execute_sequence(self, modifier, command):
-        previous_modifier = self._last_command_gesture
-        self._last_command_gesture = modifier
         self._reset_sequence()
 
-        if modifier == "welcome" and command == "index_finger":
+        if modifier == "welcome" and command == "follow":
             await self._dispatch("follow_person", target="person")
             return
 
-        if modifier == "welcome" and command == "fingers_up":
-            await self._dispatch("approach_target", target="hand")
+        if modifier == "welcome" and command == "finger_curl_up":
+            started = await self._dispatch("approach_target", target="hand")
+            self._approach_was_requested = bool(started)
             return
 
-        if modifier == "push" and command == "fingers_down":
-            if previous_modifier in {None, "welcome"}:
+        if modifier == "push" and command == "get_space":
+            await self._dispatch(
+                "navigation_sequence",
+                commands=["open_space_middle", "face_person"],
+            )
+            self._approach_was_requested = False
+            return
+
+        if modifier == "push" and command == "finger_curl_down":
+            if self._approach_was_requested:
                 await self._dispatch(
                     "navigation_sequence",
                     commands=["previous_position", "face_person"],
                 )
+                self._approach_was_requested = False
             else:
                 await self._dispatch(
                     "explicit_navigation",
                     local_command="nudge_backward",
                     room_id=None,
                 )
-            self._last_command_gesture = None
 
     async def run(self, yolo):
         self._running = True
         interval = 1.0 / self.MONITOR_HZ
-        yolo.activate(self.YOLO_OWNER, "pose")
         try:
             while self._running:
                 started_at = time.monotonic()
@@ -271,7 +301,6 @@ class HandGestureInterface:
                 await asyncio.sleep(max(0.01, interval - elapsed))
         finally:
             self._running = False
-            yolo.deactivate(self.YOLO_OWNER)
             self._reset_all()
 
     async def stop(self, reason_code="STOPPED"):

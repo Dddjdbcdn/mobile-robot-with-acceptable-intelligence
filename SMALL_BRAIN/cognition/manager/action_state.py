@@ -38,11 +38,6 @@ class ActionState:
             return "follow_person"
         if self.find_target.active:
             return self.find_target.action_type
-        if (
-            self.explicit_navigation is not None
-            and self.explicit_navigation.active
-        ):
-            return "explicit_navigation"
         if self.search.active:
             return "search_action"
         if self.tracking.active:

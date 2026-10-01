@@ -38,6 +38,8 @@ HAND_CONNECTIONS = (
 class HandLandmarkService:
     """Detect a person's right hand and return full-frame landmarks."""
 
+    MIN_HAND_DETECTION_CONFIDENCE = 0.30
+    MIN_HAND_PRESENCE_CONFIDENCE = 0.30
     CROP_MIN_SIZE_PX = 224
     CROP_FOREARM_SCALE = 2.6
     CROP_WRIST_FORWARD_OFFSET = 0.35
@@ -73,9 +75,9 @@ class HandLandmarkService:
         options = mp.tasks.vision.HandLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=str(self.model_path)),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=0.30,
-            min_hand_presence_confidence=0.30,
+            num_hands=2,
+            min_hand_detection_confidence=self.MIN_HAND_DETECTION_CONFIDENCE,
+            min_hand_presence_confidence=self.MIN_HAND_PRESENCE_CONFIDENCE,
         )
         self.landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
         self._image_factory = lambda rgb: mp.Image(
@@ -352,7 +354,46 @@ class HandLandmarkService:
             hands.append((
                 distance, points, handedness, handedness_score, landmarks,
             ))
-        selected = min(hands, key=lambda item: item[0])
+        selectable_indices = [
+            index
+            for index, item in enumerate(hands)
+            if str(item[2] or "").lower() != "left"
+        ]
+        selected_index = (
+            min(
+                selectable_indices,
+                key=lambda index: hands[index][0],
+            )
+            if selectable_indices
+            else None
+        )
+        detected_hands = [
+            {
+                "handedness": item[2],
+                "handedness_score": item[3],
+                "wrist": item[1]["wrist"],
+                "selected": index == selected_index,
+            }
+            for index, item in enumerate(hands)
+        ]
+        if selected_index is None:
+            saved_debug_path = self._save_debug_crop(
+                crop, crop_box, None, debug_path
+            )
+            return {
+                "landmarks": {},
+                "handedness": None,
+                "handedness_score": None,
+                "mediapipe_hands": detected_hands,
+                "image_width": frame_width,
+                "image_height": frame_height,
+                "inference_scope": "full_frame" if use_full_frame else "crop",
+                "crop_size_px": crop.shape[1],
+                "crop_box": list(crop_box),
+                "mediapipe_timestamp_ms": timestamp_ms,
+                "debug_image_path": saved_debug_path,
+            }
+        selected = hands[selected_index]
         crop_landmarks = selected[4]
         touches_edge = any(
             float(point.x) <= 0.03
@@ -376,6 +417,7 @@ class HandLandmarkService:
             "landmarks": points,
             "handedness": handedness,
             "handedness_score": handedness_score,
+            "mediapipe_hands": detected_hands,
             "image_width": frame_width,
             "image_height": frame_height,
             "inference_scope": "full_frame" if use_full_frame else "crop",

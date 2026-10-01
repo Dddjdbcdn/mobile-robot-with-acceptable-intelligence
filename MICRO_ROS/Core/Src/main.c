@@ -228,16 +228,18 @@ void __sync_synchronize(void) {
 }
 
 // 3. Atomic exchange for micro-ROS executors
-uint32_t __atomic_exchange_4(volatile uint32_t *mem, uint32_t val, int model) {
-    uint32_t old_val;
+unsigned int __atomic_exchange_4(volatile void *mem, unsigned int val, int model) {
+    volatile unsigned int *value = (volatile unsigned int *)mem;
+    unsigned int old_val;
+    (void)model;
     
     // Safely disable interrupts to prevent context switches
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     
     // Swap the values
-    old_val = *mem;
-    *mem = val;
+    old_val = *value;
+    *value = val;
     
     // Restore previous interrupt state
     __set_PRIMASK(primask);

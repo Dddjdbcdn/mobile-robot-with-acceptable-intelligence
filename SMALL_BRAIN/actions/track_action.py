@@ -11,7 +11,6 @@ from actions.tracking.person_pose import (
 )
 from actions.tracking.stable_seed import StableTargetSeedTracker
 from actions.tracking.target_catalog import (
-    DJ_YOLO_CLASSES,
     HUMAN_TRACKABLE_PARTS,
     normalize_human_target,
     normalize_object_target,
@@ -60,7 +59,6 @@ class TrackAction:
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = True
         self._continuous_person_reacquisition = False
-        self._yolo_owner = None
         self._visual_target_override = None
         self.stable_seeds = StableTargetSeedTracker()
         # Persist across tracker loss so approach can reacquire after moving.
@@ -103,7 +101,7 @@ class TrackAction:
         self._visual_target_override = None
         self.stable_seeds.clear()
 
-    def _current_visual_target_override(self, max_age_seconds=0.35):
+    def _current_visual_target_override(self, max_age_seconds=0.5):
         override = self._visual_target_override
         if override is None:
             return None
@@ -173,22 +171,12 @@ class TrackAction:
         )
         self.last_stable_target_location = None
 
-        yolo_sequence = None
-        yolo_mode = (
-            "pose" if normalized_target in HUMAN_TRACKABLE_PARTS
-            else "dj" if normalized_target in DJ_YOLO_CLASSES
-            else None
-        )
-        if yolo_mode is not None and hasattr(self.yolo, "activate"):
-            self._yolo_owner = f"track:{action_id}"
-            yolo_sequence = self.yolo.activate(self._yolo_owner, yolo_mode)
-            try:
-                await self.yolo.wait_for_inference_after(yolo_sequence)
-            except BaseException:
-                self._deactivate_yolo()
-                raise
+        if normalized_target in HUMAN_TRACKABLE_PARTS:
+            return await self._start_person_tracking(normalized_target)
 
-        try:
+        jpeg_bytes = None
+        snapshot = None
+        if allow_grounding_dino:
             jpeg_bytes = await asyncio.to_thread(
                 self.camera.jpeg_bytes_snapshot,
                 70,
@@ -197,27 +185,12 @@ class TrackAction:
             )
             snapshot = self.camera.snapshot()
 
-            if normalized_target in HUMAN_TRACKABLE_PARTS:
-                return await self._start_person_tracking(normalized_target)
-
-            return await self._start_object_tracking(
-                jpeg_bytes,
-                normalized_target,
-                snapshot,
-                allow_grounding_dino=allow_grounding_dino,
-            )
-        except BaseException:
-            self._deactivate_yolo()
-            raise
-
-    def _set_yolo_mode(self, mode):
-        if self._yolo_owner is not None:
-            self.yolo.set_owner_mode(self._yolo_owner, mode)
-
-    def _deactivate_yolo(self):
-        if self._yolo_owner is not None:
-            self.yolo.deactivate(self._yolo_owner)
-            self._yolo_owner = None
+        return await self._start_object_tracking(
+            jpeg_bytes,
+            normalized_target,
+            snapshot,
+            allow_grounding_dino=allow_grounding_dino,
+        )
 
     async def _start_object_tracking(
         self,
@@ -237,7 +210,6 @@ class TrackAction:
             action_id = self.action_id
             self.action_id = None
             self.target = None
-            self._deactivate_yolo()
             return ActionResult(
                 action_id=action_id,
                 action_type="track_action",
@@ -284,51 +256,19 @@ class TrackAction:
         detection_source = None
         detection_confidence = None
 
-        if target in DJ_YOLO_CLASSES:
-            matching = [
-                detection
-                for detection in self.yolo.detections
-                if detection.get("class") == target
-            ]
-            if matching:
-                detection = max(
-                    matching,
-                    key=lambda item: float(item.get("confidence") or 0.0),
-                )
-                bbox = detection.get("bbox") or {}
-                try:
-                    tracking_bbox = (
-                        int(bbox["x1"]),
-                        int(bbox["y1"]),
-                        int(bbox["x2"] - bbox["x1"]),
-                        int(bbox["y2"] - bbox["y1"]),
-                    )
-                    detection_confidence = float(
-                        detection.get("confidence") or 1.0
-                    )
-                except (KeyError, TypeError, ValueError):
-                    tracking_bbox = None
-                else:
-                    detection_source = "yolo"
-
-        if tracking_bbox is None and allow_grounding_dino:
+        if allow_grounding_dino:
             if jpeg_bytes is None:
                 jpeg_bytes = await asyncio.to_thread(
                     self.camera.jpeg_bytes_snapshot, 70, False
                 )
-            self._set_yolo_mode("none")
-            await asyncio.sleep(0.1)
-            try:
-                grounding_result = await self.grounding_dino.detect(
-                    image_source=jpeg_bytes,
-                    target=target,
-                    box_threshold=0.25,
-                    text_threshold=0.25,
-                    nms_threshold=0.80,
-                    output_root=Path("results/grounding_results"),
-                )
-            finally:
-                self._set_yolo_mode("dj")
+            grounding_result = await self.grounding_dino.detect(
+                image_source=jpeg_bytes,
+                target=target,
+                box_threshold=0.25,
+                text_threshold=0.25,
+                nms_threshold=0.80,
+                output_root=Path("results/grounding_results"),
+            )
 
             detection = grounding_result.best
             if detection is not None:
@@ -477,7 +417,6 @@ class TrackAction:
             action_id = self.action_id or "unassigned"
             self.action_id = None
             self.target = None
-            self._deactivate_yolo()
             return ActionResult(
                 action_id=action_id,
                 action_type="track_action",
@@ -896,7 +835,6 @@ class TrackAction:
 
         completion_future = self.completion_future
 
-        self._deactivate_yolo()
         self.active = False
         self._continuous_person_reacquisition = False
         self._visual_target_override = None

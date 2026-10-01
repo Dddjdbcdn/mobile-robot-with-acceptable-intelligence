@@ -11,10 +11,6 @@ from typing import Any
 import uuid
 
 from cognition.manager.world_state import robot_state
-from actions.tracking.target_catalog import (
-    DJ_YOLO_CLASSES,
-    normalize_object_target,
-)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = REPO_ROOT / "tools" / "vision_oob_tools.json"
@@ -25,7 +21,6 @@ vision_oob_tools = {tool["name"]: tool for tool in tools}
 ASSESS_BATCH_SEARCH_TOOL = vision_oob_tools.get("assess_batch_search")
 ASSESS_FRAME_SEARCH_TOOL = vision_oob_tools.get("assess_frame_search")
 
-CANDIDATE_CONFIDENCE_THRESHOLD = 0.5
 SEARCH_CANDIDATE_TYPES = {
     "visual", "context", "speculative",
 }
@@ -70,11 +65,10 @@ SEARCH_EFFORT_ROWS = {
 from actions.action_result import ActionResult
 
 class SearchAction:
-    def __init__(self, ws, send_robot_command, camera, yolo=None):
+    def __init__(self, ws, send_robot_command, camera):
         self.ws = ws
         self.send_robot_command = send_robot_command
         self.camera = camera
-        self.yolo = yolo
         self.search_task = None
         self.action_id = None
 
@@ -85,7 +79,6 @@ class SearchAction:
         self.last_coverage_frames: list[dict[str, Any]] = []
         self.last_contextual_clue: dict[str, Any] | None = None
         self.last_detection_source: str | None = None
-        self._yolo_owner = None
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -228,23 +221,6 @@ class SearchAction:
             })
             self.captured_frames.append(frames[-1])
 
-            yolo_candidate = self._best_yolo_candidate()
-            if yolo_candidate is not None:
-                self.current_batch_frames = frames
-                self.current_candidate = {
-                    "assessment": {
-                        "result": "found",
-                        "target_position": yolo_candidate["position"],
-                        "contextual_clue": None,
-                    },
-                    "frame": frames[-1],
-                    "sweep_index": sweep_index,
-                }
-                self.last_detection_source = "yolo"
-                await self.move_to_found_target()
-                await self.complete_searching("succeeded", "found")
-                return
-
         self.current_batch_frames = self._comparison_frames(frames, tilt_position)
         await self.request_batch_assessment(self.current_batch_frames)
 
@@ -284,22 +260,6 @@ class SearchAction:
             "robot_pose": self._robot_pose_at_capture(),
         }
         self.captured_frames.append(self.current_initial_frame)
-
-        yolo_candidate = self._best_yolo_candidate()
-        if yolo_candidate is not None:
-            self.current_candidate = {
-                "assessment": {
-                    "result": "found",
-                    "target_position": yolo_candidate["position"],
-                    "contextual_clue": None,
-                },
-                "frame": self.current_initial_frame,
-                "sweep_index": -1,
-            }
-            self.last_detection_source = "yolo"
-            await self.move_to_found_target()
-            await self.complete_searching("succeeded", "found")
-            return
 
         instruction = (
                 f"Search for this {'place' if self.search_mode == 'place' else 'object'}: {self.target}\n\n"
@@ -343,48 +303,9 @@ class SearchAction:
         }
         await self.ws.send(json.dumps(event))
 
-    async def _start_frame_assessment(self, yolo_sequence):
-        if (
-            yolo_sequence is not None
-            and hasattr(self.yolo, "wait_for_inference_after")
-        ):
-            await self.yolo.wait_for_inference_after(yolo_sequence)
+    async def _start_frame_assessment(self):
         if self.active:
             await self.request_frame_assessment()
-
-    def _best_yolo_candidate(self):
-        """Return the best current YOLO match before spending an LLM call."""
-        if self.yolo is None:
-            return None
-        normalized_target = normalize_object_target(self.target)
-        if normalized_target not in DJ_YOLO_CLASSES:
-            return None
-        detections = [
-            detection for detection in list(self.yolo.detections)
-            if detection.get("class") == normalized_target
-        ]
-        if not detections:
-            return None
-        detection = max(
-            detections, key=lambda item: float(item.get("confidence") or 0.0)
-        )
-        confidence = float(detection.get("confidence") or 0.0)
-        if confidence < CANDIDATE_CONFIDENCE_THRESHOLD:
-            return None
-        bbox = detection.get("bbox") or {}
-        try:
-            width, height = self.camera.tracking_size
-            x = (float(bbox["x1"]) + float(bbox["x2"])) / (2.0 * width)
-            y = (float(bbox["y1"]) + float(bbox["y2"])) / (2.0 * height)
-            position = get_valid_position({"x": x, "y": y})
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
-            return None
-        if position is None:
-            return None
-        return {
-            "position": position,
-            "confidence": confidence,
-        }
 
     async def request_batch_assessment(self, frames):
         request_id = uuid.uuid4().hex
@@ -727,22 +648,10 @@ class SearchAction:
         self.pan_angle = robot_state["camera"]["pan_angle"]
         self.tilt_angle = robot_state["camera"]["tilt_angle"]
 
-        yolo_sequence = None
-        yolo_target = normalize_object_target(normalized_target)
-        if (
-            self.search_mode == "specific"
-            and
-            self.yolo is not None
-            and yolo_target in DJ_YOLO_CLASSES
-            and hasattr(self.yolo, "activate")
-        ):
-            self._yolo_owner = f"search:{action_id}"
-            yolo_sequence = self.yolo.activate(self._yolo_owner, "dj")
-
         clear_images_folder()
         self.completion_future = asyncio.get_running_loop().create_future()
         self.search_task = asyncio.create_task(
-            self._start_frame_assessment(yolo_sequence)
+            self._start_frame_assessment()
         )
 
         return ActionResult(
@@ -877,9 +786,6 @@ class SearchAction:
         )
         self.last_contextual_clue = clue
         self.last_found_target = self.target if status == "succeeded" else None
-        if self._yolo_owner is not None:
-            self.yolo.deactivate(self._yolo_owner)
-            self._yolo_owner = None
         self.reset_state()
 
         if completion_future is not None and not completion_future.done():

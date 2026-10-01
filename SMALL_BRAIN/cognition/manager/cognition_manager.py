@@ -98,6 +98,7 @@ class CognitionManager:
         self._pending_world_state: dict | None = None
         self._world_state_queued = False
         self._last_proximity_reaction = 0.0
+        self._proximity_check = False
         self._acquire_person_after_startup = False
         self._startup_person_acquisition_pending = True
         self._autonomy_task: asyncio.Task | None = None
@@ -204,8 +205,6 @@ class CognitionManager:
                     )
                     if isinstance(latest_seed, dict):
                         seed = latest_seed
-                else:
-                    self.track_action.clear_visual_target_override()
                 if isinstance(seed, dict):
                     self._hand_location = dict(seed)
 
@@ -368,7 +367,7 @@ class CognitionManager:
 
         camera_tools = {
             "find_target", "follow_person", "see_action",
-            "watch_target", "explicit_navigation", "navigation_sequence",
+            "watch_target",
         }
         if name in camera_tools:
             camera_owner = self.action_state.camera_owner
@@ -408,12 +407,18 @@ class CognitionManager:
             active_actions = self.action_state.snapshot(
                 self._autonomy_task
             )["active_actions"]
-            if name == "follow_person" and self.action_state.person_tracking:
+            can_run_with_tracking = (
+                name in {
+                    "explicit_navigation",
+                    "navigation_sequence",
+                    "follow_person",
+                }
+                and self.track_action.active
+            )
+            if can_run_with_tracking:
                 active_actions = [
                     action for action in active_actions
-                    if not (
-                        action.get("action_type") == "track_action"
-                    )
+                    if action.get("action_type") != "track_action"
                 ]
             if active_actions:
                 return ActionResult(
@@ -478,6 +483,19 @@ class CognitionManager:
             return result
 
         if name == "watch_target":
+            direct_tracking = await self.track_action.start_tracking(
+                target=args.get("target"),
+                action_id=request.action_id,
+                allow_grounding_dino=False,
+                continuous_person_reacquisition=(
+                    args.get("target_kind") == "person"
+                ),
+            )
+            if direct_tracking.status == "running":
+                return self._as_watch_target_result(
+                    direct_tracking,
+                    direct_tracker=True,
+                )
             return await self.find_target_executor.start(
                 target=args.get("target"),
                 action_id=request.action_id,
@@ -521,6 +539,25 @@ class CognitionManager:
             status="failed",
             outcome="unsupported_action",
             reason_code="UNKNOWN_ACTION",
+        )
+
+    @staticmethod
+    def _as_watch_target_result(result, *, direct_tracker=False):
+        """Keep direct tracking behind the public watch-target lifecycle."""
+        if not isinstance(result, ActionResult):
+            return result
+        data = dict(result.data or {})
+        if direct_tracker:
+            data["watch_source"] = "direct_tracker"
+        return ActionResult(
+            action_id=result.action_id,
+            action_type="watch_target",
+            status=result.status,
+            target=result.target,
+            outcome=result.outcome,
+            reason_code=result.reason_code,
+            retryable=result.retryable,
+            data=data,
         )
 
     async def execute_stop(self, request):
@@ -656,9 +693,17 @@ class CognitionManager:
         print(f"\n🌸 [ACTION RESULT]: {result}\n")
 
         if result.status == "running":
+            direct_watch = (
+                event.request.function_name == "watch_target"
+                and isinstance(result, ActionResult)
+                and result.data.get("watch_source") == "direct_tracker"
+            )
             action = {
                 "explicit_navigation": self.explicit_navigation_action,
-                "watch_target": self.find_target_executor,
+                "watch_target": (
+                    self.track_action
+                    if direct_watch else self.find_target_executor
+                ),
                 "find_target": self.find_target_executor,
                 "follow_person": self.follow_person_executor,
                 "approach_target": self.approach_action,
@@ -713,6 +758,15 @@ class CognitionManager:
                     )
                 },
             )
+        elif (
+            event.request.function_name == "watch_target"
+            and isinstance(result, ActionResult)
+            and result.action_type == "track_action"
+        ):
+            result = self._as_watch_target_result(
+                result,
+                direct_tracker=True,
+            )
         self.action_results.append(result)
 
         if not event.request.silent:
@@ -741,17 +795,18 @@ class CognitionManager:
             self._proximity_candidate_count = 0
             return
 
-        proximity = self._observe_abrupt_approach(self.world_state)
-        if (
-            proximity is not None
-            and now - self._last_proximity_reaction >= self.proximity_cooldown
-        ):
-            self._last_proximity_reaction = now
-            self._replace_autonomy_task(
-                self._run_proximity_retreat(),
-                "proximity-retreat",
-            )
-            return
+        if self._proximity_check:
+            proximity = self._observe_abrupt_approach(self.world_state)
+            if (
+                proximity is not None
+                and now - self._last_proximity_reaction >= self.proximity_cooldown
+            ):
+                self._last_proximity_reaction = now
+                self._replace_autonomy_task(
+                    self._run_proximity_retreat(),
+                    "proximity-retreat",
+                )
+                return
 
         if self._autonomy_task is not None and not self._autonomy_task.done():
             return

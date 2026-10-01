@@ -7,6 +7,8 @@
 extern volatile float Ax;
 extern volatile float Ay;
 extern volatile float Gz;
+extern bool mpu_init_status;
+extern bool mpu_calibration_done;
 
 bool MPU6050_Init(I2C_HandleTypeDef *hi2c);
 bool MPU6050_Read_Accel(I2C_HandleTypeDef *hi2c);

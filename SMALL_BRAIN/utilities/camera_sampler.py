@@ -15,6 +15,47 @@ tof_offset_z_m: float = 0.006
 tof_yaw_deg: float = 0.0
 tof_pitch_deg: float = 0.0
 
+
+class SequenceFps:
+    """Estimate event rate from a monotonically increasing sequence."""
+
+    def __init__(self, smoothing=0.20, stale_after_s=1.0):
+        self.smoothing = float(smoothing)
+        self.stale_after_s = float(stale_after_s)
+        self._last_sequence = None
+        self._last_event_at = None
+        self._fps = 0.0
+
+    def observe(self, sequence, now=None):
+        now = time.monotonic() if now is None else float(now)
+        if not isinstance(sequence, int):
+            return self.value(now)
+        if self._last_sequence is None or sequence < self._last_sequence:
+            self._last_sequence = sequence
+            self._last_event_at = now
+            self._fps = 0.0
+        elif sequence > self._last_sequence:
+            elapsed = now - self._last_event_at
+            if elapsed > 1e-6:
+                instant = (sequence - self._last_sequence) / elapsed
+                self._fps = (
+                    instant
+                    if self._fps <= 0.0
+                    else self._fps + self.smoothing * (instant - self._fps)
+                )
+            self._last_sequence = sequence
+            self._last_event_at = now
+        return self.value(now)
+
+    def value(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        if (
+            self._last_event_at is None
+            or now - self._last_event_at > self.stale_after_s
+        ):
+            return 0.0
+        return self._fps
+
 def _focal_lengths_from_fov(
     width: int,
     height: int,
@@ -466,6 +507,40 @@ def draw_hand_landmark_overlay(frame, hand_interface):
         cv2.circle(frame, point, 5, (0, 80, 255), -1, cv2.LINE_AA)
         cv2.circle(frame, point, 5, (255, 255, 255), 1, cv2.LINE_AA)
 
+    for detected_hand in (status.get("hand") or {}).get(
+        "mediapipe_hands", []
+    ):
+        wrist = detected_hand.get("wrist") or {}
+        normalized_x = wrist.get("normalized_x")
+        normalized_y = wrist.get("normalized_y")
+        if not isinstance(normalized_x, (int, float)) or not isinstance(
+            normalized_y, (int, float)
+        ):
+            continue
+        x = int(round((1.0 - float(normalized_x)) * (width - 1)))
+        y = int(round(float(normalized_y) * (height - 1)))
+        label = str(detected_hand.get("handedness") or "UNKNOWN").upper()
+        score = detected_hand.get("handedness_score")
+        if isinstance(score, (int, float)):
+            label = f"MP {label} {float(score):.2f}"
+        else:
+            label = f"MP {label}"
+        color = (
+            (60, 230, 60)
+            if detected_hand.get("selected")
+            else (230, 80, 230)
+        )
+        cv2.putText(
+            frame,
+            label,
+            (max(4, min(x + 10, width - 210)), max(24, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
     return frame
 
 
@@ -573,6 +648,52 @@ def draw_tracking_status_overlay(frame, track_action, hand_interface):
     return frame
 
 
+def draw_pipeline_fps_overlay(frame, camera_fps, yolo_fps, hand_fps):
+    """Draw measured camera, YOLO, and MediaPipe hand inference rates."""
+    rows = (
+        f"CAMERA     {float(camera_fps):4.1f} FPS",
+        f"YOLO       {float(yolo_fps):4.1f} FPS",
+        f"HAND DET   {float(hand_fps):4.1f} FPS",
+    )
+    width = frame.shape[1]
+    scale = max(0.50, min(0.72, width / 1800.0))
+    thickness = 2
+    text_sizes = [
+        cv2.getTextSize(row, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        for row in rows
+    ]
+    text_width = max(size[0][0] for size in text_sizes)
+    text_height = max(size[0][1] for size in text_sizes)
+    baseline = max(size[1] for size in text_sizes)
+    padding = max(7, int(round(10 * scale)))
+    row_height = text_height + baseline + padding
+    panel_height = row_height * len(rows) + padding
+    x = max(4, width - text_width - padding * 2 - 12)
+    y = 12
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x, y),
+        (min(width - 4, x + text_width + padding * 2),
+         y + panel_height),
+        (5, 5, 5),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+    for index, row in enumerate(rows):
+        cv2.putText(
+            frame,
+            row,
+            (x + padding, y + padding + text_height + index * row_height),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (80, 240, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+    return frame
+
+
 async def display_camera_loop(
     camera, csrt_tracker, yolo, track_action, hand_interface
 ):
@@ -582,10 +703,21 @@ async def display_camera_loop(
 
     fullscreen_requested = False
     last_fullscreen_attempt = 0.0
+    camera_rate = SequenceFps()
+    yolo_rate = SequenceFps()
+    hand_rate = SequenceFps()
 
     while True:
         try:
             snapshot = camera.snapshot()
+            now = time.monotonic()
+            camera_fps = camera_rate.observe(snapshot.sequence, now)
+            yolo_sequence, _ = yolo.detection_snapshot()
+            yolo_fps = yolo_rate.observe(yolo_sequence, now)
+            hand_status = hand_interface.gesture_status() or {}
+            hand_fps = hand_rate.observe(
+                hand_status.get("inference_sequence"), now
+            )
             display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
             display_frame = draw_tof_overlay(display_frame)
 
@@ -603,6 +735,9 @@ async def display_camera_loop(
             )
             display_frame = draw_tracking_status_overlay(
                 display_frame, track_action, hand_interface
+            )
+            display_frame = draw_pipeline_fps_overlay(
+                display_frame, camera_fps, yolo_fps, hand_fps
             )
             cv2.imshow(window_name, display_frame)
             cv2.waitKey(1)

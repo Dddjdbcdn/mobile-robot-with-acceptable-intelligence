@@ -8,7 +8,9 @@
 #define MAX_PWM_VALUE           65535
 #define DELTA_TIME              10
 #define PULSES_PER_REVOLUTION   1920.0
+#ifndef M_PI
 #define M_PI                    3.14159265358979323846f
+#endif
 #define DEADBAND_PWM            20000
 
 #define SERVO_MIN_PWN           500

@@ -12,10 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cognition.hand.interface import HandGestureInterface
+from cognition.hand.gestures import HandGestureClassifier
 from cognition.manager.world_state import robot_state
 from actions.track_action import TrackAction
 from actions.tracking.stable_seed import StableTargetSeedTracker
-from utilities.camera_sampler import draw_tracking_status_overlay
+from utilities.camera_sampler import (
+    SequenceFps,
+    draw_pipeline_fps_overlay,
+    draw_tracking_status_overlay,
+)
 
 
 def bare_track_action():
@@ -69,12 +74,42 @@ def reversed_x_hand(direction):
     return hand
 
 
-def fingers_down_hand():
-    return reversed_x_hand("down")
-
-
 def push_hand():
     return reversed_x_hand("up")
+
+
+def finger_curl_down_hand():
+    hand = reversed_x_hand("down")
+    for finger in ("index", "middle", "ring", "pinky"):
+        for joint, y in zip(
+            ("mcp", "pip", "dip", "tip"), (0.50, 0.72, 0.66, 0.60)
+        ):
+            hand["landmarks"][f"{finger}_{joint}"]["normalized_y"] = y
+    return hand
+
+
+def finger_curl_up_hand():
+    hand = open_hand("up")
+    for finger in ("index", "middle", "ring", "pinky"):
+        for joint, y in zip(
+            ("mcp", "pip", "dip", "tip"), (0.50, 0.28, 0.34, 0.40)
+        ):
+            hand["landmarks"][f"{finger}_{joint}"]["normalized_y"] = y
+    return hand
+
+
+def follow_hand():
+    hand = open_hand("down")
+    thumb_ip_x = hand["landmarks"]["thumb_ip"]["normalized_x"]
+    hand["landmarks"]["thumb_tip"]["normalized_x"] = thumb_ip_x + 0.04
+    return hand
+
+
+def get_space_hand():
+    hand = push_hand()
+    thumb_ip_x = hand["landmarks"]["thumb_ip"]["normalized_x"]
+    hand["landmarks"]["thumb_tip"]["normalized_x"] = thumb_ip_x - 0.04
+    return hand
 
 
 def folded_hand(index_up=False):
@@ -141,19 +176,15 @@ class HandPoseTests(unittest.TestCase):
         pose = HandGestureInterface.classify_hand_pose(hand)
 
         self.assertEqual(pose["gesture"], "open_other")
-        self.assertTrue(pose["gesture_checks"]["all_fingers_straight"])
         self.assertFalse(pose["gesture_checks"]["hand_tip_order"])
 
-    def test_thumb_x_position_does_not_affect_welcome_order(self):
-        hand = open_hand("down")
-        for joint, x in zip(
-            ("cmc", "mcp", "ip", "tip"), (0.70, 0.73, 0.76, 0.79)
-        ):
-            hand["landmarks"][f"thumb_{joint}"]["normalized_x"] = x
+    def test_thumb_tip_right_of_ip_is_follow(self):
+        hand = follow_hand()
 
         pose = HandGestureInterface.classify_hand_pose(hand)
 
-        self.assertEqual(pose["gesture"], "welcome")
+        self.assertEqual(pose["gesture"], "follow")
+        self.assertTrue(pose["gesture_checks"]["thumb_tip_right_of_ip"])
         self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
 
     def test_non_descending_finger_is_not_welcome(self):
@@ -166,31 +197,25 @@ class HandPoseTests(unittest.TestCase):
         pose = HandGestureInterface.classify_hand_pose(hand)
 
         self.assertEqual(pose["gesture"], "open_other")
-        self.assertTrue(pose["gesture_checks"]["all_fingers_straight"])
         self.assertFalse(pose["gesture_checks"]["welcome_y_order"])
 
-    def test_bent_thumb_is_not_welcome(self):
-        hand = open_hand("down")
-        hand["landmarks"]["thumb_tip"] = {
-            "normalized_x": 0.37,
-            "normalized_y": 0.53,
-        }
+    def test_thumb_state_uses_x_order_without_bend_angle(self):
+        hand = follow_hand()
 
         pose = HandGestureInterface.classify_hand_pose(hand)
 
-        self.assertEqual(pose["gesture"], "open_other")
-        self.assertEqual(pose["open_fingers"], 4)
-        self.assertFalse(pose["gesture_checks"]["all_fingers_straight"])
+        self.assertEqual(pose["gesture"], "follow")
+        self.assertNotIn("bend_deg", pose["fingers"]["thumb"])
 
-    def test_upward_finger_flick_is_distinct(self):
-        pose = HandGestureInterface.classify_hand_pose(open_hand("up"))
-        self.assertEqual(pose["gesture"], "fingers_up")
-        self.assertEqual(pose["open_fingers"], 5)
-        self.assertTrue(pose["gesture_checks"]["fingers_up_y_order"])
+    def test_upward_finger_curl_is_distinct(self):
+        pose = HandGestureInterface.classify_hand_pose(finger_curl_up_hand())
+        self.assertEqual(pose["gesture"], "finger_curl_up")
+        self.assertEqual(pose["open_fingers"], 1)
+        self.assertTrue(pose["gesture_checks"]["long_fingers_curl_up"])
         self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
 
-    def test_fingers_up_does_not_check_thumb_y_order(self):
-        hand = open_hand("up")
+    def test_finger_curl_up_does_not_check_thumb_y_order(self):
+        hand = finger_curl_up_hand()
         for joint, y in zip(
             ("cmc", "mcp", "ip", "tip"), (0.44, 0.47, 0.50, 0.53)
         ):
@@ -198,15 +223,49 @@ class HandPoseTests(unittest.TestCase):
 
         pose = HandGestureInterface.classify_hand_pose(hand)
 
-        self.assertEqual(pose["gesture"], "fingers_up")
+        self.assertEqual(pose["gesture"], "finger_curl_up")
 
-    def test_fingers_down_uses_welcome_y_and_reversed_tip_order(self):
-        pose = HandGestureInterface.classify_hand_pose(fingers_down_hand())
+    def test_get_space_uses_upward_reverse_order_and_left_thumb_tip(self):
+        pose = HandGestureInterface.classify_hand_pose(get_space_hand())
 
-        self.assertEqual(pose["gesture"], "fingers_down")
-        self.assertTrue(pose["gesture_checks"]["welcome_y_order"])
-        self.assertTrue(pose["gesture_checks"]["fingers_down"])
+        self.assertEqual(pose["gesture"], "get_space")
+        self.assertTrue(pose["gesture_checks"]["fingers_up_y_order"])
+        self.assertTrue(pose["gesture_checks"]["get_space"])
+        self.assertTrue(pose["gesture_checks"]["thumb_tip_left_of_ip"])
         self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+
+    def test_finger_curl_down_keeps_reverse_order_pose(self):
+        pose = HandGestureInterface.classify_hand_pose(finger_curl_down_hand())
+
+        self.assertEqual(pose["gesture"], "finger_curl_down")
+        self.assertTrue(pose["gesture_checks"]["long_fingers_curl_down"])
+        self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+
+    def test_axis_order_can_compare_arbitrary_landmark_groups(self):
+        landmarks = open_hand("down")["landmarks"]
+
+        self.assertTrue(HandGestureClassifier._axis_order(
+            landmarks,
+            "y",
+            "index_mcp",
+            "index_pip",
+            "index_dip",
+            "index_tip",
+        ))
+        self.assertTrue(HandGestureClassifier._axis_order(
+            landmarks,
+            "y",
+            "middle_tip",
+            ("index_pip", "ring_pip"),
+            relation=">",
+        ))
+        self.assertTrue(HandGestureClassifier._axis_order(
+            landmarks,
+            "x",
+            "middle_tip",
+            "index_tip",
+            relation=lambda left, right: left >= right + 0.05,
+        ))
 
     def test_push_uses_upward_fingers_thumb_and_reversed_tip_order(self):
         pose = HandGestureInterface.classify_hand_pose(push_hand())
@@ -214,29 +273,29 @@ class HandPoseTests(unittest.TestCase):
         self.assertEqual(pose["gesture"], "push")
         self.assertTrue(pose["gesture_checks"]["fingers_up_y_order"])
         self.assertTrue(pose["gesture_checks"]["push_thumb_y_order"])
+        self.assertTrue(pose["gesture_checks"]["thumb_tip_right_of_ip"])
         self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
 
-    def test_thumb_x_position_does_not_affect_fingers_down_order(self):
-        hand = fingers_down_hand()
-        for joint, x in zip(
-            ("cmc", "mcp", "ip", "tip"), (0.19, 0.16, 0.13, 0.10)
-        ):
-            hand["landmarks"][f"thumb_{joint}"]["normalized_x"] = x
+    def test_thumb_x_order_has_no_dead_zone(self):
+        hand = open_hand("down")
+        thumb_ip_x = hand["landmarks"]["thumb_ip"]["normalized_x"]
+        hand["landmarks"]["thumb_tip"]["normalized_x"] = thumb_ip_x + 0.005
 
         pose = HandGestureInterface.classify_hand_pose(hand)
 
-        self.assertEqual(pose["gesture"], "fingers_down")
-        self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+        self.assertEqual(pose["gesture"], "follow")
+        self.assertFalse(pose["gesture_checks"]["welcome"])
+        self.assertTrue(pose["gesture_checks"]["follow"])
 
-    def test_media_pipe_left_label_does_not_change_fingers_down_order(self):
-        hand = fingers_down_hand()
+    def test_media_pipe_left_label_does_not_change_get_space_order(self):
+        hand = get_space_hand()
         hand["handedness"] = "Left"
         pose = HandGestureInterface.classify_hand_pose(hand)
 
-        self.assertEqual(pose["gesture"], "fingers_down")
+        self.assertEqual(pose["gesture"], "get_space")
         self.assertEqual(pose["gesture_checks"]["handedness"], "Right")
 
-    def test_thumb_up_requires_straight_thumb_above_folded_fingers(self):
+    def test_thumb_up_requires_thumb_above_folded_fingers(self):
         pose = HandGestureInterface.classify_hand_pose(folded_hand())
 
         self.assertEqual(pose["gesture"], "thumb_up")
@@ -254,23 +313,11 @@ class HandPoseTests(unittest.TestCase):
         self.assertNotEqual(pose["gesture"], "thumb_up")
         self.assertFalse(pose["gesture_checks"]["thumb_up"])
 
-    def test_index_finger_keeps_middle_ring_and_pinky_folded(self):
+    def test_index_finger_pose_is_no_longer_a_gesture(self):
         pose = HandGestureInterface.classify_hand_pose(folded_hand(index_up=True))
 
-        self.assertEqual(pose["gesture"], "index_finger")
-        self.assertTrue(pose["gesture_checks"]["index_finger"])
-
-    def test_index_finger_checks_folded_fingers_on_y_axis(self):
-        hand = folded_hand(index_up=True)
-        for name in ("middle", "ring", "pinky"):
-            landmarks = hand["landmarks"]
-            mcp_x = landmarks[f"{name}_mcp"]["normalized_x"]
-            landmarks[f"{name}_pip"]["normalized_x"] = mcp_x - 0.02
-
-        pose = HandGestureInterface.classify_hand_pose(hand)
-
-        self.assertEqual(pose["gesture"], "index_finger")
-        self.assertTrue(pose["gesture_checks"]["index_finger"])
+        self.assertEqual(pose["gesture"], "open_other")
+        self.assertNotIn("index_finger", pose["gesture_checks"])
 
 
 class HandTrackingOverrideTests(unittest.TestCase):
@@ -285,6 +332,18 @@ class HandTrackingOverrideTests(unittest.TestCase):
 
         tracker.set_visual_target_override(0.4, 0.6)
         self.assertIsNone(tracker._current_visual_target_override(-1.0))
+
+    def test_override_is_retained_for_half_a_second(self):
+        tracker = bare_track_action()
+        with patch(
+            "actions.track_action.time.monotonic",
+            side_effect=(10.0, 10.49, 10.51),
+        ):
+            tracker.set_visual_target_override(0.4, 0.6)
+            self.assertEqual(
+                tracker._current_visual_target_override(), (0.4, 0.6)
+            )
+            self.assertIsNone(tracker._current_visual_target_override())
 
 
 class ContinuousPersonReacquisitionTests(unittest.IsolatedAsyncioTestCase):
@@ -388,6 +447,28 @@ class ContinuousPersonReacquisitionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TrackingStatusOverlayTests(unittest.TestCase):
+    def test_sequence_fps_measures_changes_and_expires_when_stale(self):
+        rate = SequenceFps()
+
+        self.assertEqual(rate.observe(10, now=1.0), 0.0)
+        self.assertAlmostEqual(rate.observe(20, now=1.5), 20.0)
+        self.assertAlmostEqual(rate.observe(20, now=2.0), 20.0)
+        self.assertEqual(rate.value(now=2.51), 0.0)
+
+    def test_pipeline_fps_overlay_renders_all_three_rates(self):
+        with patch("utilities.camera_sampler.cv2.putText") as put_text:
+            draw_pipeline_fps_overlay(
+                np.zeros((360, 640, 3), dtype=np.uint8),
+                camera_fps=30.0,
+                yolo_fps=10.0,
+                hand_fps=24.0,
+            )
+
+        rendered_text = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("CAMERA     30.0 FPS", rendered_text)
+        self.assertIn("YOLO       10.0 FPS", rendered_text)
+        self.assertIn("HAND DET   24.0 FPS", rendered_text)
+
     def test_hand_tracking_displays_hand_seed_status(self):
         track_action = Mock(active=True, target="person", action_id="track-1")
         track_action.stable_seeds.status.return_value = {
@@ -423,7 +504,7 @@ class TrackingStatusOverlayTests(unittest.TestCase):
         }
         hand_guidance = Mock()
         hand_guidance.gesture_status.return_value = {
-            "gesture": "fingers_up", "state": "tracking_person",
+            "gesture": "finger_curl_up", "state": "tracking_person",
         }
 
         draw_tracking_status_overlay(
@@ -495,6 +576,23 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         action.set_dispatcher(dispatch or AsyncMock(side_effect=default_dispatch))
         return action
 
+    def test_interface_applies_shared_miss_tolerance(self):
+        action = self.action()
+        confirmations = (
+            action._idle_welcome,
+            action._tracking_thumb_up,
+            action._following_push,
+            action._approaching_push,
+            *action._modifier_confirmations.values(),
+            *action._command_confirmations.values(),
+        )
+
+        self.assertEqual(action.MISS_TOLERANCE, 3)
+        self.assertTrue(all(
+            item.miss_tolerance == action.MISS_TOLERANCE
+            for item in confirmations
+        ))
+
     async def test_welcome_pose_arms_hand_tracking(self):
         action = self.action(tracking_person=False)
         action.hand_landmarks.detect_right_hand = AsyncMock(
@@ -539,6 +637,10 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             action.hand_landmarks.detect_right_hand.await_count,
+            action.IDLE_WELCOME_CONFIRM_FRAMES,
+        )
+        self.assertEqual(
+            action.gesture_status()["inference_sequence"],
             action.IDLE_WELCOME_CONFIRM_FRAMES,
         )
         commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
@@ -690,7 +792,7 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         handler = AsyncMock(side_effect=dispatch)
         action = self.action(handler)
         action.hand_landmarks.detect_right_hand = AsyncMock(
-            return_value=open_hand("up")
+            return_value=finger_curl_up_hand()
         )
         yolo = Mock()
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
@@ -740,7 +842,7 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         commands = [call.args[0] for call in handler.await_args_list]
         self.assertEqual(commands.count("stop_navigation"), 1)
 
-    async def test_push_then_down_flick_returns_then_faces_person(self):
+    async def test_push_then_get_space_moves_to_open_space_and_faces_person(self):
         action = self.action()
         for index in range(action.MODIFIER_CONFIRM_FRAMES):
             await action._observe_gesture("push", (0.5, 0.5))
@@ -748,25 +850,68 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
                 await action._observe_gesture("open_other", None)
         self.assertEqual(action._armed_gesture, "push")
         for index in range(action.COMMAND_CONFIRM_FRAMES):
-            await action._observe_gesture("fingers_down", (0.5, 0.5))
+            await action._observe_gesture("get_space", (0.5, 0.5))
             if index == 0:
                 await action._observe_gesture("open_other", None)
 
-        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
-        self.assertIn("navigation_sequence", commands)
+        navigation_call = next(
+            call for call in action._dispatch_handler.await_args_list
+            if call.args[0] == "navigation_sequence"
+        )
+        self.assertEqual(
+            navigation_call.args[1]["commands"],
+            ["open_space_middle", "face_person"],
+        )
 
-    async def test_down_flick_without_push_pose_does_nothing(self):
+    async def test_get_space_without_push_pose_does_nothing(self):
         action = self.action()
 
         for _ in range(action.COMMAND_CONFIRM_FRAMES):
-            await action._observe_gesture("fingers_down", (0.5, 0.5))
+            await action._observe_gesture("get_space", (0.5, 0.5))
 
         self.assertIsNone(action._armed_gesture)
 
-    async def test_fingers_down_pose_restores_person_tracking(self):
+    async def test_push_then_finger_curl_down_backs_up_without_prior_approach(self):
+        action = self.action()
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("finger_curl_down", (0.5, 0.5))
+
+        navigation_call = next(
+            call for call in action._dispatch_handler.await_args_list
+            if call.args[0] == "explicit_navigation"
+        )
+        self.assertEqual(
+            navigation_call.args[1],
+            {"local_command": "nudge_backward", "room_id": None},
+        )
+
+    async def test_finger_curl_down_returns_after_prior_approach(self):
+        action = self.action()
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("welcome", (0.5, 0.5))
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("finger_curl_up", (0.5, 0.5))
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("finger_curl_down", (0.5, 0.5))
+
+        navigation_call = next(
+            call for call in action._dispatch_handler.await_args_list
+            if call.args[0] == "navigation_sequence"
+        )
+        self.assertEqual(
+            navigation_call.args[1]["commands"],
+            ["previous_position", "face_person"],
+        )
+        self.assertFalse(action._approach_was_requested)
+
+    async def test_get_space_pose_reaches_gesture_observer(self):
         action = self.action()
         action.hand_landmarks.detect_right_hand = AsyncMock(
-            return_value=fingers_down_hand()
+            return_value=get_space_hand()
         )
         yolo = Mock()
         yolo.detection_snapshot_with_frame.return_value = (
@@ -780,7 +925,7 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
 
         observe_call = action._dispatch_handler.await_args_list[-1]
         self.assertEqual(observe_call.args[0], "observe_gesture")
-        self.assertEqual(observe_call.args[1]["gesture"], "fingers_down")
+        self.assertEqual(observe_call.args[1]["gesture"], "get_space")
 
     async def test_one_bad_frame_does_not_clear_welcome_confirmation(self):
         action = self.action(tracking_person=False)
@@ -801,17 +946,13 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.count("observe_gesture"), 11)
         self.assertEqual(commands[-1], "watch_target")
 
-    async def test_push_after_push_nudges_backward(self):
+    async def test_get_space_requires_push_modifier(self):
         action = self.action()
-        action._last_command_gesture = "push"
-        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
-            await action._observe_gesture("push", (0.5, 0.5))
         for _ in range(action.COMMAND_CONFIRM_FRAMES):
-            await action._observe_gesture("fingers_down", (0.5, 0.5))
+            await action._observe_gesture("get_space", (0.5, 0.5))
 
         commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
-        self.assertIn("explicit_navigation", commands)
-        self.assertIsNone(action._last_command_gesture)
+        self.assertNotIn("navigation_sequence", commands)
 
     async def test_welcome_is_accepted_after_approach(self):
         action = self.action()
@@ -840,13 +981,16 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stop_call.args[1]["reason"], "HAND_THUMB_UP")
 
-    async def test_welcome_then_index_starts_following(self):
+    async def test_welcome_then_follow_starts_following_after_two_frames(self):
         action = self.action()
 
         for _ in range(action.MODIFIER_CONFIRM_FRAMES):
             await action._observe_gesture("welcome", (0.5, 0.5))
-        for _ in range(action.COMMAND_CONFIRM_FRAMES):
-            await action._observe_gesture("index_finger", (0.5, 0.4))
+        await action._observe_gesture("follow", (0.5, 0.4))
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertNotIn("follow_person", commands)
+
+        await action._observe_gesture("follow", (0.5, 0.4))
 
         commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
         self.assertIn("follow_person", commands)
@@ -960,7 +1104,7 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(context["tracking_person"])
 
-    async def test_run_holds_always_on_yolo_pose_lease(self):
+    async def test_run_consumes_always_on_yolo_pose_stream(self):
         action = self.action()
         yolo = Mock()
 
@@ -971,8 +1115,8 @@ class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
         with patch("cognition.hand.interface.asyncio.sleep", AsyncMock()):
             await action.run(yolo)
 
-        yolo.activate.assert_called_once_with(action.YOLO_OWNER, "pose")
-        yolo.deactivate.assert_called_once_with(action.YOLO_OWNER)
+        yolo.activate.assert_not_called()
+        yolo.deactivate.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -372,8 +372,7 @@ SMALL_BRAIN/vision_models/groundingdino_tools/GroundingDINO/
 SMALL_BRAIN/vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml
 SMALL_BRAIN/vision_models/depthanything_tools/openvino_models/dav2_metric_indoor_vitb_896x504_fp16.xml
 SMALL_BRAIN/vision_models/sam2_tools/models/sam2.1_hiera_b+_openvino/
-SMALL_BRAIN/vision_models/yolo_tools/yolo11m-pose_openvino_model/
-SMALL_BRAIN/vision_models/yolo_tools/yoloe-11m_openvino_model/
+SMALL_BRAIN/vision_models/yolo_tools/yolo11n-pose_openvino_model/
 ```
 
 OpenVINO `.xml` models require their matching `.bin` files in the same
@@ -385,7 +384,6 @@ Relevant tools:
 SMALL_BRAIN/vision_models/groundingdino_tools/README.md
 SMALL_BRAIN/vision_models/depthanything_tools/export_depthanything.py
 SMALL_BRAIN/vision_models/sam2_tools/export_sam2_openvino.py
-SMALL_BRAIN/vision_models/yolo_tools/export_yolo.py
 SMALL_BRAIN/vision_models/yolo_tools/export_yolo_pose.py
 ```
 

@@ -1,12 +1,5 @@
 """Trackable target catalogs and name normalization."""
 
-DJ_YOLO_CLASSES = [
-    "guitar", "chair", "table", "person", "laptop", "door",
-    "television", "fan", "bottle", "mirror", "toolbox", "dumbbell",
-    "camera", "houseplant", "curtain", "power socket", "book",
-    "microphone", "smartphone", "air conditioner", "remote control",
-]
-
 HUMAN_RETARGETS = {
     "person": ["torso_center"],
     "human": ["torso_center"],
@@ -149,8 +142,3 @@ def normalize_object_target(target):
     normalized = normalized.replace("'s", "").replace("-", " ").replace("_", " ")
     normalized = " ".join(normalized.split())
     return OBJECT_ALIASES.get(normalized, normalized)
-
-
-def is_yolo_trackable_target(target):
-    normalized = normalize_human_target(target) or normalize_object_target(target)
-    return normalized in HUMAN_TRACKABLE_PARTS or normalized in DJ_YOLO_CLASSES
