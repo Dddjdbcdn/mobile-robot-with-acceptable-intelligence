@@ -36,7 +36,7 @@ class CameraServo:
         self.command_lock = threading.Lock()
         self._latency_window_started = time.monotonic()
         self._latency_samples = []
-        self.Kp = 0.15
+        self.Kp = 0.1
         self.deadband_degrees = 0.5
         self.max_step_degrees = 4.0
 

@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from actions.action_result import ActionResult
-from actions.tracking.target_catalog import (
-    normalize_human_target,
-    normalize_object_target,
-)
 
 
 class ApproachAction:
-    """Dispatch one tracked-target Nav2 approach and report its result."""
+    """Navigate to one already-resolved approach location."""
 
-    def __init__(self, send_robot_command, track_action):
+    def __init__(self, send_robot_command):
         self.send_robot_command = send_robot_command
-        self.track_action = track_action
         self.active = False
         self.action_id: str | None = None
         self.target: str | None = None
@@ -21,10 +17,7 @@ class ApproachAction:
         self._navigation_attempts = 0
         self._last_destination: dict | None = None
 
-    async def start_approaching(self, target, action_id, standoff_m=None):
-        normalized_target = (
-            normalize_human_target(target) or normalize_object_target(target)
-        )
+    async def start(self, location, action_id, target=None, standoff_m=None):
         if self.active:
             return ActionResult(
                 action_id=action_id,
@@ -37,43 +30,31 @@ class ApproachAction:
                 data={"active_action_id": self.action_id},
             )
 
-        if (
-            not self.track_action.active
-            or normalized_target != self.track_action.target
-        ):
-            return ActionResult(
-                action_id=action_id,
-                action_type="approach_action",
-                status="failed",
-                target=target,
-                outcome="precondition_failed",
-                reason_code="TARGET_NOT_TRACKED",
-                retryable=True,
-            )
-
-        tracking_session_id = self.track_action.action_id
-        seed = await self.track_action.wait_for_stable_target_seed(
-            self.track_action.TRACKED_TARGET_SEED_OWNER,
-            target=normalized_target,
-            session_id=tracking_session_id,
-            timeout=10.0,
+        required = ("x", "y", "angle", "tof_range")
+        valid_location = isinstance(location, dict) and all(
+            name in location
+            and not isinstance(location[name], bool)
+            and isinstance(location[name], (int, float))
+            and math.isfinite(float(location[name]))
+            for name in required
         )
-        if seed is None:
+        if valid_location:
+            valid_location = float(location["tof_range"]) > 0.0
+        if not valid_location:
             return ActionResult(
                 action_id=action_id,
                 action_type="approach_action",
                 status="failed",
                 target=target,
-                outcome="stable_seed_timeout",
-                reason_code="STABLE_SEED_TIMEOUT",
-                retryable=True,
+                outcome="invalid_location",
+                reason_code="INVALID_APPROACH_LOCATION",
             )
 
         raw_destination = {
-            "x": seed["x"],
-            "y": seed["y"],
-            "angle": seed["angle"],
-            "tof_range": seed["tof_range"],
+            "x": location["x"],
+            "y": location["y"],
+            "angle": location["angle"],
+            "tof_range": location["tof_range"],
         }
 
         self.completion_future = asyncio.get_running_loop().create_future()
@@ -120,12 +101,11 @@ class ApproachAction:
             target=target,
             outcome="approaching",
             data={
-                "stable_seed": dict(seed),
+                "approach_location": dict(location),
                 "raw_destination": dict(raw_destination),
                 "destination": dict(self._last_destination or raw_destination),
             },
         )
-
 
     async def wait_until_finished(self):
         return await self.completion_future

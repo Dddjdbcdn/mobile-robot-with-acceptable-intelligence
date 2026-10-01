@@ -103,6 +103,22 @@ class LLMRosBridge(Node):
                 self.get_parameter("follow_heading_critical_deg").value
             ),
         )
+        self.declare_parameter("track_body_pan_margin_deg", 15.0)
+        self.declare_parameter("track_body_pan_hysteresis_deg", 5.0)
+        self.declare_parameter("track_body_kp", 0.08)
+        self.declare_parameter("track_body_max_angular_vel", 1.0)
+        self.track_body_pan_margin_deg = float(
+            self.get_parameter("track_body_pan_margin_deg").value
+        )
+        self.track_body_pan_hysteresis_deg = float(
+            self.get_parameter("track_body_pan_hysteresis_deg").value
+        )
+        self.track_body_kp = float(
+            self.get_parameter("track_body_kp").value
+        )
+        self.track_body_max_angular_vel = float(
+            self.get_parameter("track_body_max_angular_vel").value
+        )
         self.map_image_stream = MapImageStream(self, self.tf_buffer, self.zmq_context)
 
         self.camera_tof_range = 0.0
@@ -123,6 +139,7 @@ class LLMRosBridge(Node):
         self.follow_enabled = False
         self.follow_action_id = None
         self.person_tracker_state = None
+        self.person_tracker_status = {"state": None}
         self.follow_had_person_track = False
         self.latest_person_pose_map = None
         self.latest_person_pose_at = None
@@ -173,6 +190,7 @@ class LLMRosBridge(Node):
                 "robot_pose": self.robot_pose,
                 "person_pose": self._person_state(),
                 "person_tracker_state": self.person_tracker_state,
+                "person_tracker_status": self.person_tracker_status,
                 }
             )
 
@@ -211,6 +229,7 @@ class LLMRosBridge(Node):
         state = str(status.get("state") or "")
         previous = self.person_tracker_state
         self.person_tracker_state = state
+        self.person_tracker_status = status
         if not self.follow_enabled:
             return
 
@@ -453,27 +472,44 @@ class LLMRosBridge(Node):
         )
 
     def track_action_loop(self):
-        remaining_pan_angle = self.servo.publish_servo_command(
-            tracking=True
-        )
+        self.servo.publish_servo_command(tracking=True)
 
         if self.navigation_active:
             self.tracking_body_active = False
             return
 
-        remaining_rad = math.radians(remaining_pan_angle)
+        # Do not wait for a requested servo step to overflow the hard limit.
+        # That overflow exists for only one timer tick, which makes the base
+        # repeatedly start and stop at the camera frame rate.  Instead, turn
+        # continuously whenever the actual pan leaves a soft comfort band.
+        start_margin = max(0.0, self.track_body_pan_margin_deg)
+        release_margin = start_margin + max(
+            0.0, self.track_body_pan_hysteresis_deg
+        )
+        start_low = self.servo.min_pan_angle + start_margin
+        start_high = self.servo.max_pan_angle - start_margin
+        release_low = self.servo.min_pan_angle + release_margin
+        release_high = self.servo.max_pan_angle - release_margin
+        pan_angle = self.servo.pan_angle
 
-        if abs(remaining_rad) <= math.radians(1.0):
-            if self.tracking_body_active:
-                self.publish_cmd(0.0, 0.0)
-                self.tracking_body_active = False
+        should_turn = self.tracking_body_active or (
+            pan_angle < start_low or pan_angle > start_high
+        )
+        if not should_turn:
             return
 
-        body_kp = 100.0
-        ang_vel = body_kp * remaining_rad
+        if pan_angle < release_low:
+            body_pan_error = pan_angle - release_low
+        elif pan_angle > release_high:
+            body_pan_error = pan_angle - release_high
+        else:
+            self.publish_cmd(0.0, 0.0)
+            self.tracking_body_active = False
+            return
 
-        max_ang_vel = 1.0
-        ang_vel = max(min(ang_vel, max_ang_vel),-max_ang_vel)
+        ang_vel = self.track_body_kp * body_pan_error
+        max_ang_vel = max(0.0, self.track_body_max_angular_vel)
+        ang_vel = max(min(ang_vel, max_ang_vel), -max_ang_vel)
 
         self.publish_cmd(0.0, ang_vel)
         self.tracking_body_active = True
@@ -614,9 +650,12 @@ class LLMRosBridge(Node):
                         room_step_commands = {
                             "exit_room", "go_to_another_room"
                         }
+                        map_step_commands = {
+                            *room_step_commands, "open_space_middle"
+                        }
                         if (
                             cmd == "navigate_local"
-                            and request.get("local_command") in room_step_commands
+                            and request.get("local_command") in map_step_commands
                             and (
                                 (
                                     after_revision is not None
@@ -704,6 +743,13 @@ class LLMRosBridge(Node):
                                         })
                                         continue
                                     destination = exit_step["destination"]
+                                elif local_command == "open_space_middle":
+                                    open_space_step = self.map_image_stream.logic.resolve_open_space_middle_step(
+                                        prepared, pose,
+                                        request.get("open_space_state"),
+                                        person_pose=self._person_state(),
+                                    )
+                                    destination = open_space_step["destination"]
                                 elif local_command in {
                                     "go_to_room", "return_to_initial_place"
                                 }:
@@ -800,6 +846,20 @@ class LLMRosBridge(Node):
                         })
                         if exit_step.get("recovery_reason") is not None:
                             response["recovery_reason"] = exit_step[
+                                "recovery_reason"
+                            ]
+                    elif (
+                        cmd == "navigate_local"
+                        and request.get("local_command") == "open_space_middle"
+                    ):
+                        response.update({
+                            "open_space_phase": open_space_step["phase"],
+                            "open_space_state": open_space_step["state"],
+                            "map_revision": map_revision,
+                            "map_received_at_unix_ns": map_received_at,
+                        })
+                        if open_space_step.get("recovery_reason") is not None:
+                            response["recovery_reason"] = open_space_step[
                                 "recovery_reason"
                             ]
                     self.rep_socket.send_json(response)

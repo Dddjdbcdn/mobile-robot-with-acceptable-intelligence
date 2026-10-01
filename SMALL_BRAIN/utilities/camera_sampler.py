@@ -1,9 +1,10 @@
+import asyncio
 import numpy as np
 import cv2
 import time
-import math
 
-from cognition.state import robot_state 
+from cognition.manager.world_state import robot_state
+from services.hand_landmark_service import HAND_CONNECTIONS
 
 camera_horizontal_fov_deg: float = 85.0
 camera_vertical_fov_deg: float = 52.0
@@ -103,8 +104,6 @@ def project_tof_region(
 def draw_tof_overlay(
     frame: np.ndarray,
     stale_after_s: float = 0.5,
-    tracking: bool = False,
-    stable_seed_ready: bool = False,
 ) -> np.ndarray:
     d = robot_state["camera"]
     distance = d["camera_tof_range"]
@@ -148,23 +147,6 @@ def draw_tof_overlay(
         2,
         cv2.LINE_AA,
     )
-
-    # Robot/servo state
-    lines = [
-        f"X {d['object_x']:+.2f}m  Y {d['object_y']:+.2f}m",
-        f"Pan {d['pan_angle']:.1f}  Tilt {d['tilt_angle']:.1f}",
-        f"Tracking: {'YES' if tracking else 'NO'}",
-    ]
-
-    if tracking:
-        lines.append(f"Stable seed: {'YES' if stable_seed_ready else 'NO'}")
-
-    for i, text in enumerate(lines):
-        cv2.putText(
-            frame, text, (20, 35 + i * 25),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-            (255, 255, 255), 2, cv2.LINE_AA
-        )
 
     return frame
 
@@ -448,3 +430,201 @@ def draw_yolo_overlay(frame,yolo):
             )
 
     return frame
+
+
+def draw_hand_landmark_overlay(frame, hand_interface):
+    """Render full-frame hand landmarks."""
+    status = hand_interface.gesture_status()
+    if status is None:
+        return frame
+
+    height, width = frame.shape[:2]
+    landmarks = ((status.get("hand") or {}).get("landmarks") or {})
+    projected = {}
+    for name, point in landmarks.items():
+        normalized_x = point.get("normalized_x")
+        normalized_y = point.get("normalized_y")
+        if not isinstance(normalized_x, (int, float)) or not isinstance(
+            normalized_y, (int, float)
+        ):
+            continue
+        # The camera display is mirrored, while inference coordinates are not.
+        x = int(round((1.0 - float(normalized_x)) * (width - 1)))
+        y = int(round(float(normalized_y) * (height - 1)))
+        projected[name] = (
+            max(0, min(x, width - 1)),
+            max(0, min(y, height - 1)),
+        )
+
+    for start_name, end_name in HAND_CONNECTIONS:
+        start = projected.get(start_name)
+        end = projected.get(end_name)
+        if start is not None and end is not None:
+            cv2.line(frame, start, end, (0, 255, 255), 3, cv2.LINE_AA)
+
+    for point in projected.values():
+        cv2.circle(frame, point, 5, (0, 80, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, point, 5, (255, 255, 255), 1, cv2.LINE_AA)
+
+    return frame
+
+
+def draw_tracking_status_overlay(frame, track_action, hand_interface):
+    """Draw the high-value tracking signals as a readable HUD."""
+    hand_status = hand_interface.gesture_status() or {}
+    seed_target = (
+        "hand"
+        if hand_status.get("gesture") in {"welcome", "push"}
+        and hand_status.get("state") in {
+            "tracking_person", "following",
+        }
+        else track_action.target
+    )
+    seed = track_action.stable_seeds.status(
+        target=seed_target,
+        session_id=track_action.action_id,
+    )
+    if seed["valid"]:
+        seed_value = f"VALID  {seed['valid_for_seconds']:.1f}s"
+        seed_color = (70, 240, 70)
+    elif track_action.active and seed["sample_count"]:
+        seed_value = (
+            f"BUILDING  {seed['sample_count']}/{seed['sample_target']}"
+        )
+        seed_color = (0, 210, 255)
+    else:
+        seed_value = "NO VALID SEED"
+        seed_color = (80, 80, 255)
+
+    lidar = robot_state.get("lidar_person") or {}
+    accepted_age = lidar.get("seed_accepted_age_seconds")
+    if isinstance(accepted_age, (int, float)):
+        accepted_age = float(accepted_age)
+        if accepted_age <= 1.0:
+            lidar_seed_value = f"ACCEPTED  {accepted_age:.1f}s AGO"
+            lidar_seed_color = (70, 240, 70)
+        else:
+            lidar_seed_value = f"STALE  {accepted_age:.1f}s AGO"
+            lidar_seed_color = (80, 80, 255)
+    else:
+        lidar_seed_value = "WAITING"
+        lidar_seed_color = (0, 210, 255)
+
+    lidar_state = str(lidar.get("state") or "offline").upper()
+    pose_age = lidar.get("pose_age_seconds")
+    lidar_pose_value = lidar_state
+    if isinstance(pose_age, (int, float)):
+        lidar_pose_value += f"  {float(pose_age):.1f}s"
+    lidar_pose_color = (
+        (70, 240, 70)
+        if lidar_state in {"TRACKING", "COASTING"}
+        else (0, 210, 255)
+        if lidar_state in {"WAITING", "INITIALIZING", "RECOVERING"}
+        else (80, 80, 255)
+    )
+
+    hand_value = str(hand_status.get("gesture") or "unavailable").upper()
+    hand_state = str(hand_status.get("state") or "watching_person").upper()
+    hand_color = (
+        (0, 255, 255) if hand_value != "UNAVAILABLE" else (170, 170, 170)
+    )
+
+    rows = [
+        ("TOF SEED", seed_value, seed_color),
+        ("LIDAR SEED", lidar_seed_value, lidar_seed_color),
+        ("LIDAR POSE", lidar_pose_value, lidar_pose_color),
+        ("HAND", f"{hand_value}  |  {hand_state}", hand_color),
+    ]
+    width = frame.shape[1]
+    scale = max(0.62, min(1.05, width / 1280.0))
+    row_height = int(round(43 * scale))
+    panel_width = min(width - 24, int(round(610 * scale)))
+    panel_height = row_height * len(rows) + int(round(18 * scale))
+    x1, y1 = 12, 12
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay, (x1, y1), (x1 + panel_width, y1 + panel_height),
+        (5, 5, 5), -1,
+    )
+    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+
+    label_x = x1 + int(round(20 * scale))
+    value_x = x1 + int(round(180 * scale))
+    for index, (label, value, color) in enumerate(rows):
+        baseline_y = y1 + int(round(33 * scale)) + index * row_height
+        cv2.rectangle(
+            frame,
+            (x1, baseline_y - int(round(25 * scale))),
+            (x1 + int(round(7 * scale)), baseline_y + int(round(6 * scale))),
+            color,
+            -1,
+        )
+        cv2.putText(
+            frame, label, (label_x, baseline_y),
+            cv2.FONT_HERSHEY_SIMPLEX, scale * 0.72,
+            (190, 190, 190), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame, value, (value_x, baseline_y),
+            cv2.FONT_HERSHEY_SIMPLEX, scale * 0.82,
+            color, 2, cv2.LINE_AA,
+        )
+    return frame
+
+
+async def display_camera_loop(
+    camera, csrt_tracker, yolo, track_action, hand_interface
+):
+    """Render the complete camera debug view."""
+    window_name = "Robot Vision"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    fullscreen_requested = False
+    last_fullscreen_attempt = 0.0
+
+    while True:
+        try:
+            snapshot = camera.snapshot()
+            display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
+            display_frame = draw_tof_overlay(display_frame)
+
+            tracking_update = csrt_tracker.tracking_update
+            if yolo.detections:
+                display_frame = draw_yolo_overlay(display_frame, yolo)
+            if tracking_update is not None and tracking_update.success:
+                display_frame = draw_csrt_overlay(
+                    display_frame,
+                    tracking_update.target,
+                    tracking_update.bbox_xywh,
+                )
+            display_frame = draw_hand_landmark_overlay(
+                display_frame, hand_interface
+            )
+            display_frame = draw_tracking_status_overlay(
+                display_frame, track_action, hand_interface
+            )
+            cv2.imshow(window_name, display_frame)
+            cv2.waitKey(1)
+
+            now = time.monotonic()
+            if (
+                cv2.getWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN)
+                != cv2.WINDOW_FULLSCREEN
+                and (
+                    not fullscreen_requested
+                    or now - last_fullscreen_attempt >= 0.5
+                )
+            ):
+                cv2.setWindowProperty(
+                    window_name,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
+                fullscreen_requested = True
+                last_fullscreen_attempt = now
+        except RuntimeError:
+            await asyncio.sleep(0.05)
+            continue
+
+        await asyncio.sleep(0.03)

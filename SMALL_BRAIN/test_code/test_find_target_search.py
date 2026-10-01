@@ -25,12 +25,13 @@ from actions.action_result import ActionResult
 from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
 from actions.track_action import TrackAction
-from cognition.find_target_executor import (
+from actions.tracking.stable_seed import StableTargetSeedTracker
+from cognition.sequence.find_target_executor import (
     FindLoopConfig,
     FindTargetExecutor,
 )
-from cognition.follow_person_executor import FollowPersonExecutor
-from cognition.state import robot_state
+from cognition.sequence.follow_person_executor import FollowPersonExecutor
+from cognition.manager.world_state import robot_state
 from robot.map.map_logic import LogicConfig, MapLogic
 from robot.map.map_renderer import MapRenderer
 
@@ -406,6 +407,98 @@ class FindTargetCandidateTests(unittest.TestCase):
         )
         self.assertAlmostEqual(rotation["x"], self.pose["x"])
         self.assertAlmostEqual(rotation["angle"], math.pi / 2.0)
+
+    def test_local_translation_arrives_facing_fresh_lidar_person_pose(self):
+        person = {"x": 1.0, "y": 2.0, "age_seconds": 0.2}
+
+        for command in ("nudge_forward", "furthest_forward"):
+            destination = self.logic.resolve_local_destination(
+                self.prepared, self.pose, command, person_pose=person
+            )
+            expected = math.atan2(
+                person["y"] - destination["y"],
+                person["x"] - destination["x"],
+            )
+            self.assertAlmostEqual(destination["angle"], expected)
+
+    def test_local_translation_keeps_heading_for_stale_person_pose(self):
+        destination = self.logic.resolve_local_destination(
+            self.prepared,
+            self.pose,
+            "nudge_forward",
+            person_pose={"x": 0.0, "y": 2.0, "age_seconds": 1.1},
+        )
+
+        self.assertAlmostEqual(destination["angle"], self.pose["yaw"])
+
+    def test_open_space_middle_targets_the_current_room_core(self):
+        self.grid.data[:] = 100
+        reachable = np.zeros_like(self.grid.data, dtype=bool)
+        reachable[15:46, 10:41] = True
+        self.grid.data[reachable] = 0
+        self.prepared["reachable"] = reachable
+        start_x, start_y = self.grid.world(13, 30)
+        self.pose.update(x=float(start_x), y=float(start_y))
+
+        result = self.logic.resolve_open_space_middle_step(
+            self.prepared, self.pose
+        )
+
+        labels, areas = self.logic._exit_open_components(
+            self.grid, reachable
+        )
+        destination = result["destination"]
+        col, row = (
+            int(value)
+            for value in self.grid.cells(
+                destination["x"], destination["y"]
+            )
+        )
+        self.assertEqual(result["phase"], "move_to_room_core")
+        self.assertGreaterEqual(
+            areas[int(labels[row, col])],
+            self.logic.cfg.exit_component_min_area_m2,
+        )
+
+    def test_open_space_middle_arrives_facing_fresh_lidar_person_pose(self):
+        self.grid.data[:] = 100
+        reachable = np.zeros_like(self.grid.data, dtype=bool)
+        reachable[15:46, 10:41] = True
+        self.grid.data[reachable] = 0
+        self.prepared["reachable"] = reachable
+        start_x, start_y = self.grid.world(13, 30)
+        self.pose.update(x=float(start_x), y=float(start_y))
+        person = {"x": -2.0, "y": 2.0, "age_seconds": 0.1}
+
+        result = self.logic.resolve_open_space_middle_step(
+            self.prepared, self.pose, person_pose=person
+        )
+
+        destination = result["destination"]
+        self.assertAlmostEqual(
+            destination["angle"],
+            math.atan2(
+                person["y"] - destination["y"],
+                person["x"] - destination["x"],
+            ),
+        )
+
+    def test_open_space_middle_explores_when_no_room_core_is_mapped(self):
+        self.grid.data[:] = 100
+        reachable = np.zeros_like(self.grid.data, dtype=bool)
+        reachable[25:36, 5:56] = True
+        self.grid.data[reachable] = 0
+        self.prepared["reachable"] = reachable
+        start_x, start_y = self.grid.world(30, 30)
+        self.pose.update(x=float(start_x), y=float(start_y))
+
+        result = self.logic.resolve_open_space_middle_step(
+            self.prepared, self.pose
+        )
+
+        self.assertEqual(result["phase"], "stabilize_room_map")
+        self.assertEqual(result["recovery_reason"], "no_room_core")
+        self.assertEqual(result["state"]["recovery_moves"], 1)
 
     def test_exit_room_explores_frontier_crosses_boundary_then_completes(self):
         self.grid.data[:] = 100
@@ -1685,7 +1778,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
         tracker.send_robot_command = AsyncMock(return_value={
             "status": "accepted"
         })
-        tracker._publish_person_tracking_state = AsyncMock()
         expected = ActionResult(
             "follow-1:track", "track_action", "failed", target="person"
         )
@@ -1703,7 +1795,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             "action_id": "follow-1:track",
             "reset_camera": False,
         })
-        tracker._publish_person_tracking_state.assert_not_awaited()
 
     async def test_acquisition_searches_then_starts_camera_tracking(self):
         tracker = type("Tracker", (), {"active": False})()
@@ -1744,7 +1835,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             "active": True,
             "target": "person",
             "action_id": "follow-existing:track",
-            "TRACKED_TARGET_SEED_OWNER": "tracked_target",
         })()
         tracker.adopt_person_tracking = AsyncMock(return_value=True)
         tracker.wait_for_stable_target_seed = AsyncMock(return_value={
@@ -1770,7 +1860,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             continuous_person_reacquisition=True,
         )
         tracker.wait_for_stable_target_seed.assert_awaited_once_with(
-            "tracked_target",
             target="person",
             session_id="follow-existing:track",
             timeout=10.0,
@@ -1833,7 +1922,7 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             "command": "stop_follow_action",
             "action_id": "follow-1",
         })
-        tracker.stop_tracking.assert_awaited_once_with("USER_REQUESTED")
+        tracker.stop_tracking.assert_not_awaited()
 
     async def test_camera_tracking_end_restarts_camera_without_stopping_follow(self):
         executor = FollowPersonExecutor.__new__(FollowPersonExecutor)
@@ -1864,7 +1953,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
         executor.track_action.wait_until_finished = AsyncMock(
             side_effect=wait_until_finished
         )
-        executor.track_action.keep_person_tracker_alive = AsyncMock()
         executor.track_action.start_tracking = AsyncMock(return_value=ActionResult(
             "track", "track_action", "running", target="person"
         ))
@@ -1880,9 +1968,6 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0]["command"] for call in
              executor.send_robot_command.await_args_list],
             ["follow_action"],
-        )
-        executor.track_action.keep_person_tracker_alive.assert_awaited_once_with(
-            "follow-1:track"
         )
         executor.track_action.start_tracking.assert_awaited_once_with(
             target="torso center",
@@ -1920,9 +2005,7 @@ class FollowPersonExecutorTests(unittest.IsolatedAsyncioTestCase):
             "command": "stop_follow_action",
             "action_id": "follow-1",
         })
-        executor.track_action.stop_tracking.assert_awaited_once_with(
-            "LIDAR_TRACK_LOST"
-        )
+        executor.track_action.stop_tracking.assert_not_awaited()
         result = executor.completion_future.result()
         self.assertEqual(result.outcome, "target_lost")
         self.assertEqual(result.reason_code, "LIDAR_TRACK_LOST")
@@ -1997,32 +2080,28 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("faced_known_person", executor._completed_steps)
         executor._search_environment.assert_awaited_once_with()
 
-    async def test_acquisition_waits_for_current_session_seed(self):
+    async def test_acquisition_returns_after_tracking_starts(self):
         executor = FindTargetExecutor.__new__(FindTargetExecutor)
         executor.action_id = "follow-1:acquire-person"
         executor.target = "person"
+        executor.target_kind = "person"
         executor._completed_steps = []
         executor._track = AsyncMock(return_value=ActionResult(
-            "track", "track_action", "succeeded", target="person"
+            "track", "track_action", "succeeded", target="person",
+            data={"detection_source": "yolo_pose"},
         ))
         executor.track_action = type("Tracker", (), {})()
-        executor.track_action.action_id = "track-person"
-        executor.track_action.target = "person"
-        executor.track_action.TRACKED_TARGET_SEED_OWNER = "tracked_target"
         executor.track_action.wait_for_stable_target_seed = AsyncMock(
-            return_value={"target": "person", "session_id": "track-person"}
+            side_effect=AssertionError("find must not wait for a seed")
         )
 
         result = await executor._acquire_person_without_approach(0)
 
         self.assertEqual(result.status, "succeeded")
         self.assertTrue(result.data["tracking_active"])
-        executor.track_action.wait_for_stable_target_seed.assert_awaited_once_with(
-            "tracked_target",
-            target="person",
-            session_id="track-person",
-            timeout=10.0,
-        )
+        self.assertEqual(result.data["detection_source"], "yolo_pose")
+        self.assertEqual(result.outcome, "target_tracking_started")
+        executor.track_action.wait_for_stable_target_seed.assert_not_awaited()
 
     def setUp(self):
         self.saved_pose = robot_state.get("pose")
@@ -2035,6 +2114,7 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
 
     def test_person_seed_uses_pose_mask_and_bounded_map_motion(self):
         tracker = TrackAction.__new__(TrackAction)
+        tracker.stable_seeds = StableTargetSeedTracker()
         tracker.camera = Mock()
         tracker.camera.snapshot.return_value = type("Frame", (), {
             "tracking_bgr": np.zeros((360, 640, 3), dtype=np.uint8),
@@ -2126,20 +2206,14 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(approach.active)
 
     async def test_approach_sends_one_resolved_navigation_command(self):
-        tracker = type("Tracker", (), {
-            "active": True,
-            "target": "bottle",
-            "action_id": "track-bottle",
-            "TRACKED_TARGET_SEED_OWNER": "tracked_target",
-        })()
-        tracker.wait_for_stable_target_seed = AsyncMock(return_value={
+        location = {
             "x": 4.0,
             "y": 0.5,
             "angle": 0.12,
             "tof_range": 4.1,
             "target": "bottle",
             "session_id": "track-bottle",
-        })
+        }
         resolved = {
             "x": 2.0,
             "y": 3.0,
@@ -2152,17 +2226,14 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
             "status": "accepted",
             "destination": resolved,
         })
-        approach = ApproachAction(send_robot_command, tracker)
-        result = await approach.start_approaching("bottle", "approach-2")
+        approach = ApproachAction(send_robot_command)
+        result = await approach.start(
+            location, "approach-2", target="bottle"
+        )
 
         self.assertEqual(result.status, "running")
         self.assertEqual(result.data["destination"], resolved)
-        tracker.wait_for_stable_target_seed.assert_awaited_once_with(
-            "tracked_target",
-            target="bottle",
-            session_id="track-bottle",
-            timeout=10.0,
-        )
+        self.assertEqual(result.data["approach_location"], location)
         self.assertEqual(
             send_robot_command.await_args_list,
             [
@@ -2176,6 +2247,58 @@ class PostApproachReacquisitionTests(unittest.IsolatedAsyncioTestCase):
                     "tof_range": 4.1,
                 }),
             ],
+        )
+
+    async def test_approach_rejects_invalid_location_without_navigation(self):
+        send_robot_command = AsyncMock()
+        approach = ApproachAction(send_robot_command)
+
+        result = await approach.start(
+            {"x": 1.0, "y": 0.0, "angle": 0.0, "tof_range": float("nan")},
+            "approach-invalid",
+            target="bottle",
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason_code, "INVALID_APPROACH_LOCATION")
+        send_robot_command.assert_not_awaited()
+
+    async def test_find_executor_resolves_location_before_approach(self):
+        executor = FindTargetExecutor.__new__(FindTargetExecutor)
+        executor.action_id = "find-1"
+        executor.target = "bottle"
+        executor._approach_standoff_m = 0.3
+        executor._approach_result_data = {}
+        location = {
+            "x": 1.2,
+            "y": 0.1,
+            "angle": 0.05,
+            "tof_range": 1.3,
+        }
+        executor.track_action = type("Tracker", (), {
+            "action_id": "find-1:track",
+            "wait_for_stable_target_seed": AsyncMock(return_value=location),
+        })()
+        executor.approach_action = type("Approach", (), {
+            "start": AsyncMock(return_value=ActionResult(
+                "find-1:approach", "approach_action", "succeeded",
+                target="bottle", data={"destination": {"x": 1.0}},
+            )),
+        })()
+
+        result = await executor._approach()
+
+        self.assertEqual(result.status, "succeeded")
+        executor.track_action.wait_for_stable_target_seed.assert_awaited_once_with(
+            target="bottle",
+            session_id="find-1:track",
+            timeout=10.0,
+        )
+        executor.approach_action.start.assert_awaited_once_with(
+            location=location,
+            action_id="find-1:approach",
+            target="bottle",
+            standoff_m=0.3,
         )
 
     async def test_track_approach_and_reacquire_uses_max_effort(self):

@@ -6,17 +6,15 @@ from pathlib import Path
 import queue
 import sys
 import threading
-import time
 
 import cv2
-import numpy as np
 import pyaudio
 import websockets
 import zmq
 import zmq.asyncio
 from typing import Any
 
-from utilities.camera_sampler import draw_tof_overlay,draw_yolo_overlay,draw_csrt_overlay
+from utilities.camera_sampler import display_camera_loop
 
 from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
@@ -33,17 +31,15 @@ from services.response_manager import ResponseManager
 from services.groundingdino_service import GroundingDINOService
 from services.csrt_tracker import CSRTTrackingManager
 from services.depthanything_service import DepthAnythingService # unused
-from services.hand_landmark_service import HAND_CONNECTIONS, HandLandmarkService
+from services.hand_landmark_service import HandLandmarkService
 from services.sam2_service import SAM2OpenVINOService # unused
 from services.yolo_service import YoloService
 
-from cognition.cognition_manager import CognitionManager
-from cognition.follow_person_executor import FollowPersonExecutor
-from cognition.find_target_executor import FindTargetExecutor
-from cognition.hand_guided_navigation import (
-    HandGuidedNavigation,
-)
-from cognition.state import update_state
+from cognition.manager.cognition_manager import CognitionManager
+from cognition.sequence.follow_person_executor import FollowPersonExecutor
+from cognition.sequence.find_target_executor import FindTargetExecutor
+from cognition.hand.interface import HandGestureInterface
+from cognition.manager.world_state import update_state
 
 context = zmq.asyncio.Context()
 
@@ -124,8 +120,7 @@ async def background_status_monitor(cognitive_manager):
                 update_state(message)
                 active_tracker = cognitive_manager.track_action
                 stable_seed = (
-                    active_tracker.get_stable_target_seed(
-                        active_tracker.TRACKED_TARGET_SEED_OWNER,
+                    active_tracker.stable_seeds.get(
                         target=active_tracker.target,
                         session_id=active_tracker.action_id,
                     )
@@ -288,120 +283,6 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
-def draw_hand_landmark_overlay(frame, hand_guidance):
-    """Render full-frame hand landmarks plus the navigation gesture."""
-    status = hand_guidance.gesture_status()
-    if status is None:
-        return frame
-
-    height, width = frame.shape[:2]
-    landmarks = ((status.get("hand") or {}).get("landmarks") or {})
-    projected = {}
-    for name, point in landmarks.items():
-        normalized_x = point.get("normalized_x")
-        normalized_y = point.get("normalized_y")
-        if not isinstance(normalized_x, (int, float)) or not isinstance(
-            normalized_y, (int, float)
-        ):
-            continue
-        # The camera display is mirrored, while inference coordinates are not.
-        x = int(round((1.0 - float(normalized_x)) * (width - 1)))
-        y = int(round(float(normalized_y) * (height - 1)))
-        projected[name] = (
-            max(0, min(x, width - 1)),
-            max(0, min(y, height - 1)),
-        )
-
-    for start_name, end_name in HAND_CONNECTIONS:
-        start = projected.get(start_name)
-        end = projected.get(end_name)
-        if start is not None and end is not None:
-            cv2.line(frame, start, end, (0, 255, 255), 3, cv2.LINE_AA)
-
-    for point in projected.values():
-        cv2.circle(frame, point, 5, (0, 80, 255), -1, cv2.LINE_AA)
-        cv2.circle(frame, point, 5, (255, 255, 255), 1, cv2.LINE_AA)
-
-    gesture_label = str(status.get("gesture") or "unavailable").upper()
-    state_label = str(status.get("state") or "watching_person").upper()
-
-    panel_width = min(300, max(220, width // 4))
-    panel_height = 76
-    x1 = width - panel_width - 12
-    y1 = 12
-    cv2.rectangle(
-        frame, (x1, y1), (x1 + panel_width, y1 + panel_height),
-        (0, 0, 0), -1,
-    )
-    font_scale = max(0.58, min(0.9, width / 1400.0))
-    cv2.putText(
-        frame, gesture_label, (x1 + 10, y1 + 29),
-        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-        (0, 255, 255), 2, cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame, state_label, (x1 + 10, y1 + 60),
-        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.75,
-        (255, 255, 255), 2, cv2.LINE_AA,
-    )
-    return frame
-
-
-async def display_camera_loop(
-    camera, csrt_tracker, yolo, track_action, hand_guidance
-):
-    window_name = "Robot Vision"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    fullscreen_requested = False
-    last_fullscreen_attempt = 0.0
-
-    while True:
-        try:
-            snapshot = camera.snapshot()
-            display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
-
-            display_frame = draw_tof_overlay(
-                display_frame,
-                tracking=track_action.active,
-                stable_seed_ready=(
-                    track_action.get_stable_target_seed(
-                        track_action.TRACKED_TARGET_SEED_OWNER,
-                        target=track_action.target,
-                        session_id=track_action.action_id,
-                    ) is not None
-                ),
-            )
-
-            tracking_update = csrt_tracker.tracking_update
-
-            if yolo.detections:
-                display_frame = draw_yolo_overlay(display_frame,yolo)
-            if (tracking_update is not None and tracking_update.success):
-                display_frame = draw_csrt_overlay(display_frame,tracking_update.target,tracking_update.bbox_xywh)
-            display_frame = draw_hand_landmark_overlay(
-                display_frame, hand_guidance
-            )
-            cv2.imshow(window_name, display_frame)
-            cv2.waitKey(1)
-
-            now = time.monotonic()
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN) != cv2.WINDOW_FULLSCREEN:
-                if not fullscreen_requested or now - last_fullscreen_attempt >= 0.5:
-                    cv2.setWindowProperty(
-                        window_name,
-                        cv2.WND_PROP_FULLSCREEN,
-                        cv2.WINDOW_FULLSCREEN,
-                    )
-                    fullscreen_requested = True
-                    last_fullscreen_attempt = now
-
-        except RuntimeError:
-            await asyncio.sleep(0.05)
-            continue
-
-        await asyncio.sleep(0.03)
-
 def build_system_prompt(identity, memory, tool_routing=None):
     def format_value(value):
         if isinstance(value, list):
@@ -552,7 +433,6 @@ async def main():
             )
             approach_action = ApproachAction(
                 send_robot_command=send_robot_command,
-                track_action=track_action,
             )
             see_action = SeeAction(
                 ws=ws,
@@ -580,9 +460,7 @@ async def main():
                 local_navigation_action=explicit_navigation_action,
                 send_map_overlay=send_map_overlay,
             )
-            hand_guided_navigation = HandGuidedNavigation(
-                hand_landmarks, track_action, send_robot_command
-            )
+            hand_gesture_interface = HandGestureInterface(hand_landmarks)
             follow_person_executor = FollowPersonExecutor(
                 find_target_executor=find_target_executor,
                 track_action=track_action,
@@ -596,21 +474,11 @@ async def main():
                 track_action=track_action,
                 explicit_navigation_action=explicit_navigation_action,
                 map_navigation_action=map_navigation_action,
-                hand_guided_navigation=hand_guided_navigation,
+                hand_gesture_interface=hand_gesture_interface,
                 find_target_executor=find_target_executor,
                 follow_person_executor=follow_person_executor,
                 response_manager=response_manager,
             )
-            hand_guided_navigation.set_motion_allowed(lambda: not any((
-                getattr(approach_action, "active", False),
-                getattr(explicit_navigation_action, "active", False),
-                getattr(map_navigation_action, "active", False),
-                getattr(find_target_executor, "active", False),
-                getattr(follow_person_executor, "active", False),
-                getattr(search_action, "active", False),
-                getattr(see_action, "active", False),
-            )))
-
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -660,9 +528,9 @@ async def main():
                 cognitive_manager.cognition_loop(),
                 display_camera_loop(
                     camera, csrt_tracker, yolo, track_action,
-                    hand_guided_navigation,
+                    hand_gesture_interface,
                 ),
-                hand_guided_navigation.run(yolo),
+                hand_gesture_interface.run(yolo),
                 wait_for_dino(),
                 wait_for_yolo()
             )

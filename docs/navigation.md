@@ -58,14 +58,16 @@ room-name classifier or disk-backed map annotation.
 `watch_target` runs the find-target acquisition flow with approach disabled,
 then leaves camera tracking active for the requested person or object.
 
-While a person is tracked, `HandGuidedNavigation` automatically runs MediaPipe
-on a dynamic crop around the YOLO right wrist. A relaxed open hand tilted down
-arms hand tracking. The camera follows the palm while a stable ToF seed is
-accepted only when it remains close to the lidar person pose. An upward finger
-flick dispatches a close approach to that seed. After arrival, an upward hand
-and a small sustained ToF decrease return the robot to its pre-approach pose;
-the robot then faces the person again. This background behavior has no LLM tool
-call.
+While a person is tracked, `HandGestureInterface` automatically runs MediaPipe
+on a dynamic crop around the YOLO right wrist. Welcome and push poses
+temporarily aim the camera at the palm; every other pose immediately resumes
+the current person target. A hand ToF seed is accepted only when it remains
+close to the lidar person pose, and validated hand and person seeds are both
+forwarded to lidar tracking. Welcome followed by fingers-up approaches the
+saved hand seed. Push followed by fingers-down returns to and faces the person.
+Recognized commands enter CognitionManager as ordinary `ToolRequest` events
+with LLM and voice reporting disabled, so they use the same arbitration and
+lifecycle path as spoken commands.
 
 ## Find-loop map navigation
 
@@ -80,5 +82,7 @@ own coverage candidate and furthest forward extension. When map logic offers
 only one exploration pose, it is dispatched directly with its sampled viewing
 heading; vision selection is used only when there is a choice.
 
-`stop_navigation` cancels explicit or active hand-guided navigation. `stop_goal` cancels the
-find loop and its internal map navigation.
+`stop_navigation` cancels explicit navigation or the active approach. Approach
+and follow cancellation leave their independent person-tracking action running;
+stopping watch-target tracking ends that tracking action.
+`stop_goal` cancels the find loop and its internal map navigation.

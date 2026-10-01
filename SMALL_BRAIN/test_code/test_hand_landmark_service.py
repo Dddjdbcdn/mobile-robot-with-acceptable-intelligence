@@ -18,17 +18,49 @@ class Point:
         self.y = y
 
 
+class Category:
+    def __init__(self, category_name="Right", score=0.95):
+        self.category_name = category_name
+        self.score = score
+
+
 class FakeLandmarker:
     def __init__(self):
         self.timestamps = []
+        self.image_shapes = []
 
-    def detect_for_video(self, _image, timestamp_ms):
+    def detect_for_video(self, image, timestamp_ms):
         self.timestamps.append(timestamp_ms)
+        self.image_shapes.append(image.shape)
         points = [Point(0.5, 0.5) for _ in range(21)]
         points[6] = Point(0.45, 0.45)
         points[7] = Point(0.40, 0.60)
         points[8] = Point(0.35, 0.75)
-        return type("Result", (), {"hand_landmarks": [points]})()
+        return type("Result", (), {
+            "hand_landmarks": [points],
+            "handedness": [[Category()]],
+        })()
+
+
+class RetryLandmarker(FakeLandmarker):
+    def detect_for_video(self, image, timestamp_ms):
+        if not self.timestamps:
+            self.timestamps.append(timestamp_ms)
+            self.image_shapes.append(image.shape)
+            return type("Result", (), {
+                "hand_landmarks": [],
+                "handedness": [],
+            })()
+        return super().detect_for_video(image, timestamp_ms)
+
+
+def person_detection():
+    return {
+        "keypoints": {
+            "right_elbow": {"normalized_x": 0.40, "normalized_y": 0.60},
+            "right_wrist": {"normalized_x": 0.50, "normalized_y": 0.40},
+        }
+    }
 
 
 class HandLandmarkServiceTests(unittest.TestCase):
@@ -40,15 +72,8 @@ class HandLandmarkServiceTests(unittest.TestCase):
             image_factory=lambda image: image,
         )
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": 400.0, "y": 400.0},
-                "right_wrist": {"x": 600.0, "y": 300.0},
-            }
-        }
-
-        first = service._detect(frame, person)
-        second = service._detect(frame, person)
+        first = service._detect(frame, person_detection())
+        second = service._detect(frame, person_detection())
 
         self.assertLess(
             first["mediapipe_timestamp_ms"],
@@ -62,22 +87,22 @@ class HandLandmarkServiceTests(unittest.TestCase):
             ],
         )
 
-    def test_maps_crop_landmarks_back_to_full_frame(self):
+    def test_runs_landmarker_on_right_hand_crop(self):
+        landmarker = FakeLandmarker()
         service = HandLandmarkService(
             camera=None,
-            landmarker=FakeLandmarker(),
+            landmarker=landmarker,
             image_factory=lambda image: image,
         )
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": 260.0, "y": 180.0},
-                "right_wrist": {"x": 300.0, "y": 140.0},
-            }
-        }
 
-        result = service._detect(frame, person)
+        result = service._detect(frame, person_detection())
 
+        self.assertEqual(len(landmarker.image_shapes), 1)
+        crop_height, crop_width, channels = landmarker.image_shapes[0]
+        self.assertEqual(crop_height, crop_width)
+        self.assertEqual(channels, 3)
+        self.assertLess(crop_width, frame.shape[1])
         self.assertEqual(result["image_width"], 640)
         self.assertEqual(result["image_height"], 360)
         self.assertIn("index_pip", result["landmarks"])
@@ -88,86 +113,95 @@ class HandLandmarkServiceTests(unittest.TestCase):
             result["landmarks"]["index_pip"]["normalized_x"],
         )
 
-    def test_requires_yolo_right_arm_for_the_crop(self):
+    def test_low_right_arm_confidence_uses_full_frame(self):
+        landmarker = FakeLandmarker()
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=landmarker,
+            image_factory=lambda image: image,
+        )
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        person = person_detection()
+        person["keypoint_confidences"] = {
+            "right_wrist": 0.49,
+            "right_elbow": 0.90,
+        }
+
+        result = service._detect(frame, person)
+
+        self.assertEqual(landmarker.image_shapes, [(360, 640, 3)])
+        self.assertEqual(result["inference_scope"], "full_frame")
+        self.assertEqual(result["crop_box"], [0, 0, 640, 360])
+
+    def test_right_arm_confidence_at_threshold_uses_crop(self):
+        landmarker = FakeLandmarker()
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=landmarker,
+            image_factory=lambda image: image,
+        )
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        person = person_detection()
+        person["keypoint_confidences"] = {
+            "right_wrist": 0.50,
+            "right_elbow": 0.50,
+        }
+
+        result = service._detect(frame, person)
+
+        self.assertEqual(result["inference_scope"], "crop")
+        self.assertLess(landmarker.image_shapes[0][1], frame.shape[1])
+
+    def test_missing_right_elbow_and_wrist_uses_full_frame(self):
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=FakeLandmarker(),
+            image_factory=lambda image: image,
+        )
+
+        result = service._detect(
+            np.zeros((360, 640, 3), dtype=np.uint8), {"keypoints": {}}
+        )
+
+        self.assertEqual(result["inference_scope"], "full_frame")
+        self.assertEqual(result["crop_box"], [0, 0, 640, 360])
+
+    def test_missed_hand_expands_the_next_frame_crop(self):
+        landmarker = RetryLandmarker()
+        service = HandLandmarkService(
+            camera=None,
+            landmarker=landmarker,
+            image_factory=lambda image: image,
+        )
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        first = service._detect(frame, person_detection())
+        result = service._detect(frame, person_detection())
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(landmarker.image_shapes), 2)
+        self.assertLess(
+            landmarker.image_shapes[0][0], landmarker.image_shapes[1][0]
+        )
+
+    def test_crop_center_smooths_yolo_keypoint_jitter(self):
         service = HandLandmarkService(
             camera=None,
             landmarker=FakeLandmarker(),
             image_factory=lambda image: image,
         )
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        self.assertIsNone(service._detect(frame, {"keypoints": {}}))
+        first = service._detect(frame, person_detection())
+        shifted_person = person_detection()
+        for point in shifted_person["keypoints"].values():
+            point["normalized_x"] += 0.10
+        second = service._detect(frame, shifted_person)
 
-    def test_full_resolution_crop_uses_normalized_pose_coordinates(self):
-        service = HandLandmarkService(
-            camera=None,
-            landmarker=FakeLandmarker(),
-            image_factory=lambda image: image,
-        )
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        person = {
-            "keypoints": {
-                "right_elbow": {
-                    "x": 260.0, "y": 180.0,
-                    "normalized_x": 260.0 / 640.0,
-                    "normalized_y": 180.0 / 360.0,
-                },
-                "right_wrist": {
-                    "x": 300.0, "y": 140.0,
-                    "normalized_x": 300.0 / 640.0,
-                    "normalized_y": 140.0 / 360.0,
-                },
-            }
-        }
-
-        crop_box = service._crop_box(frame.shape, person)
-        result = service._detect(frame, person)
-
-        self.assertEqual(result["image_width"], 1280)
-        self.assertEqual(result["image_height"], 720)
-        self.assertGreater(crop_box[2] - crop_box[0], 96)
-        self.assertLess(crop_box[0], 600)
-        self.assertGreater(crop_box[2], 600)
-
-    def test_crop_geometry_scales_with_forearm_length(self):
-        service = HandLandmarkService(
-            camera=None,
-            landmarker=FakeLandmarker(),
-            image_factory=lambda image: image,
-        )
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        first_person = {
-            "keypoints": {
-                "right_elbow": {
-                    "normalized_x": 0.40, "normalized_y": 0.55,
-                },
-                "right_wrist": {
-                    "normalized_x": 0.48, "normalized_y": 0.38,
-                },
-            }
-        }
-        moved_person = {
-            "keypoints": {
-                "right_elbow": {
-                    "normalized_x": 0.38, "normalized_y": 0.60,
-                },
-                "right_wrist": {
-                    "normalized_x": 0.56, "normalized_y": 0.30,
-                },
-            }
-        }
-
-        first_box = service._crop_box(frame.shape, first_person)
-        moved_box = service._crop_box(frame.shape, moved_person)
-
-        self.assertEqual(
-            first_box[2] - first_box[0], first_box[3] - first_box[1]
-        )
-        self.assertEqual(
-            moved_box[2] - moved_box[0], moved_box[3] - moved_box[1]
-        )
-        self.assertGreater(
-            moved_box[2] - moved_box[0], first_box[2] - first_box[0]
-        )
+        first_center = (first["crop_box"][0] + first["crop_box"][2]) / 2
+        second_center = (second["crop_box"][0] + second["crop_box"][2]) / 2
+        self.assertGreater(second_center, first_center)
+        self.assertLess(second_center - first_center, 640 * 0.10)
 
     def test_returns_all_21_hand_landmarks(self):
         service = HandLandmarkService(
@@ -176,75 +210,28 @@ class HandLandmarkServiceTests(unittest.TestCase):
             image_factory=lambda image: image,
         )
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": 400.0, "y": 400.0},
-                "right_wrist": {"x": 600.0, "y": 300.0},
-            }
-        }
-
-        result = service._detect(frame, person)
+        result = service._detect(frame, person_detection())
 
         self.assertEqual(len(result["landmarks"]), 21)
         self.assertIn("thumb_tip", result["landmarks"])
         self.assertIn("middle_tip", result["landmarks"])
         self.assertIn("ring_tip", result["landmarks"])
         self.assertIn("pinky_tip", result["landmarks"])
+        self.assertEqual(result["handedness"], "Right")
+        self.assertAlmostEqual(result["handedness_score"], 0.95)
 
-    def test_dynamic_crop_contains_wrist_and_forward_hand_region(self):
-        frame_shape = (720, 1280, 3)
-        elbow = (400.0, 400.0)
-        wrist = (600.0, 300.0)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": elbow[0], "y": elbow[1]},
-                "right_wrist": {"x": wrist[0], "y": wrist[1]},
-            }
-        }
-
-        box = HandLandmarkService._crop_box(frame_shape, person)
-        forward_hand = (
-            wrist[0] + (wrist[0] - elbow[0]),
-            wrist[1] + (wrist[1] - elbow[1]),
-        )
-
-        for x, y in (wrist, forward_hand):
-            self.assertLessEqual(box[0], x)
-            self.assertLess(x, box[2])
-            self.assertLessEqual(box[1], y)
-            self.assertLess(y, box[3])
-
-    def test_edge_crop_keeps_constant_square_dimensions(self):
-        frame_shape = (360, 640, 3)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": 30.0, "y": 170.0},
-                "right_wrist": {"x": 5.0, "y": 120.0},
-            }
-        }
-
-        box = HandLandmarkService._crop_box(frame_shape, person)
-
-        self.assertEqual(box[0], 0)
-        self.assertEqual(box[2] - box[0], box[3] - box[1])
-
-    def test_saves_annotated_hand_crop_for_debugging(self):
+    def test_saves_annotated_crop_for_debugging(self):
         service = HandLandmarkService(
             camera=None,
             landmarker=FakeLandmarker(),
             image_factory=lambda image: image,
         )
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        person = {
-            "keypoints": {
-                "right_elbow": {"x": 260.0, "y": 180.0},
-                "right_wrist": {"x": 300.0, "y": 140.0},
-            }
-        }
-
         with tempfile.TemporaryDirectory() as directory:
             debug_path = Path(directory) / "hand.jpg"
-            result = service._detect(frame, person, debug_path=debug_path)
+            result = service._detect(
+                frame, person_detection(), debug_path=debug_path
+            )
 
             self.assertTrue(debug_path.is_file())
             self.assertEqual(result["debug_image_path"], str(debug_path))

@@ -16,7 +16,7 @@ from actions.tracking.target_catalog import (
     normalize_human_target,
     normalize_object_target,
 )
-from cognition.state import robot_state
+from cognition.manager.world_state import robot_state
 from utilities.camera_sampler import pose_body_mask, project_tof_region
 
 HORIZONTAL_FOV_DEG = 85
@@ -28,7 +28,6 @@ class TrackAction:
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
     TARGET_SEED_SAMPLES = StableTargetSeedTracker.SAMPLE_COUNT
-    TRACKED_TARGET_SEED_OWNER = "tracked_target"
     PERSON_POINT_MAX_AGE_SECONDS = StableTargetSeedTracker.INPUT_MAX_AGE_SECONDS
     PERSON_SEED_UPDATE_HZ = 5.0
 
@@ -63,29 +62,24 @@ class TrackAction:
         self._continuous_person_reacquisition = False
         self._yolo_owner = None
         self._visual_target_override = None
-        self._stable_seed_tracker = StableTargetSeedTracker()
+        self.stable_seeds = StableTargetSeedTracker()
         # Persist across tracker loss so approach can reacquire after moving.
         self.last_stable_target_location = None
 
         self.person_path = []
         self.person_path_index = 0
 
-    def set_visual_target_override(self, owner, normalized_x, normalized_y):
+    def set_visual_target_override(self, normalized_x, normalized_y):
         """Temporarily aim person tracking at an externally observed point."""
-        owner = str(owner)
-        previous_owner = (
-            None if self._visual_target_override is None
-            else self._visual_target_override.get("owner")
-        )
-        if previous_owner != owner:
-            self.clear_stable_target_seed(owner)
+        override_started = self._visual_target_override is None
         self._visual_target_override = {
-            "owner": owner,
             "x": max(0.0, min(1.0, float(normalized_x))),
             "y": max(0.0, min(1.0, float(normalized_y))),
             "updated_at": time.monotonic(),
         }
-        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
+        if override_started:
+            self.stable_seeds.clear()
+
         center_tolerance = getattr(self, "stable_threshold", 0.05)
         if (
             abs(self._visual_target_override["x"] - 0.5)
@@ -93,76 +87,34 @@ class TrackAction:
             and abs(self._visual_target_override["y"] - 0.5)
             < center_tolerance
         ):
-            self.update_stable_target_seed(
-                owner,
+            self.stable_seeds.update(
+                robot_state.get("camera"),
                 target="hand",
+                session_id=self.action_id,
+                person=robot_state.get("person"),
                 require_person_proximity=True,
             )
         else:
-            self.clear_stable_target_seed(owner)
+            self.stable_seeds.clear()
 
-    def clear_visual_target_override(self, owner):
-        override = self._visual_target_override
-        if override is None or override.get("owner") != str(owner):
+    def clear_visual_target_override(self):
+        if self._visual_target_override is None:
             return
         self._visual_target_override = None
-        self.clear_stable_target_seed(owner)
+        self.stable_seeds.clear()
 
     def _current_visual_target_override(self, max_age_seconds=0.35):
         override = self._visual_target_override
         if override is None:
             return None
         if time.monotonic() - override["updated_at"] > max_age_seconds:
-            self.clear_stable_target_seed(override.get("owner"))
+            self.stable_seeds.clear()
             self._visual_target_override = None
             return None
         return override["x"], override["y"]
 
-    def _seed_tracker(self):
-        if not hasattr(self, "_stable_seed_tracker"):
-            self._stable_seed_tracker = StableTargetSeedTracker()
-        return self._stable_seed_tracker
-
-    def clear_stable_target_seed(self, owner=None):
-        """Clear one owner's stable ToF seed, or all seed state."""
-        self._seed_tracker().clear(owner)
-
-    def update_stable_target_seed(
-        self,
-        owner,
-        *,
-        target=None,
-        require_person_proximity=False,
-    ):
-        """Validate raw camera depth into an owner-scoped stable seed."""
-        return self._seed_tracker().update(
-            owner,
-            robot_state.get("camera"),
-            target=target or getattr(self, "target", None),
-            session_id=getattr(self, "action_id", None),
-            person=robot_state.get("person"),
-            require_person_proximity=require_person_proximity,
-        )
-
-    def get_stable_target_seed(
-        self,
-        owner,
-        max_age_seconds=None,
-        *,
-        target=None,
-        session_id=None,
-    ):
-        """Return a fresh validated seed belonging to ``owner``."""
-        return self._seed_tracker().get(
-            owner,
-            max_age_seconds,
-            target=target,
-            session_id=session_id,
-        )
-
     async def wait_for_stable_target_seed(
         self,
-        owner,
         *,
         target=None,
         session_id=None,
@@ -181,8 +133,7 @@ class TrackAction:
             and self.target == expected_target
             and self.action_id == expected_session_id
         ):
-            seed = self.get_stable_target_seed(
-                owner,
+            seed = self.stable_seeds.get(
                 target=expected_target,
                 session_id=expected_session_id,
             )
@@ -213,7 +164,7 @@ class TrackAction:
 
         self.action_id = action_id
         self.target = normalized_target
-        self.clear_stable_target_seed()
+        self.stable_seeds.clear()
         self.detection_confidence = 1.0
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = allow_grounding_dino
@@ -441,20 +392,17 @@ class TrackAction:
                     })
 
                 if centered:
-                    seed = self.update_stable_target_seed(
-                        self.TRACKED_TARGET_SEED_OWNER,
+                    seed = self.stable_seeds.update(
+                        robot_state.get("camera"),
                         target=self.target,
+                        session_id=self.action_id,
                     )
                     if seed is not None:
                         self._remember_stable_target()
                 else:
-                    self.clear_stable_target_seed(
-                        self.TRACKED_TARGET_SEED_OWNER
-                    )
+                    self.stable_seeds.clear()
             else:
-                self.clear_stable_target_seed(
-                    self.TRACKED_TARGET_SEED_OWNER
-                )
+                self.stable_seeds.clear()
                 failure_frames += 1
                 if failure_frames >= self.OBJECT_FAILURE_GRACE_FRAMES:
                     # Keep the camera at its last tracked angle. Re-detect there and
@@ -552,7 +500,6 @@ class TrackAction:
 
         self.active = True
         self.completion_future = asyncio.get_running_loop().create_future()
-        await self._publish_person_tracking_state(True)
         self._tracking_task = asyncio.create_task(self._person_tracking_loop())
 
         return ActionResult(
@@ -568,40 +515,18 @@ class TrackAction:
             },
         )
 
-    def _clear_person_seed(self):
-        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
-
-    async def _publish_stable_person_position(self):
-        if self.person_tracker_pub_socket is None:
-            return
-        seed = self.get_stable_target_seed(
-            self.TRACKED_TARGET_SEED_OWNER,
-            target=self.target,
-            session_id=self.action_id,
-        )
-        if seed is None:
+    async def _publish_lidar_seed(self, seed):
+        """Send the exact validated visual seed to the lidar person tracker."""
+        if self.person_tracker_pub_socket is None or seed is None:
             return
         await self.person_tracker_pub_socket.send_json({
             "type": "person_tof_position",
             "x": seed["x"],
             "y": seed["y"],
             "frame_id": "base_footprint",
-            "sent_at_unix_ns": time.time_ns(),
-            "action_id": self.action_id,
+            "target": seed.get("target"),
+            "session_id": seed.get("session_id"),
         })
-
-    async def _publish_person_tracking_state(self, active, action_id=None):
-        if self.person_tracker_pub_socket is None:
-            return
-        await self.person_tracker_pub_socket.send_json({
-            "type": "person_tracking_state",
-            "active": bool(active),
-            "action_id": self.action_id if action_id is None else action_id,
-        })
-
-    async def keep_person_tracker_alive(self, action_id):
-        """Keep lidar tracking enabled between visual reacquisition attempts."""
-        await self._publish_person_tracking_state(True, action_id=action_id)
 
     def _update_person_seed(self, person):
         """Validate a centered person's ToF point against the pose mask."""
@@ -617,7 +542,7 @@ class TrackAction:
             or time.monotonic() - float(timestamp)
             > self.PERSON_POINT_MAX_AGE_SECONDS
         ):
-            self._clear_person_seed()
+            self.stable_seeds.clear()
             return None
 
         try:
@@ -640,17 +565,18 @@ class TrackAction:
                 frame_width, frame_height, max(float(distance), 0.02)
             )
         except (KeyError, TypeError, ValueError, RuntimeError):
-            self._clear_person_seed()
+            self.stable_seeds.clear()
             return None
 
         tof_x, tof_y = tof_center
         if mask[tof_y, tof_x] == 0:
-            self._clear_person_seed()
+            self.stable_seeds.clear()
             return None
 
-        return self.update_stable_target_seed(
-            self.TRACKED_TARGET_SEED_OWNER,
-            target=getattr(self, "target", None),
+        return self.stable_seeds.update(
+            camera_state,
+            target=self.target,
+            session_id=self.action_id,
         )
 
     async def _person_tracking_loop(self):
@@ -661,13 +587,11 @@ class TrackAction:
         keypoint_timeout_seconds = 2.0
         loop = asyncio.get_running_loop()
         last_inference_sequence = None
+        last_visual_override_updated_at = None
         last_seed_update_at = None
-        last_lidar_heartbeat_at = loop.time()
+        last_seed_target = None
 
         while self.active:
-            if loop.time() - last_lidar_heartbeat_at >= 1.0:
-                await self._publish_person_tracking_state(True)
-                last_lidar_heartbeat_at = loop.time()
             (
                 inference_sequence,
                 inference_detections,
@@ -675,7 +599,20 @@ class TrackAction:
             ) = (
                 self.yolo.detection_snapshot_with_timing()
             )
-            if inference_sequence == last_inference_sequence:
+            visual_override = self._current_visual_target_override()
+            override_state = self._visual_target_override
+            visual_override_updated_at = (
+                override_state.get("updated_at")
+                if visual_override is not None
+                and isinstance(override_state, dict)
+                else None
+            )
+            inference_is_new = inference_sequence != last_inference_sequence
+            override_is_new = (
+                visual_override_updated_at
+                != last_visual_override_updated_at
+            )
+            if not inference_is_new and not override_is_new:
                 if (
                     missing_person_since is not None
                     and loop.time() - missing_person_since
@@ -690,7 +627,9 @@ class TrackAction:
                     return
                 await asyncio.sleep(0.01)
                 continue
-            last_inference_sequence = inference_sequence
+            if inference_is_new:
+                last_inference_sequence = inference_sequence
+            last_visual_override_updated_at = visual_override_updated_at
             detections = [
                 detection
                 for detection in inference_detections
@@ -699,7 +638,7 @@ class TrackAction:
             ]
 
             if not detections:
-                self._clear_person_seed()
+                self.stable_seeds.clear()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
                 elif (
@@ -775,7 +714,6 @@ class TrackAction:
                         )
                         current_reached = True
 
-            visual_override = self._current_visual_target_override()
             if visual_override is not None:
                 target_x, target_y = visual_override
 
@@ -817,29 +755,52 @@ class TrackAction:
                 })
 
             if visual_override is not None or not target_centered:
+                tracking_sequence = (
+                    f"hand:{visual_override_updated_at}"
+                    if visual_override is not None
+                    else f"pose:{inference_sequence}"
+                )
                 await self.zmq_pub_socket.send_json({
                     "delta_pan_angle": delta_pan_angle,
                     "delta_tilt_angle": delta_tilt_angle,
-                    "tracking_sequence": f"pose:{inference_sequence}",
+                    "tracking_sequence": tracking_sequence,
                     "tracking_timing": tracking_timing,
                 })
 
             final_keypoint = self.person_path_index == len(self.person_path) - 1
-            if visual_override is None and final_keypoint and target_centered:
+            seed_target = (
+                "hand"
+                if visual_override is not None
+                else self.target
+                if final_keypoint and target_centered
+                else None
+            )
+            if seed_target != last_seed_target:
+                last_seed_update_at = None
+                last_seed_target = seed_target
+
+            if seed_target is not None:
                 now = loop.time()
                 seed_update_interval = 1.0 / self.PERSON_SEED_UPDATE_HZ
                 if (
                     last_seed_update_at is None
                     or now - last_seed_update_at >= seed_update_interval
                 ):
-                    seed = self._update_person_seed(person)
+                    seed = (
+                        self.stable_seeds.get(
+                            target="hand",
+                            session_id=self.action_id,
+                        )
+                        if visual_override is not None
+                        else self._update_person_seed(person)
+                    )
                     if seed is not None:
-                        self._remember_stable_target()
-                        await self._publish_stable_person_position()
+                        if visual_override is None:
+                            self._remember_stable_target()
+                        await self._publish_lidar_seed(seed)
                     last_seed_update_at = now
             elif visual_override is None:
-                self._clear_person_seed()
-                last_seed_update_at = None
+                self.stable_seeds.clear()
 
             await asyncio.sleep(0.01)
 
@@ -853,10 +814,9 @@ class TrackAction:
             return False
 
         self.action_id = action_id
-        self.clear_stable_target_seed(self.TRACKED_TARGET_SEED_OWNER)
+        self.stable_seeds.clear()
         if continuous_person_reacquisition:
             self._continuous_person_reacquisition = True
-        await self._publish_person_tracking_state(True)
         return True
 
 
@@ -875,7 +835,6 @@ class TrackAction:
 
         tracking_task = self._tracking_task
         was_person_tracking = self.target in HUMAN_TRACKABLE_PARTS
-        tracked_action_id = self.action_id
         preserve_person_tracker = (
             was_person_tracking
             and status == "failed"
@@ -905,11 +864,6 @@ class TrackAction:
             tracking_task.cancel()
             await asyncio.gather(tracking_task, return_exceptions=True)
 
-        if was_person_tracking and not preserve_person_tracker:
-            await self._publish_person_tracking_state(
-                False, action_id=tracked_action_id
-            )
-
         return result
 
     def complete_tracking(
@@ -921,8 +875,7 @@ class TrackAction:
     ):
         action_id = self.action_id or "unassigned"
         target = self.target
-        had_validated_seed = self.get_stable_target_seed(
-            self.TRACKED_TARGET_SEED_OWNER,
+        had_validated_seed = self.stable_seeds.get(
             target=target,
             session_id=action_id,
         ) is not None
@@ -947,7 +900,7 @@ class TrackAction:
         self.active = False
         self._continuous_person_reacquisition = False
         self._visual_target_override = None
-        self.clear_stable_target_seed()
+        self.stable_seeds.clear()
         self.csrt_tracker.stop_tracking()
         self.action_id = None
         self.target = None

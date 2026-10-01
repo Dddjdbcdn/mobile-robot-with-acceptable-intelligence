@@ -1,0 +1,63 @@
+system_watchdog:
+  ros__parameters:
+    output_topic: /system/watchdog
+    publish_period: 1.0
+    startup_grace: 10.0
+
+    # group|short name|topic|message type|mode|stale seconds|min publishers|min external subscribers
+    # "stream" checks data freshness. "endpoint" only checks the ROS graph.
+    topic_specs:
+      - "micro|imu_raw|/stm32/imu_msg|geometry_msgs/msg/Point32|stream|1.0|1|1"
+      - "micro|range_raw|/stm32/range_msg|geometry_msgs/msg/Point32|stream|1.0|1|1"
+      - "micro|tof_raw|/stm32/tof_raw_data|std_msgs/msg/Int16MultiArray|stream|1.0|1|1"
+      - "micro|wheel_state|/stm32/wheel_states|sensor_msgs/msg/JointState|stream|1.0|1|1"
+      - "micro|pwm|/stm32/pwm_msg|geometry_msgs/msg/Point32|stream|1.0|1|0"
+      - "micro|debug|/stm32/debug_msg|std_msgs/msg/String|stream|3.0|1|0"
+      - "micro|wheel_cmd|/stm32/wheel_commands|sensor_msgs/msg/JointState|endpoint|0.0|1|1"
+      - "micro|servo_pan|/stm32/servo_pan|std_msgs/msg/Float32|endpoint|0.0|1|1"
+      - "micro|servo_tilt|/stm32/servo_tilt|std_msgs/msg/Float32|endpoint|0.0|1|1"
+
+      - "bridge|imu|/imu|sensor_msgs/msg/Imu|stream|1.0|1|1"
+      - "bridge|camera_tof|/camera_tof|sensor_msgs/msg/Range|stream|1.0|1|1"
+      - "bridge|range_left|/range/left|sensor_msgs/msg/Range|stream|1.0|1|3"
+      - "bridge|range_right|/range/right|sensor_msgs/msg/Range|stream|1.0|1|3"
+      - "bridge|tof_cloud|/tof_pointcloud|sensor_msgs/msg/PointCloud2|stream|1.5|1|2"
+      - "bridge|person_status|/person_tracker/status|std_msgs/msg/String|endpoint|0.0|1|1"
+
+      - "nav|scan|/scan|sensor_msgs/msg/LaserScan|stream|1.0|1|1"
+      - "nav|wheel_odom|/diff_drive_controller/odom|nav_msgs/msg/Odometry|stream|1.0|1|1"
+      - "nav|fused_odom|/odom|nav_msgs/msg/Odometry|stream|1.0|1|1"
+      - "nav|tf|/tf|tf2_msgs/msg/TFMessage|stream|1.0|1|1"
+      - "nav|map|/map|nav_msgs/msg/OccupancyGrid|endpoint|0.0|1|1"
+      - "layers|local_costmap|/local_costmap/costmap|nav_msgs/msg/OccupancyGrid|stream|1.5|1|0"
+      - "layers|global_costmap|/global_costmap/costmap|nav_msgs/msg/OccupancyGrid|stream|2.5|1|1"
+      - "layers|local_range|/local_costmap/range_layer|nav_msgs/msg/OccupancyGrid|stream|1.5|1|0"
+      - "layers|global_range|/global_costmap/range_layer|nav_msgs/msg/OccupancyGrid|stream|2.5|1|0"
+      - "layers|local_obstacle|/local_costmap/obstacle_layer|nav_msgs/msg/OccupancyGrid|stream|1.5|1|0"
+      - "layers|global_obstacle|/global_costmap/obstacle_layer|nav_msgs/msg/OccupancyGrid|stream|2.5|1|0"
+      - "layers|local_stvl|/local_costmap/stvl_layer|nav_msgs/msg/OccupancyGrid|stream|1.5|1|0"
+      - "layers|global_stvl|/global_costmap/stvl_layer|nav_msgs/msg/OccupancyGrid|stream|2.5|1|0"
+      - "layers|local_stvl_grid|/local_costmap/voxel_grid|sensor_msgs/msg/PointCloud2|stream|1.5|1|0"
+      - "layers|global_stvl_grid|/global_costmap/voxel_grid|sensor_msgs/msg/PointCloud2|stream|2.5|1|0"
+      - "nav|depth_cloud|/camera/depth/points|sensor_msgs/msg/PointCloud2|stream|2.0|1|4"
+      - "nav|cmd_vel|/diff_drive_controller/cmd_vel|geometry_msgs/msg/TwistStamped|endpoint|0.0|1|1"
+
+    # group|short name|fully qualified ROS node name
+    node_specs:
+      - "core|micro_agent|/micro_ros_agent"
+      - "core|stm32|/cubemx_node"
+      - "core|sensor_bridge|/stm32_sensor_bridge"
+      - "core|controller|/controller_manager"
+      - "core|ekf|/ekf_filter_node"
+      - "core|llm_bridge|/llm_ros_bridge"
+      - "core|person_tracker|/person_lidar_tracker"
+      - "layers|local_costmap_node|/local_costmap/local_costmap"
+      - "layers|global_costmap_node|/global_costmap/global_costmap"
+
+    # These services are created by STVL for each observation buffer. Their
+    # presence proves that the plugin and both marking/clearing sources loaded.
+    service_specs:
+      - "layers|local_stvl_mark|/local_costmap/depth_mark/toggle_enabled"
+      - "layers|local_stvl_clear|/local_costmap/depth_clear/toggle_enabled"
+      - "layers|global_stvl_mark|/global_costmap/depth_mark/toggle_enabled"
+      - "layers|global_stvl_clear|/global_costmap/depth_clear/toggle_enabled"

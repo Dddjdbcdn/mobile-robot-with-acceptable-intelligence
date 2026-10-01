@@ -10,7 +10,7 @@ import time
 from typing import Any
 import uuid
 
-from cognition.state import robot_state
+from cognition.manager.world_state import robot_state
 from actions.tracking.target_catalog import (
     DJ_YOLO_CLASSES,
     normalize_object_target,

@@ -6,7 +6,7 @@ import math
 import time
 
 from actions.action_result import ActionResult
-from cognition.state import robot_state
+from cognition.manager.world_state import robot_state
 from actions.tracking.target_catalog import (
     normalize_human_target,
     normalize_object_target,
@@ -315,6 +315,7 @@ class FindTargetExecutor:
         )
 
     async def _acquire_target_without_approach(self, attempt):
+        """Start tracking and leave ongoing alignment/reacquisition to it."""
         suffix = "" if attempt == 0 else f"_{attempt}"
         person_target = getattr(self, "target_kind", "object") == "person"
         target_label = "person" if person_target else "target"
@@ -327,31 +328,14 @@ class FindTargetExecutor:
         )
         if tracked.status != "succeeded":
             return tracked
-        tracking_session_id = self.track_action.action_id
-        seed = await self.track_action.wait_for_stable_target_seed(
-            self.track_action.TRACKED_TARGET_SEED_OWNER,
-            target=self.track_action.target,
-            session_id=tracking_session_id,
-            timeout=10.0,
-        )
-        if seed is None:
-            return ActionResult(
-                self._step_id(f"align_{target_label}{suffix}"),
-                "track_action",
-                "failed",
-                target=self.target,
-                outcome="stable_seed_timeout",
-                reason_code="STABLE_SEED_TIMEOUT",
-                retryable=True,
-            )
-        self._completed_steps.append("target_tracked_and_aligned")
+        self._completed_steps.append("target_tracking_started")
         return ActionResult(
             self._step_id(f"target_acquired{suffix}"),
             "track_action",
             "succeeded",
             target=self.target,
-            outcome="target_found_and_aligned",
-            data={"tracking_active": True, "stable_seed": dict(seed)},
+            outcome="target_tracking_started",
+            data={"tracking_active": True, **dict(tracked.data or {})},
         )
 
     async def _acquire_person_without_approach(self, attempt):
@@ -359,9 +343,27 @@ class FindTargetExecutor:
         return await self._acquire_target_without_approach(attempt)
 
     async def _approach(self, step="approach") -> ActionResult:
-        result = await self.approach_action.start_approaching(
+        tracking_session_id = self.track_action.action_id
+        location = await self.track_action.wait_for_stable_target_seed(
             target=self.target,
+            session_id=tracking_session_id,
+            timeout=10.0,
+        )
+        if location is None:
+            return ActionResult(
+                action_id=self._step_id(step),
+                action_type="approach_action",
+                status="failed",
+                target=self.target,
+                outcome="stable_seed_timeout",
+                reason_code="STABLE_SEED_TIMEOUT",
+                retryable=True,
+            )
+
+        result = await self.approach_action.start(
+            location=location,
             action_id=self._step_id(step),
+            target=self.target,
             standoff_m=self._approach_standoff_m,
         )
         result = await self._terminal_result(self.approach_action, result)

@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import time
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
@@ -11,12 +11,24 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cognition.hand_guided_navigation import HandGuidedNavigation
-from cognition.state import robot_state
+from cognition.hand.interface import HandGestureInterface
+from cognition.manager.world_state import robot_state
 from actions.track_action import TrackAction
+from actions.tracking.stable_seed import StableTargetSeedTracker
+from utilities.camera_sampler import draw_tracking_status_overlay
 
 
-def open_hand(direction="down"):
+def bare_track_action():
+    tracker = TrackAction.__new__(TrackAction)
+    tracker.target = None
+    tracker.action_id = None
+    tracker.stable_threshold = 0.05
+    tracker._visual_target_override = None
+    tracker.stable_seeds = StableTargetSeedTracker()
+    return tracker
+
+
+def open_hand(direction="down", handedness="Right"):
     landmarks = {
         "wrist": {"normalized_x": 0.51, "normalized_y": 0.62},
         "thumb_cmc": {"normalized_x": 0.40, "normalized_y": 0.56},
@@ -30,7 +42,65 @@ def open_hand(direction="down"):
         landmarks[f"{name}_pip"] = {"normalized_x": x, "normalized_y": 0.56 if sign > 0 else 0.44}
         landmarks[f"{name}_dip"] = {"normalized_x": x, "normalized_y": 0.62 if sign > 0 else 0.38}
         landmarks[f"{name}_tip"] = {"normalized_x": x, "normalized_y": 0.68 if sign > 0 else 0.32}
-    return {"image_width": 640, "image_height": 360, "landmarks": landmarks}
+    return {
+        "image_width": 640,
+        "image_height": 360,
+        "landmarks": landmarks,
+        "handedness": handedness,
+    }
+
+
+def reversed_x_hand(direction):
+    hand = open_hand(direction)
+    raw_x = {
+        "thumb": 0.70,
+        "index": 0.60,
+        "middle": 0.50,
+        "ring": 0.40,
+        "pinky": 0.30,
+    }
+    for name in ("index", "middle", "ring", "pinky"):
+        for joint in ("mcp", "pip", "dip", "tip"):
+            hand["landmarks"][f"{name}_{joint}"]["normalized_x"] = raw_x[name]
+    for joint, x in zip(
+        ("cmc", "mcp", "ip", "tip"), (0.64, 0.66, 0.68, 0.70)
+    ):
+        hand["landmarks"][f"thumb_{joint}"]["normalized_x"] = x
+    return hand
+
+
+def fingers_down_hand():
+    return reversed_x_hand("down")
+
+
+def push_hand():
+    return reversed_x_hand("up")
+
+
+def folded_hand(index_up=False):
+    hand = open_hand("up")
+    landmarks = hand["landmarks"]
+    for joint, y in zip(
+        ("cmc", "mcp", "ip", "tip"), (0.58, 0.48, 0.38, 0.28)
+    ):
+        landmarks[f"thumb_{joint}"]["normalized_y"] = y
+    for name in ("index", "middle", "ring", "pinky"):
+        base_x = landmarks[f"{name}_mcp"]["normalized_x"]
+        landmarks[f"{name}_pip"]["normalized_x"] = base_x + 0.08
+        landmarks[f"{name}_dip"]["normalized_x"] = base_x + 0.06
+        landmarks[f"{name}_tip"]["normalized_x"] = base_x + 0.03
+        landmarks[f"{name}_mcp"]["normalized_y"] = 0.50
+        landmarks[f"{name}_pip"]["normalized_y"] = 0.38
+        landmarks[f"{name}_dip"]["normalized_y"] = 0.42
+        landmarks[f"{name}_tip"]["normalized_y"] = 0.46
+    if index_up:
+        index_x = landmarks["index_mcp"]["normalized_x"]
+        for joint, y in zip(
+            ("mcp", "pip", "dip", "tip"), (0.50, 0.43, 0.36, 0.29)
+        ):
+            landmarks[f"index_{joint}"]["normalized_y"] = y
+            landmarks[f"index_{joint}"]["normalized_x"] = index_x
+    return hand
 
 
 def person_detection():
@@ -45,37 +115,343 @@ def person_detection():
 
 
 class HandPoseTests(unittest.TestCase):
-    def test_relaxed_downward_open_hand_is_welcome(self):
-        pose = HandGuidedNavigation.classify_hand_pose(open_hand("down"))
+    def test_five_straight_downward_ordered_fingers_are_welcome(self):
+        pose = HandGestureInterface.classify_hand_pose(open_hand("down"))
+
         self.assertEqual(pose["gesture"], "welcome")
+        self.assertEqual(pose["open_fingers"], 5)
+        self.assertEqual(pose["gesture_checks"]["handedness"], "Right")
+        self.assertTrue(pose["gesture_checks"]["welcome_y_order"])
+        self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
+
+    def test_media_pipe_left_label_does_not_change_welcome_order(self):
+        pose = HandGestureInterface.classify_hand_pose(
+            open_hand("down", handedness="Left")
+        )
+
+        self.assertEqual(pose["gesture"], "welcome")
+        self.assertEqual(pose["gesture_checks"]["handedness"], "Right")
+        self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
+
+    def test_wrong_fingertip_order_is_not_welcome(self):
+        hand = open_hand("down")
+        for joint in ("mcp", "pip", "dip", "tip"):
+            hand["landmarks"][f"ring_{joint}"]["normalized_x"] = 0.46
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "open_other")
+        self.assertTrue(pose["gesture_checks"]["all_fingers_straight"])
+        self.assertFalse(pose["gesture_checks"]["hand_tip_order"])
+
+    def test_thumb_x_position_does_not_affect_welcome_order(self):
+        hand = open_hand("down")
+        for joint, x in zip(
+            ("cmc", "mcp", "ip", "tip"), (0.70, 0.73, 0.76, 0.79)
+        ):
+            hand["landmarks"][f"thumb_{joint}"]["normalized_x"] = x
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "welcome")
+        self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
+
+    def test_non_descending_finger_is_not_welcome(self):
+        hand = open_hand("down")
+        for joint, y in zip(
+            ("mcp", "pip", "dip", "tip"), (0.50, 0.44, 0.38, 0.32)
+        ):
+            hand["landmarks"][f"index_{joint}"]["normalized_y"] = y
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "open_other")
+        self.assertTrue(pose["gesture_checks"]["all_fingers_straight"])
+        self.assertFalse(pose["gesture_checks"]["welcome_y_order"])
+
+    def test_bent_thumb_is_not_welcome(self):
+        hand = open_hand("down")
+        hand["landmarks"]["thumb_tip"] = {
+            "normalized_x": 0.37,
+            "normalized_y": 0.53,
+        }
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "open_other")
         self.assertEqual(pose["open_fingers"], 4)
-        self.assertGreater(pose["finger_axis_y"], 0.0)
+        self.assertFalse(pose["gesture_checks"]["all_fingers_straight"])
 
     def test_upward_finger_flick_is_distinct(self):
-        pose = HandGuidedNavigation.classify_hand_pose(open_hand("up"))
+        pose = HandGestureInterface.classify_hand_pose(open_hand("up"))
         self.assertEqual(pose["gesture"], "fingers_up")
-        self.assertEqual(pose["open_fingers"], 4)
-        self.assertLess(pose["finger_axis_y"], 0.0)
+        self.assertEqual(pose["open_fingers"], 5)
+        self.assertTrue(pose["gesture_checks"]["fingers_up_y_order"])
+        self.assertTrue(pose["gesture_checks"]["hand_tip_order"])
+
+    def test_fingers_up_does_not_check_thumb_y_order(self):
+        hand = open_hand("up")
+        for joint, y in zip(
+            ("cmc", "mcp", "ip", "tip"), (0.44, 0.47, 0.50, 0.53)
+        ):
+            hand["landmarks"][f"thumb_{joint}"]["normalized_y"] = y
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "fingers_up")
+
+    def test_fingers_down_uses_welcome_y_and_reversed_tip_order(self):
+        pose = HandGestureInterface.classify_hand_pose(fingers_down_hand())
+
+        self.assertEqual(pose["gesture"], "fingers_down")
+        self.assertTrue(pose["gesture_checks"]["welcome_y_order"])
+        self.assertTrue(pose["gesture_checks"]["fingers_down"])
+        self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+
+    def test_push_uses_upward_fingers_thumb_and_reversed_tip_order(self):
+        pose = HandGestureInterface.classify_hand_pose(push_hand())
+
+        self.assertEqual(pose["gesture"], "push")
+        self.assertTrue(pose["gesture_checks"]["fingers_up_y_order"])
+        self.assertTrue(pose["gesture_checks"]["push_thumb_y_order"])
+        self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+
+    def test_thumb_x_position_does_not_affect_fingers_down_order(self):
+        hand = fingers_down_hand()
+        for joint, x in zip(
+            ("cmc", "mcp", "ip", "tip"), (0.19, 0.16, 0.13, 0.10)
+        ):
+            hand["landmarks"][f"thumb_{joint}"]["normalized_x"] = x
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "fingers_down")
+        self.assertTrue(pose["gesture_checks"]["reverse_tip_order"])
+
+    def test_media_pipe_left_label_does_not_change_fingers_down_order(self):
+        hand = fingers_down_hand()
+        hand["handedness"] = "Left"
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "fingers_down")
+        self.assertEqual(pose["gesture_checks"]["handedness"], "Right")
+
+    def test_thumb_up_requires_straight_thumb_above_folded_fingers(self):
+        pose = HandGestureInterface.classify_hand_pose(folded_hand())
+
+        self.assertEqual(pose["gesture"], "thumb_up")
+        self.assertTrue(pose["gesture_checks"]["thumb_up"])
+
+    def test_thumb_up_checks_folded_fingers_on_x_axis(self):
+        hand = folded_hand()
+        for name in ("index", "middle", "ring", "pinky"):
+            landmarks = hand["landmarks"]
+            mcp_x = landmarks[f"{name}_mcp"]["normalized_x"]
+            landmarks[f"{name}_pip"]["normalized_x"] = mcp_x - 0.02
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertNotEqual(pose["gesture"], "thumb_up")
+        self.assertFalse(pose["gesture_checks"]["thumb_up"])
+
+    def test_index_finger_keeps_middle_ring_and_pinky_folded(self):
+        pose = HandGestureInterface.classify_hand_pose(folded_hand(index_up=True))
+
+        self.assertEqual(pose["gesture"], "index_finger")
+        self.assertTrue(pose["gesture_checks"]["index_finger"])
+
+    def test_index_finger_checks_folded_fingers_on_y_axis(self):
+        hand = folded_hand(index_up=True)
+        for name in ("middle", "ring", "pinky"):
+            landmarks = hand["landmarks"]
+            mcp_x = landmarks[f"{name}_mcp"]["normalized_x"]
+            landmarks[f"{name}_pip"]["normalized_x"] = mcp_x - 0.02
+
+        pose = HandGestureInterface.classify_hand_pose(hand)
+
+        self.assertEqual(pose["gesture"], "index_finger")
+        self.assertTrue(pose["gesture_checks"]["index_finger"])
 
 
 class HandTrackingOverrideTests(unittest.TestCase):
-    def test_override_is_bounded_owned_and_expires(self):
-        tracker = TrackAction.__new__(TrackAction)
-        tracker._visual_target_override = None
+    def test_override_is_bounded_clearable_and_expires(self):
+        tracker = bare_track_action()
 
-        tracker.set_visual_target_override("hand", 1.2, -0.2)
+        tracker.set_visual_target_override(1.2, -0.2)
 
         self.assertEqual(tracker._current_visual_target_override(), (1.0, 0.0))
-        tracker.clear_visual_target_override("someone-else")
-        self.assertIsNotNone(tracker._visual_target_override)
-        tracker.clear_visual_target_override("hand")
+        tracker.clear_visual_target_override()
         self.assertIsNone(tracker._visual_target_override)
 
-        tracker.set_visual_target_override("hand", 0.4, 0.6)
+        tracker.set_visual_target_override(0.4, 0.6)
         self.assertIsNone(tracker._current_visual_target_override(-1.0))
 
 
-class HandGuidedNavigationTests(unittest.IsolatedAsyncioTestCase):
+class ContinuousPersonReacquisitionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_person_waits_without_moving_camera(self):
+        tracker = bare_track_action()
+        tracker.active = True
+        tracker.target = "person"
+        tracker.action_id = "track-person"
+        tracker._continuous_person_reacquisition = True
+        tracker.zmq_pub_socket = AsyncMock()
+        tracker.yolo = Mock()
+        sequence = 0
+
+        def snapshot():
+            nonlocal sequence
+            sequence += 1
+            if sequence > 1:
+                tracker.active = False
+            return sequence, [], {}
+
+        tracker.yolo.detection_snapshot_with_timing.side_effect = snapshot
+
+        with patch("actions.track_action.asyncio.sleep", AsyncMock()):
+            await tracker._person_tracking_loop()
+
+        tracker.zmq_pub_socket.send_json.assert_not_awaited()
+
+    async def test_new_hand_override_does_not_wait_for_another_yolo_frame(self):
+        tracker = bare_track_action()
+        tracker.active = True
+        tracker.target = "person"
+        tracker.action_id = "track-person"
+        tracker._continuous_person_reacquisition = True
+        tracker.person_path = ["right_wrist"]
+        tracker.person_path_index = 0
+        tracker.yolo = Mock()
+        tracker.yolo.detection_snapshot_with_timing.return_value = (
+            1, [person_detection()], {},
+        )
+        sent = []
+
+        async def send(payload):
+            sent.append(dict(payload))
+            if len(sent) == 1:
+                tracker.set_visual_target_override(0.60, 0.50)
+            else:
+                tracker.active = False
+
+        tracker.zmq_pub_socket = Mock()
+        tracker.zmq_pub_socket.send_json = AsyncMock(side_effect=send)
+        tracker.set_visual_target_override(0.40, 0.50)
+
+        await asyncio.wait_for(tracker._person_tracking_loop(), timeout=1.0)
+
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(sent[0]["tracking_sequence"].startswith("hand:"))
+        self.assertNotEqual(
+            sent[0]["tracking_sequence"], sent[1]["tracking_sequence"]
+        )
+
+    async def test_valid_hand_seed_is_published_to_lidar_with_identity(self):
+        tracker = bare_track_action()
+        tracker.active = True
+        tracker.target = "person"
+        tracker.action_id = "track-person"
+        tracker._continuous_person_reacquisition = True
+        tracker.person_path = ["right_wrist"]
+        tracker.person_path_index = 0
+        tracker.yolo = Mock()
+        tracker.yolo.detection_snapshot_with_timing.return_value = (
+            1, [person_detection()], {},
+        )
+        tracker.zmq_pub_socket = AsyncMock()
+        tracker.person_tracker_pub_socket = Mock()
+
+        async def publish(_payload):
+            tracker.active = False
+
+        tracker.person_tracker_pub_socket.send_json = AsyncMock(
+            side_effect=publish
+        )
+        tracker._visual_target_override = {
+            "x": 0.5,
+            "y": 0.5,
+            "updated_at": time.monotonic(),
+        }
+        tracker.stable_seeds = Mock()
+        tracker.stable_seeds.get.return_value = {
+            "x": 1.0,
+            "y": 0.1,
+            "target": "hand",
+            "session_id": "track-person",
+        }
+
+        await asyncio.wait_for(tracker._person_tracking_loop(), timeout=1.0)
+
+        payload = tracker.person_tracker_pub_socket.send_json.call_args.args[0]
+        self.assertEqual(payload["type"], "person_tof_position")
+        self.assertEqual(payload["target"], "hand")
+        self.assertEqual(payload["session_id"], "track-person")
+
+
+class TrackingStatusOverlayTests(unittest.TestCase):
+    def test_hand_tracking_displays_hand_seed_status(self):
+        track_action = Mock(active=True, target="person", action_id="track-1")
+        track_action.stable_seeds.status.return_value = {
+            "valid": True,
+            "valid_for_seconds": 0.1,
+            "sample_count": 3,
+            "sample_target": 3,
+        }
+        hand_guidance = Mock()
+        hand_guidance.gesture_status.return_value = {
+            "gesture": "welcome", "state": "tracking_person",
+        }
+
+        draw_tracking_status_overlay(
+            np.zeros((360, 640, 3), dtype=np.uint8),
+            track_action,
+            hand_guidance,
+        )
+
+        track_action.stable_seeds.status.assert_called_once_with(
+            target="hand", session_id="track-1",
+        )
+
+    def test_command_pose_displays_resumed_person_seed_status(self):
+        track_action = Mock(
+            active=True, target="torso_center", action_id="track-1"
+        )
+        track_action.stable_seeds.status.return_value = {
+            "valid": True,
+            "valid_for_seconds": 0.1,
+            "sample_count": 3,
+            "sample_target": 3,
+        }
+        hand_guidance = Mock()
+        hand_guidance.gesture_status.return_value = {
+            "gesture": "fingers_up", "state": "tracking_person",
+        }
+
+        draw_tracking_status_overlay(
+            np.zeros((360, 640, 3), dtype=np.uint8),
+            track_action,
+            hand_guidance,
+        )
+
+        track_action.stable_seeds.status.assert_called_once_with(
+            target="torso_center", session_id="track-1",
+        )
+
+    def test_seed_status_hides_samples_from_another_target(self):
+        tracker = StableTargetSeedTracker()
+        started_at = time.monotonic()
+        for index in range(tracker.SAMPLE_COUNT):
+            robot_state["camera"]["timestamp"] = started_at + index * 0.01
+            tracker.update(
+                robot_state["camera"], target="hand", session_id="track-1"
+            )
+
+        status = tracker.status(target="person", session_id="track-1")
+
+        self.assertFalse(status["valid"])
+        self.assertEqual(status["sample_count"], 0)
+
+
+class HandGestureInterfaceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.previous_camera = dict(robot_state["camera"])
         self.previous_person = robot_state.get("person")
@@ -98,37 +474,78 @@ class HandGuidedNavigationTests(unittest.IsolatedAsyncioTestCase):
         robot_state["person"] = self.previous_person
 
     @staticmethod
-    def action(send_robot_command=None):
+    def action(dispatch=None, tracking_person=True):
         hand_service = Mock()
-        track_action = Mock(active=True, target="person")
-        track_action.set_visual_target_override = Mock()
-        track_action.clear_visual_target_override = Mock()
-        track_action.get_stable_target_seed = Mock(return_value=None)
-        return HandGuidedNavigation(
-            hand_service,
-            track_action,
-            send_robot_command or AsyncMock(return_value={"status": "accepted"}),
-        )
+        action = HandGestureInterface(hand_service)
+
+        async def default_dispatch(command, _data):
+            if command == "observe_gesture":
+                return {
+                    "mode": (
+                        "tracking_person" if tracking_person
+                        else "watching_person"
+                    ),
+                    "tracking_active": True,
+                    "tracking_person": tracking_person,
+                    "following_active": False,
+                    "approach_active": False,
+                }
+            return True
+
+        action.set_dispatcher(dispatch or AsyncMock(side_effect=default_dispatch))
+        return action
 
     async def test_welcome_pose_arms_hand_tracking(self):
-        action = self.action()
+        action = self.action(tracking_person=False)
         action.hand_landmarks.detect_right_hand = AsyncMock(
             return_value=open_hand("down")
         )
         yolo = Mock()
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        for sequence in range(1, action.WELCOME_CONFIRM_FRAMES + 1):
+        for sequence in range(1, action.IDLE_WELCOME_CONFIRM_FRAMES + 1):
             yolo.detection_snapshot_with_frame.return_value = (
                 sequence, [person_detection()], frame, {},
             )
             await action._sample(yolo)
 
-        self.assertTrue(action.active)
-        self.assertEqual(action.state, "tracking_hand")
-        action.track_action.set_visual_target_override.assert_called()
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertEqual(
+            commands,
+            ["observe_gesture"] * action.IDLE_WELCOME_CONFIRM_FRAMES
+            + ["watch_target"],
+        )
+
+    async def test_hand_inference_uses_fresh_camera_frames_between_yolo_frames(self):
+        action = self.action(tracking_person=False)
+        action.hand_landmarks.detect_right_hand = AsyncMock(
+            return_value=open_hand("down")
+        )
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        snapshots = []
+        for sequence in range(1, action.IDLE_WELCOME_CONFIRM_FRAMES + 1):
+            snapshot = Mock()
+            snapshot.sequence = sequence
+            snapshot.full_bgr = frame
+            snapshots.append(snapshot)
+        action.hand_landmarks.camera = Mock()
+        action.hand_landmarks.camera.snapshot.side_effect = snapshots
+        yolo = Mock()
+        yolo.detection_snapshot.return_value = (
+            7, [person_detection()],
+        )
+
+        for _ in snapshots:
+            await action._sample(yolo)
+
+        self.assertEqual(
+            action.hand_landmarks.detect_right_hand.await_count,
+            action.IDLE_WELCOME_CONFIRM_FRAMES,
+        )
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertEqual(commands[-1], "watch_target")
 
     def test_track_action_validates_three_close_samples_near_person(self):
-        tracker = TrackAction.__new__(TrackAction)
+        tracker = bare_track_action()
         tracker.target = "person"
         samples = ((2.00, 1.00), (2.04, 0.98), (1.98, 1.03))
         for index, (map_x, map_y) in enumerate(samples):
@@ -137,32 +554,33 @@ class HandGuidedNavigationTests(unittest.IsolatedAsyncioTestCase):
                 "object_map_y": map_y,
                 "timestamp": time.monotonic() + index * 0.01,
             })
-            seed = tracker.update_stable_target_seed(
-                "hand_guided_navigation",
+            seed = tracker.stable_seeds.update(
+                robot_state["camera"],
                 target="hand",
+                session_id=tracker.action_id,
+                person=robot_state["person"],
                 require_person_proximity=True,
             )
 
         self.assertAlmostEqual(seed["x"], 1.0)
         self.assertAlmostEqual(seed["map_x"], 2.0)
-        self.assertEqual(seed["owner"], "hand_guided_navigation")
 
         robot_state["person"].update({
             "x": 4.0, "y": 1.0, "timestamp": time.monotonic(),
         })
         robot_state["camera"]["timestamp"] = time.monotonic() + 1.0
-        seed = tracker.update_stable_target_seed(
-            "hand_guided_navigation",
+        seed = tracker.stable_seeds.update(
+            robot_state["camera"],
             target="hand",
+            session_id=tracker.action_id,
+            person=robot_state["person"],
             require_person_proximity=True,
         )
         self.assertIsNone(seed)
-        self.assertIsNone(
-            tracker.get_stable_target_seed("hand_guided_navigation")
-        )
+        self.assertIsNone(tracker.stable_seeds.get())
 
-    def test_centered_hand_override_produces_owned_stable_seed(self):
-        tracker = TrackAction.__new__(TrackAction)
+    def test_centered_hand_override_produces_hand_seed(self):
+        tracker = bare_track_action()
         tracker.target = "person"
         tracker.action_id = "track-person"
         tracker.stable_threshold = 0.05
@@ -171,63 +589,61 @@ class HandGuidedNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         for index in range(tracker.TARGET_SEED_SAMPLES):
             robot_state["camera"]["timestamp"] = started_at + index * 0.01
-            tracker.set_visual_target_override(
-                "hand_guided_navigation", 0.51, 0.49
-            )
+            tracker.set_visual_target_override(0.51, 0.49)
 
-        seed = tracker.get_stable_target_seed(
-            "hand_guided_navigation",
+        seed = tracker.stable_seeds.get(
             target="hand",
             session_id="track-person",
         )
         self.assertIsNotNone(seed)
         self.assertEqual(seed["target"], "hand")
-        self.assertIsNone(tracker.get_stable_target_seed(
-            "hand_guided_navigation",
+        self.assertIsNone(tracker.stable_seeds.get(
             target="hand",
             session_id="another-session",
         ))
-        self.assertIsNone(tracker.get_stable_target_seed(
-            "hand_guided_navigation",
+        self.assertIsNone(tracker.stable_seeds.get(
             target="person",
             session_id="track-person",
         ))
 
-        tracker.set_visual_target_override(
-            "hand_guided_navigation", 0.75, 0.49
-        )
-        self.assertIsNone(
-            tracker.get_stable_target_seed("hand_guided_navigation")
-        )
+        tracker.set_visual_target_override(0.75, 0.49)
+        self.assertIsNone(tracker.stable_seeds.get())
 
     def test_track_action_seed_samples_are_unique_consecutive_and_close(self):
-        tracker = TrackAction.__new__(TrackAction)
+        tracker = bare_track_action()
         tracker.target = "person"
         started_at = time.monotonic()
         robot_state["camera"]["timestamp"] = started_at
-        tracker.update_stable_target_seed("test")
-        tracker.update_stable_target_seed("test")
-        self.assertEqual(tracker._seed_tracker().sample_count("test"), 1)
+        tracker.stable_seeds.update(
+            robot_state["camera"], target=tracker.target
+        )
+        tracker.stable_seeds.update(
+            robot_state["camera"], target=tracker.target
+        )
+        self.assertEqual(tracker.stable_seeds.status()["sample_count"], 1)
 
         for index, map_x in enumerate((2.02, 2.4), start=1):
             robot_state["camera"]["object_map_x"] = map_x
             robot_state["camera"]["timestamp"] = started_at + index * 0.01
-            seed = tracker.update_stable_target_seed("test")
+            seed = tracker.stable_seeds.update(
+                robot_state["camera"], target=tracker.target
+            )
         self.assertIsNone(seed)
 
         robot_state["camera"]["object_x"] = float("nan")
         robot_state["camera"]["timestamp"] = started_at + 0.03
-        tracker.update_stable_target_seed("test")
-        self.assertEqual(tracker._seed_tracker().sample_count("test"), 0)
+        tracker.stable_seeds.update(
+            robot_state["camera"], target=tracker.target
+        )
+        self.assertEqual(tracker.stable_seeds.status()["sample_count"], 0)
 
     async def test_seed_wait_stops_when_tracking_session_is_replaced(self):
-        tracker = TrackAction.__new__(TrackAction)
+        tracker = bare_track_action()
         tracker.active = True
         tracker.target = "person"
         tracker.action_id = "track-old"
 
         waiting = asyncio.create_task(tracker.wait_for_stable_target_seed(
-            tracker.TRACKED_TARGET_SEED_OWNER,
             target="person",
             session_id="track-old",
             check_interval=0.001,
@@ -239,109 +655,324 @@ class HandGuidedNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await waiting)
 
     def test_seed_samples_do_not_mix_tracking_sessions(self):
-        tracker = TrackAction.__new__(TrackAction)
+        tracker = bare_track_action()
         tracker.target = "person"
         tracker.action_id = "track-old"
         started_at = time.monotonic()
         for index in range(2):
             robot_state["camera"]["timestamp"] = started_at + index * 0.01
-            tracker.update_stable_target_seed("test")
+            tracker.stable_seeds.update(
+                robot_state["camera"],
+                target=tracker.target,
+                session_id=tracker.action_id,
+            )
 
         tracker.action_id = "track-new"
         robot_state["camera"]["timestamp"] = started_at + 0.02
-        self.assertIsNone(tracker.update_stable_target_seed("test"))
-        self.assertEqual(tracker._seed_tracker().sample_count("test"), 1)
+        self.assertIsNone(tracker.stable_seeds.update(
+            robot_state["camera"],
+            target=tracker.target,
+            session_id=tracker.action_id,
+        ))
+        self.assertEqual(tracker.stable_seeds.status()["sample_count"], 1)
 
-    async def test_upward_flick_dispatches_approach_to_stable_seed(self):
-        commands = []
-        action = None
+    async def test_upward_flick_dispatches_approach(self):
+        async def dispatch(command, _data):
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": True,
+                    "tracking_person": True,
+                    "following_active": False,
+                    "approach_active": False,
+                }
+            return True
 
-        async def send(payload):
-            commands.append(dict(payload))
-            asyncio.get_running_loop().call_soon(
-                action.handle_navigation_event,
-                {
-                    "event": "navigation",
-                    "action_id": payload["action_id"],
-                    "status": "Goal Reached",
-                },
-            )
-            return {"status": "accepted"}
-
-        action = self.action(send)
-        action.active = True
-        action.state = "tracking_hand"
-        action.action_id = "hand-test"
-        action.track_action.get_stable_target_seed.return_value = {
-            "captured_at": time.monotonic(),
-            "validated_at": time.monotonic(),
-            "owner": "hand_guided_navigation", "target": "hand",
-            "x": 1.0, "y": 0.1, "angle": 0.1,
-            "tof_range": 1.0, "map_x": 2.0, "map_y": 1.0,
-        }
+        handler = AsyncMock(side_effect=dispatch)
+        action = self.action(handler)
         action.hand_landmarks.detect_right_hand = AsyncMock(
             return_value=open_hand("up")
         )
         yolo = Mock()
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        for sequence in range(1, action.UP_FLICK_CONFIRM_FRAMES + 1):
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("welcome", (0.5, 0.5))
+        for sequence in range(1, action.COMMAND_CONFIRM_FRAMES + 1):
             yolo.detection_snapshot_with_frame.return_value = (
                 sequence, [person_detection()], frame, {},
             )
             await action._sample(yolo)
 
-        task = action._navigation_task
-        self.assertIsNotNone(task)
-        await task
+        approach_call = next(
+            call for call in handler.await_args_list
+            if call.args[0] == "approach_target"
+        )
+        self.assertNotIn("seed", approach_call.args[1])
 
-        self.assertEqual(commands[0]["command"], "navigate_to_approach")
-        self.assertEqual(commands[0]["standoff_m"], action.APPROACH_STANDOFF_M)
-        self.assertEqual(action.state, "awaiting_push")
+    async def test_push_for_ten_frames_stops_approach(self):
+        approach_active = True
 
-    async def test_upward_hand_and_tof_shrink_returns_then_faces_person(self):
-        commands = []
-        action = None
+        async def dispatch(command, _data):
+            nonlocal approach_active
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": True,
+                    "tracking_person": True,
+                    "following_active": False,
+                    "approach_active": approach_active,
+                }
+            if command == "stop_navigation":
+                approach_active = False
+            return True
 
-        async def send(payload):
-            commands.append(dict(payload))
-            asyncio.get_running_loop().call_soon(
-                action.handle_navigation_event,
-                {
-                    "event": "navigation",
-                    "action_id": payload["action_id"],
-                    "status": "Goal Reached",
-                },
+        handler = AsyncMock(side_effect=dispatch)
+        action = self.action(handler)
+
+        for _ in range(action.APPROACHING_STOP_CONFIRM_FRAMES - 1):
+            await action._observe_gesture("push", (0.5, 0.5))
+        self.assertNotIn(
+            "stop_navigation",
+            [call.args[0] for call in handler.await_args_list],
+        )
+
+        await action._observe_gesture("push", (0.5, 0.5))
+        await action._observe_gesture("unavailable", None)
+
+        commands = [call.args[0] for call in handler.await_args_list]
+        self.assertEqual(commands.count("stop_navigation"), 1)
+
+    async def test_push_then_down_flick_returns_then_faces_person(self):
+        action = self.action()
+        for index in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+            if index == 0:
+                await action._observe_gesture("open_other", None)
+        self.assertEqual(action._armed_gesture, "push")
+        for index in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("fingers_down", (0.5, 0.5))
+            if index == 0:
+                await action._observe_gesture("open_other", None)
+
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertIn("navigation_sequence", commands)
+
+    async def test_down_flick_without_push_pose_does_nothing(self):
+        action = self.action()
+
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("fingers_down", (0.5, 0.5))
+
+        self.assertIsNone(action._armed_gesture)
+
+    async def test_fingers_down_pose_restores_person_tracking(self):
+        action = self.action()
+        action.hand_landmarks.detect_right_hand = AsyncMock(
+            return_value=fingers_down_hand()
+        )
+        yolo = Mock()
+        yolo.detection_snapshot_with_frame.return_value = (
+            1,
+            [person_detection()],
+            np.zeros((360, 640, 3), dtype=np.uint8),
+            {},
+        )
+
+        await action._sample(yolo)
+
+        observe_call = action._dispatch_handler.await_args_list[-1]
+        self.assertEqual(observe_call.args[0], "observe_gesture")
+        self.assertEqual(observe_call.args[1]["gesture"], "fingers_down")
+
+    async def test_one_bad_frame_does_not_clear_welcome_confirmation(self):
+        action = self.action(tracking_person=False)
+        action.hand_landmarks.detect_right_hand = AsyncMock(side_effect=(
+            [open_hand("down")] * 5
+            + [None]
+            + [open_hand("down")] * 5
+        ))
+        yolo = Mock()
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        for sequence in range(1, 12):
+            yolo.detection_snapshot_with_frame.return_value = (
+                sequence, [person_detection()], frame, {},
             )
-            return {"status": "accepted"}
+            await action._sample(yolo)
 
-        action = self.action(send)
-        action.active = True
-        action.state = "awaiting_push"
-        action.action_id = "hand-test"
-        for _ in range(action.PUSH_BASELINE_SAMPLES):
-            robot_state["camera"].update({
-                "camera_tof_range": 0.40,
-                "timestamp": time.monotonic(),
-            })
-            action._observe_push("fingers_up")
-        for _ in range(action.PUSH_CONFIRM_FRAMES):
-            robot_state["camera"].update({
-                "camera_tof_range": 0.32,
-                "timestamp": time.monotonic(),
-            })
-            action._observe_push("fingers_up")
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertEqual(commands.count("observe_gesture"), 11)
+        self.assertEqual(commands[-1], "watch_target")
 
-        task = action._navigation_task
-        self.assertIsNotNone(task)
-        await task
+    async def test_push_after_push_nudges_backward(self):
+        action = self.action()
+        action._last_command_gesture = "push"
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("fingers_down", (0.5, 0.5))
 
-        local_commands = [
-            item.get("local_command") for item in commands
-            if item["command"] == "navigate_local"
-        ]
-        self.assertEqual(local_commands, ["previous_position", "face_person"])
-        self.assertEqual(action.state, "watching_person")
-        self.assertFalse(action.active)
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertIn("explicit_navigation", commands)
+        self.assertIsNone(action._last_command_gesture)
+
+    async def test_welcome_is_accepted_after_approach(self):
+        action = self.action()
+        action.hand_landmarks.detect_right_hand = AsyncMock(
+            return_value=open_hand("down")
+        )
+        yolo = Mock()
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        for sequence in range(1, action.IDLE_WELCOME_CONFIRM_FRAMES + 1):
+            yolo.detection_snapshot_with_frame.return_value = (
+                sequence, [person_detection()], frame, {},
+            )
+            await action._sample(yolo)
+
+        self.assertEqual(action._armed_gesture, "welcome")
+
+    async def test_thumb_up_for_ten_frames_stops_tracking(self):
+        action = self.action()
+
+        for _ in range(action.TRACKING_STOP_CONFIRM_FRAMES):
+            await action._observe_gesture("thumb_up", (0.5, 0.4))
+
+        stop_call = next(
+            call for call in action._dispatch_handler.await_args_list
+            if call.args[0] == "stop_watching_target"
+        )
+        self.assertEqual(stop_call.args[1]["reason"], "HAND_THUMB_UP")
+
+    async def test_welcome_then_index_starts_following(self):
+        action = self.action()
+
+        for _ in range(action.MODIFIER_CONFIRM_FRAMES):
+            await action._observe_gesture("welcome", (0.5, 0.5))
+        for _ in range(action.COMMAND_CONFIRM_FRAMES):
+            await action._observe_gesture("index_finger", (0.5, 0.4))
+
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertIn("follow_person", commands)
+
+    async def test_push_for_ten_frames_stops_following(self):
+        following_active = True
+
+        async def dispatch(command, _data):
+            nonlocal following_active
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": True,
+                    "tracking_person": True,
+                    "following_active": following_active,
+                    "approach_active": False,
+                }
+            if command == "stop_follow":
+                following_active = False
+            return True
+
+        action = self.action(AsyncMock(side_effect=dispatch))
+
+        for _ in range(action.FOLLOW_STOP_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+
+        stop_call = next(
+            call for call in action._dispatch_handler.await_args_list
+            if call.args[0] == "stop_follow"
+        )
+        self.assertEqual(stop_call.args[1]["reason"], "HAND_PUSH")
+
+    async def test_push_stops_llm_started_follow_without_claiming_session(self):
+        following_active = True
+
+        async def dispatch(command, _data):
+            nonlocal following_active
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": True,
+                    "tracking_person": True,
+                    "following_active": following_active,
+                    "approach_active": False,
+                }
+            if command == "stop_follow":
+                following_active = False
+            return True
+
+        action = self.action(AsyncMock(side_effect=dispatch))
+
+        for _ in range(action.FOLLOW_STOP_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertIn("stop_follow", commands)
+
+    async def test_push_stops_find_started_approach_without_claiming_session(self):
+        approach_active = True
+
+        async def dispatch(command, _data):
+            nonlocal approach_active
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": True,
+                    "tracking_person": True,
+                    "following_active": False,
+                    "approach_active": approach_active,
+                }
+            if command == "stop_navigation":
+                approach_active = False
+            return True
+
+        action = self.action(AsyncMock(side_effect=dispatch))
+
+        for _ in range(action.APPROACHING_STOP_CONFIRM_FRAMES):
+            await action._observe_gesture("push", (0.5, 0.5))
+
+        commands = [call.args[0] for call in action._dispatch_handler.await_args_list]
+        self.assertIn("stop_navigation", commands)
+
+    async def test_external_follow_stop_without_hand_session_returns_to_watching(self):
+        async def dispatch(command, _data):
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": False,
+                    "tracking_person": False,
+                    "following_active": False,
+                    "approach_active": False,
+                }
+            return True
+
+        action = self.action(AsyncMock(side_effect=dispatch))
+
+        context = await action._observe_gesture("unavailable", None)
+
+        self.assertEqual(context["mode"] if "mode" in context else "watching_person", "watching_person")
+
+    async def test_external_tracking_stop_returns_to_watching(self):
+        async def dispatch(command, _data):
+            if command == "observe_gesture":
+                return {
+                    "tracking_active": False,
+                    "tracking_person": False,
+                    "following_active": False,
+                    "approach_active": False,
+                }
+            return True
+
+        action = self.action(AsyncMock(side_effect=dispatch))
+
+        context = await action._observe_gesture("unavailable", None)
+
+        self.assertFalse(context["tracking_person"])
+
+    async def test_run_holds_always_on_yolo_pose_lease(self):
+        action = self.action()
+        yolo = Mock()
+
+        async def sample_once(_yolo):
+            action._running = False
+
+        action._sample = AsyncMock(side_effect=sample_once)
+        with patch("cognition.hand.interface.asyncio.sleep", AsyncMock()):
+            await action.run(yolo)
+
+        yolo.activate.assert_called_once_with(action.YOLO_OWNER, "pose")
+        yolo.deactivate.assert_called_once_with(action.YOLO_OWNER)
 
 
 if __name__ == "__main__":

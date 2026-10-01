@@ -41,11 +41,19 @@ class HandLandmarkService:
     CROP_MIN_SIZE_PX = 224
     CROP_FOREARM_SCALE = 2.6
     CROP_WRIST_FORWARD_OFFSET = 0.35
+    CROP_SMOOTHING_ALPHA = 0.25
+    CROP_HAND_FOLLOW_ALPHA = 0.20
+    CROP_EXPANSION_FACTOR = 1.45
+    CROP_EXPANSION_DECAY = 0.97
+    RIGHT_ARM_CROP_MIN_CONFIDENCE = 0.50
 
     def __init__(self, camera, model_path=None, landmarker=None, image_factory=None):
         self.camera = camera
         self._inference_lock = asyncio.Lock()
         self._last_mediapipe_timestamp_ms = 0
+        self._crop_state = None
+        self._crop_frame_shape = None
+        self._crop_expansion = 1.0
         self.model_path = Path(model_path) if model_path else (
             Path(__file__).resolve().parents[1]
             / "vision_models" / "hand_landmark_tools" / "hand_landmarker.task"
@@ -86,12 +94,32 @@ class HandLandmarkService:
 
     @staticmethod
     def _square_crop_box(width, height, center_x, center_y, size):
-        size = max(1, min(int(round(size)), int(width), int(height)))
+        size = max(1, min(int(round(size)), max(int(width), int(height))))
         x1 = int(round(float(center_x) - size / 2.0))
         y1 = int(round(float(center_y) - size / 2.0))
-        x1 = min(max(0, x1), int(width) - size)
-        y1 = min(max(0, y1), int(height) - size)
         return x1, y1, x1 + size, y1 + size
+
+    @staticmethod
+    def _extract_padded_crop(frame, crop_box):
+        x1, y1, x2, y2 = crop_box
+        size = x2 - x1
+        output = np.zeros((size, size, frame.shape[2]), dtype=frame.dtype)
+        frame_height, frame_width = frame.shape[:2]
+        source_x1 = max(0, x1)
+        source_y1 = max(0, y1)
+        source_x2 = min(frame_width, x2)
+        source_y2 = min(frame_height, y2)
+        if source_x1 >= source_x2 or source_y1 >= source_y2:
+            return output
+        destination_x1 = source_x1 - x1
+        destination_y1 = source_y1 - y1
+        destination_x2 = destination_x1 + source_x2 - source_x1
+        destination_y2 = destination_y1 + source_y2 - source_y1
+        output[
+            destination_y1:destination_y2,
+            destination_x1:destination_x2,
+        ] = frame[source_y1:source_y2, source_x1:source_x2]
+        return output
 
     @classmethod
     def _crop_box(cls, frame_shape, person):
@@ -112,6 +140,108 @@ class HandLandmarkService:
         center_y = wy + cls.CROP_WRIST_FORWARD_OFFSET * (wy - ey)
         return cls._square_crop_box(
             width, height, center_x, center_y, crop_size
+        )
+
+    @classmethod
+    def _right_arm_confidence(cls, person, name):
+        confidences = person.get("keypoint_confidences") or {}
+        value = confidences.get(name)
+        if isinstance(value, (int, float)):
+            return float(value)
+        point = (person.get("keypoints") or {}).get(name)
+        if not point:
+            return 0.0
+        value = point.get("confidence")
+        # Compatibility for pose sources created before per-joint confidence
+        # was retained. An existing joint from such a source remains usable.
+        return float(value) if isinstance(value, (int, float)) else 1.0
+
+    @classmethod
+    def _right_arm_crop_is_reliable(cls, person):
+        return all(
+            cls._right_arm_confidence(person, name)
+            >= cls.RIGHT_ARM_CROP_MIN_CONFIDENCE
+            for name in ("right_wrist", "right_elbow")
+        )
+
+    def _stabilized_crop_box(self, frame_shape, person):
+        raw_box = self._crop_box(frame_shape, person)
+        if raw_box is None:
+            self._crop_state = None
+            self._crop_frame_shape = None
+            self._crop_expansion = 1.0
+            return None
+
+        height, width = frame_shape[:2]
+        shape = (height, width)
+        raw_x1, raw_y1, raw_x2, raw_y2 = raw_box
+        desired = {
+            "center_x": (raw_x1 + raw_x2) * 0.5,
+            "center_y": (raw_y1 + raw_y2) * 0.5,
+            "size": min(
+                max(width, height),
+                (raw_x2 - raw_x1) * self._crop_expansion,
+            ),
+        }
+        crop_jump = False
+        if self._crop_state is not None:
+            crop_jump = math.hypot(
+                desired["center_x"] - self._crop_state["center_x"],
+                desired["center_y"] - self._crop_state["center_y"],
+            ) > max(desired["size"], self._crop_state["size"]) * 1.5
+        if (
+            self._crop_state is None
+            or self._crop_frame_shape != shape
+            or crop_jump
+        ):
+            self._crop_state = desired
+            self._crop_frame_shape = shape
+        else:
+            alpha = self.CROP_SMOOTHING_ALPHA
+            for name, value in desired.items():
+                self._crop_state[name] += alpha * (
+                    value - self._crop_state[name]
+                )
+
+        return self._square_crop_box(
+            width,
+            height,
+            self._crop_state["center_x"],
+            self._crop_state["center_y"],
+            self._crop_state["size"],
+        )
+
+    def _expand_next_crop(self, frame_shape):
+        if self._crop_state is None:
+            return
+        maximum = max(frame_shape[:2])
+        self._crop_expansion = min(
+            maximum / self.CROP_MIN_SIZE_PX,
+            self._crop_expansion * self.CROP_EXPANSION_FACTOR,
+        )
+        self._crop_state["size"] = min(
+            maximum,
+            self._crop_state["size"] * self.CROP_EXPANSION_FACTOR,
+        )
+
+    def _relax_crop_expansion(self):
+        self._crop_expansion = max(
+            1.0, self._crop_expansion * self.CROP_EXPANSION_DECAY
+        )
+
+    def _follow_detected_hand(self, points):
+        if self._crop_state is None or not points:
+            return
+        xs = [point["x"] for point in points.values()]
+        ys = [point["y"] for point in points.values()]
+        hand_center_x = (min(xs) + max(xs)) * 0.5
+        hand_center_y = (min(ys) + max(ys)) * 0.5
+        alpha = self.CROP_HAND_FOLLOW_ALPHA
+        self._crop_state["center_x"] += alpha * (
+            hand_center_x - self._crop_state["center_x"]
+        )
+        self._crop_state["center_y"] += alpha * (
+            hand_center_y - self._crop_state["center_y"]
         )
 
     @staticmethod
@@ -144,11 +274,28 @@ class HandLandmarkService:
         return str(path)
 
     def _detect(self, frame_bgr, person, debug_path=None):
-        crop_box = self._crop_box(frame_bgr.shape, person)
-        if crop_box is None:
-            return None
-        x1, y1, x2, y2 = crop_box
-        crop = frame_bgr[y1:y2, x1:x2]
+        frame_height, frame_width = frame_bgr.shape[:2]
+        use_full_frame = not self._right_arm_crop_is_reliable(person)
+        if use_full_frame:
+            crop_box = (0, 0, frame_width, frame_height)
+        else:
+            crop_box = self._stabilized_crop_box(frame_bgr.shape, person)
+            if crop_box is None:
+                return None
+
+        wrist = (person.get("keypoints") or {}).get("right_wrist")
+        if wrist:
+            wrist_x, wrist_y = self._point_pixels(
+                wrist, frame_width, frame_height
+            )
+        else:
+            wrist_x, wrist_y = frame_width * 0.5, frame_height * 0.5
+        x1, y1, _, _ = crop_box
+        crop = (
+            frame_bgr
+            if use_full_frame
+            else self._extract_padded_crop(frame_bgr, crop_box)
+        )
         rgb = np.ascontiguousarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
         timestamp_ms = max(
             self._last_mediapipe_timestamp_ms + 1,
@@ -158,15 +305,14 @@ class HandLandmarkService:
         result = self.landmarker.detect_for_video(
             self._image_factory(rgb), timestamp_ms
         )
+
         if not result.hand_landmarks:
+            if not use_full_frame:
+                self._expand_next_crop(frame_bgr.shape)
             self._save_debug_crop(crop, crop_box, None, debug_path)
             return None
 
-        frame_height, frame_width = frame_bgr.shape[:2]
         crop_height, crop_width = crop.shape[:2]
-        wrist_x, wrist_y = self._point_pixels(
-            person["keypoints"]["right_wrist"], frame_width, frame_height
-        )
 
         def full_point(point):
             pixel_x = x1 + float(point.x) * crop_width
@@ -182,24 +328,57 @@ class HandLandmarkService:
             return transformed
 
         hands = []
-        for landmarks in result.hand_landmarks:
+        handedness_hands = getattr(result, "handedness", None) or []
+        for hand_index, landmarks in enumerate(result.hand_landmarks):
             points = {
                 name: full_point(landmarks[index])
                 for index, name in LANDMARK_NAMES.items()
             }
+            handedness = None
+            handedness_score = None
+            if (
+                hand_index < len(handedness_hands)
+                and handedness_hands[hand_index]
+            ):
+                category = handedness_hands[hand_index][0]
+                handedness = getattr(category, "category_name", None)
+                score = getattr(category, "score", None)
+                if score is not None:
+                    handedness_score = float(score)
             distance = math.hypot(
                 points["wrist"]["x"] - wrist_x,
                 points["wrist"]["y"] - wrist_y,
             )
-            hands.append((distance, points))
-        points = min(hands, key=lambda item: item[0])[1]
+            hands.append((
+                distance, points, handedness, handedness_score, landmarks,
+            ))
+        selected = min(hands, key=lambda item: item[0])
+        crop_landmarks = selected[4]
+        touches_edge = any(
+            float(point.x) <= 0.03
+            or float(point.x) >= 0.97
+            or float(point.y) <= 0.03
+            or float(point.y) >= 0.97
+            for point in crop_landmarks
+        )
+        if not use_full_frame:
+            if touches_edge:
+                self._expand_next_crop(frame_bgr.shape)
+            else:
+                self._relax_crop_expansion()
+
+        _, points, handedness, handedness_score, _ = selected
+        self._follow_detected_hand(points)
         saved_debug_path = self._save_debug_crop(
             crop, crop_box, points, debug_path
         )
         return {
             "landmarks": points,
+            "handedness": handedness,
+            "handedness_score": handedness_score,
             "image_width": frame_width,
             "image_height": frame_height,
+            "inference_scope": "full_frame" if use_full_frame else "crop",
             "crop_size_px": crop.shape[1],
             "crop_box": list(crop_box),
             "mediapipe_timestamp_ms": timestamp_ms,

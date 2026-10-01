@@ -36,6 +36,7 @@ setup(
             'ring_bridge.py = robot.store.ring_bridge:main',
             'test_servo.py = robot.utilities.camera_servo:main',
             'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
+            'system_watchdog.py = robot.watchdog.system_watchdog:main',
         ],
     },
 )

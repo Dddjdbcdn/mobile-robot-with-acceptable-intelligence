@@ -32,8 +32,9 @@ def test_scan_processing_stays_dormant_until_first_seed():
     from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
+    tracker.seed_lock = threading.Lock()
+    tracker.latest_seed = None
     tracker.enabled = False
-    tracker._apply_pending_control = Mock()
     tracker._publish_disabled = Mock()
     tracker._lookup_transform = Mock()
     scan = LaserScan()
@@ -195,58 +196,36 @@ def test_trusted_seed_biases_candidate_choice_without_becoming_pose():
     assert selected is person
 
 
-def test_disabling_camera_session_keeps_continuous_lidar_track():
+def test_pending_seed_activates_lidar_processing_once():
     from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.seed_lock = threading.Lock()
-    tracker.enabled = True
-    tracker.session_id = "person-1"
-    tracker.last_alive_at = 1.0
-    tracker.pending_control = (False, "person-1")
-    tracker.track = object()
-    tracker.pending_position = np.array([1.0, 2.0])
-    tracker.pending_hits = 2
+    tracker.enabled = False
     tracker.latest_seed = {"x": 1.0, "y": 2.0}
-    tracker.last_seed_position = np.array([1.0, 2.0])
-    tracker.last_seed_at = 1.0
-    tracker.seed_mismatch_hits = 1
-    tracker.acquisition_state = "tracking"
-    tracker.acquisition_started_at = None
-    tracker.last_detections = [object()]
+    tracker.acquisition_state = "disabled"
+    tracker.get_logger = Mock(return_value=Mock())
 
-    tracker._apply_pending_control()
+    tracker._activate_from_pending_seed()
 
     assert tracker.enabled
-    assert tracker.session_id == "person-1"
-    assert tracker.track is not None
-    assert tracker.pending_hits == 2
+    assert tracker.acquisition_state == "waiting"
+    tracker.get_logger().info.assert_called_once()
 
 
-def test_new_camera_session_keeps_old_track_while_updating_session():
+def test_enabled_lidar_ignores_later_activation_attempts():
     from robot.person_pose.person_lidar_tracker import PersonLidarTracker
 
     tracker = PersonLidarTracker.__new__(PersonLidarTracker)
     tracker.seed_lock = threading.Lock()
     tracker.enabled = True
-    tracker.session_id = "person-1"
-    tracker.last_alive_at = 1.0
-    tracker.pending_control = (True, "person-2")
-    tracker.track = object()
-    tracker.pending_position = np.array([1.0, 2.0])
-    tracker.pending_hits = 2
-    tracker.latest_seed = None
-    tracker.last_seed_position = np.array([1.0, 2.0])
-    tracker.last_seed_at = 1.0
-    tracker.seed_mismatch_hits = 1
     tracker.acquisition_state = "tracking"
-    tracker.acquisition_started_at = None
-    tracker.last_detections = [object()]
+    tracker.latest_seed = {"x": 3.0, "y": 4.0}
+    tracker.get_logger = Mock(return_value=Mock())
 
-    tracker._apply_pending_control()
+    tracker._activate_from_pending_seed()
 
     assert tracker.enabled
-    assert tracker.session_id == "person-2"
-    assert tracker.track is not None
-    assert tracker.pending_hits == 2
-    assert tracker.last_seed_position is not None
+    assert tracker.acquisition_state == "tracking"
+    assert tracker.latest_seed == {"x": 3.0, "y": 4.0}
+    tracker.get_logger().info.assert_not_called()

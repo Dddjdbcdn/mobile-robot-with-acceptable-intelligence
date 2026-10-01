@@ -1,4 +1,4 @@
-"""Owner-scoped validation and storage for tracked-target ToF seeds."""
+"""Validation and storage for the current tracked-target ToF seed."""
 
 from collections import deque
 import math
@@ -14,24 +14,17 @@ class StableTargetSeedTracker:
     HAND_PERSON_MAX_DISTANCE_M = 0.85
 
     def __init__(self):
-        self._samples = {}
-        self._stable = {}
+        self._samples = deque(maxlen=self.SAMPLE_COUNT)
+        self._stable = None
+        self._stable_since = None
 
-    def clear(self, owner=None):
-        if owner is None:
-            self._samples.clear()
-            self._stable.clear()
-            return
-        owner = str(owner)
-        self._samples.pop(owner, None)
-        self._stable.pop(owner, None)
-
-    def sample_count(self, owner):
-        return len(self._samples.get(str(owner), ()))
+    def clear(self):
+        self._samples.clear()
+        self._stable = None
+        self._stable_since = None
 
     def update(
         self,
-        owner,
         camera,
         *,
         target=None,
@@ -39,7 +32,6 @@ class StableTargetSeedTracker:
         person=None,
         require_person_proximity=False,
     ):
-        owner = str(owner)
         camera = dict(camera or {})
         now = time.monotonic()
         values = [
@@ -80,21 +72,17 @@ class StableTargetSeedTracker:
                 ) <= self.HAND_PERSON_MAX_DISTANCE_M
 
         if not valid:
-            self.clear(owner)
+            self.clear()
             return None
 
-        samples = self._samples.setdefault(
-            owner, deque(maxlen=self.SAMPLE_COUNT)
-        )
-        if samples and (
-            samples[-1]["target"] != target
-            or samples[-1]["session_id"] != session_id
+        if self._samples and (
+            self._samples[-1]["target"] != target
+            or self._samples[-1]["session_id"] != session_id
         ):
-            samples.clear()
-            self._stable.pop(owner, None)
+            self.clear()
         timestamp = float(camera["timestamp"])
-        if samples and timestamp <= samples[-1]["timestamp"]:
-            return self.get(owner)
+        if self._samples and timestamp <= self._samples[-1]["timestamp"]:
+            return self.get(target=target, session_id=session_id)
 
         sample = {
             "x": float(camera["object_x"]),
@@ -114,55 +102,85 @@ class StableTargetSeedTracker:
             "session_id": session_id,
             "timestamp": timestamp,
         }
-        if samples and samples[-1]["stability_frame"] != sample["stability_frame"]:
-            samples.clear()
-        samples.append(sample)
-        self._stable.pop(owner, None)
-        if len(samples) < self.SAMPLE_COUNT:
+        if (
+            self._samples
+            and self._samples[-1]["stability_frame"]
+            != sample["stability_frame"]
+        ):
+            self.clear()
+        self._samples.append(sample)
+        self._stable = None
+        if len(self._samples) < self.SAMPLE_COUNT:
+            self._stable_since = None
             return None
 
-        center_x = median(item["stability_x"] for item in samples)
-        center_y = median(item["stability_y"] for item in samples)
+        center_x = median(item["stability_x"] for item in self._samples)
+        center_y = median(item["stability_y"] for item in self._samples)
         spread = max(
             math.hypot(
                 item["stability_x"] - center_x,
                 item["stability_y"] - center_y,
             )
-            for item in samples
+            for item in self._samples
         )
         if spread > self.MAX_SPREAD_M:
+            self._stable_since = None
             return None
 
         stable = {
-            key: median(item[key] for item in samples)
+            key: median(item[key] for item in self._samples)
             for key in ("x", "y", "angle", "tof_range")
         }
         stable["map_x"] = (
-            median(item["map_x"] for item in samples) if map_valid else None
+            median(item["map_x"] for item in self._samples)
+            if map_valid else None
         )
         stable["map_y"] = (
-            median(item["map_y"] for item in samples) if map_valid else None
+            median(item["map_y"] for item in self._samples)
+            if map_valid else None
         )
         stable.update({
-            "owner": owner,
             "target": target,
             "session_id": session_id,
-            "captured_at": max(item["timestamp"] for item in samples),
+            "captured_at": max(
+                item["timestamp"] for item in self._samples
+            ),
             "validated_at": now,
         })
-        self._stable[owner] = stable
+        if self._stable_since is None:
+            self._stable_since = now
+        self._stable = stable
         return dict(stable)
+
+    def status(self, *, target=None, session_id=None):
+        """Return display-friendly progress for the current seed stream."""
+        seed = self.get(target=target, session_id=session_id)
+        valid_since = self._stable_since if seed is not None else None
+        samples_match = bool(self._samples) and (
+            (target is None or self._samples[-1]["target"] == target)
+            and (
+                session_id is None
+                or self._samples[-1]["session_id"] == session_id
+            )
+        )
+        return {
+            "valid": seed is not None,
+            "valid_for_seconds": (
+                max(0.0, time.monotonic() - valid_since)
+                if valid_since is not None else 0.0
+            ),
+            "sample_count": len(self._samples) if samples_match else 0,
+            "sample_target": self.SAMPLE_COUNT,
+        }
 
     def get(
         self,
-        owner,
         max_age_seconds=None,
         *,
         target=None,
         session_id=None,
     ):
-        owner = str(owner)
-        seed = self._stable.get(owner)
+        seed = self._stable
         if seed is None:
             return None
         if target is not None and seed.get("target") != target:
@@ -174,6 +192,6 @@ class StableTargetSeedTracker:
             if max_age_seconds is None else float(max_age_seconds)
         )
         if time.monotonic() - seed["validated_at"] > max_age:
-            self.clear(owner)
+            self.clear()
             return None
         return dict(seed)

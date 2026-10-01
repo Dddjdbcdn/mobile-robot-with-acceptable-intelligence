@@ -28,7 +28,7 @@ class YoloService():
         self.detections = []
         self.inference_thread = threading.Thread(target=self.timer_callback, daemon=True)
         self.running = False
-        self.fps = 20.0
+        self.fps = 10.0
         self.current_fps = 0.0
         self._fps_window_started = time.monotonic()
         self._fps_frame_count = 0
@@ -342,6 +342,7 @@ class YoloService():
             keypoints_conf = result.keypoints.conf[i].cpu().numpy()
 
             human_keypoints = {}
+            human_keypoint_confidences = {}
 
             for name, (x, y), (nx, ny), kp_conf in zip(
                 keypoint_names,
@@ -349,6 +350,9 @@ class YoloService():
                 keypoints_xyn,
                 keypoints_conf,
             ):
+                human_keypoint_confidences[name] = round(
+                    float(kp_conf), 3
+                )
 
                 if kp_conf < self.conf_threshold: continue
                 
@@ -383,6 +387,7 @@ class YoloService():
                 },
 
                 "keypoints": human_keypoints,
+                "keypoint_confidences": human_keypoint_confidences,
             })
 
         return detections

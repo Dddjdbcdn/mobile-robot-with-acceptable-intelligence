@@ -3,6 +3,7 @@ import math,time
 robot_state = {
     "pose": None,
     "person": None,
+    "lidar_person": {"state": None, "pose_age_seconds": None},
     "camera": {
         "camera_tof_range": 0.0,
         "pan_angle": 0.0,
@@ -22,6 +23,7 @@ def update_state(message):
     tilt_angle = float(message.get("servo_tilt_angle") or 90.0)
     robot_pose = message.get("robot_pose")
     person_pose = message.get("person_pose")
+    tracker_status = message.get("person_tracker_status")
 
     zenith = math.radians(tilt_angle)
     azimuth = math.radians(pan_angle - 95)
@@ -51,6 +53,15 @@ def update_state(message):
             "timestamp": time.monotonic() - float(person_pose.get("age_seconds") or 0.0),
             "tracking_state": message.get("person_tracker_state"),
         }
+
+    robot_state["lidar_person"] = {
+        **(tracker_status if isinstance(tracker_status, dict) else {}),
+        "state": message.get("person_tracker_state"),
+        "pose_age_seconds": (
+            float(person_pose.get("age_seconds") or 0.0)
+            if isinstance(person_pose, dict) else None
+        ),
+    }
 
     robot_state["camera"].update({
         "camera_tof_range": camera_tof_range,

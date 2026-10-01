@@ -24,6 +24,7 @@ class ExplicitNavigationAction:
 
     NAVIGATION_TIMEOUT = 90.0
     EXIT_MAX_PASSES = 12
+    OPEN_SPACE_MAX_PASSES = 4
     # SLAM publishes /map every 10 s and analysis runs at 0.5 Hz. Allow one
     # full publication interval plus the following analysis cycle.
     MAP_REFRESH_TIMEOUT = 15.0
@@ -88,6 +89,8 @@ class ExplicitNavigationAction:
         try:
             if self.target in ROOM_STEP_COMMANDS:
                 return await self._run_exit_room()
+            if self.target == "open_space_middle":
+                return await self._run_open_space_middle()
             payload = {
                 "command": "navigate_local",
                 "action_id": self.action_id,
@@ -128,6 +131,89 @@ class ExplicitNavigationAction:
                 "failed", "command_failed", "NAVIGATION_COMMAND_FAILED",
                 {"error": f"{type(error).__name__}: {error}"},
             )
+
+    async def _run_open_space_middle(self):
+        state = None
+        after_revision = None
+        after_map_received_at = None
+        destinations = []
+        for pass_index in range(self.OPEN_SPACE_MAX_PASSES):
+            feedback = await self._request_open_space_step(
+                state, after_revision, after_map_received_at
+            )
+            if feedback.get("status") != "accepted":
+                return self._finish(
+                    "failed", "open_space_blocked", "OPEN_SPACE_BLOCKED",
+                    {"message": str(feedback), "passes": pass_index},
+                )
+
+            state = feedback.get("open_space_state")
+            after_revision = feedback.get("map_revision")
+            phase = feedback.get("open_space_phase")
+            destinations.append({
+                "phase": phase,
+                "recovery_reason": feedback.get("recovery_reason"),
+                "destination": feedback.get("destination"),
+            })
+            event = await asyncio.wait_for(
+                self._navigation_future, self.NAVIGATION_TIMEOUT
+            )
+            if event.get("status") != "Goal Reached":
+                return self._finish(
+                    "failed", "navigation_failed", "NAVIGATION_FAILED",
+                    {"robot_status": event.get("status"),
+                     "passes": pass_index + 1},
+                )
+            if phase == "move_to_room_core":
+                return self._finish(
+                    "succeeded", "open_space_middle_reached",
+                    data={
+                        "passes": pass_index + 1,
+                        "destinations": destinations,
+                        "destination": feedback.get("destination"),
+                    },
+                )
+
+            after_map_received_at = time.time_ns()
+            self._navigation_future = asyncio.get_running_loop().create_future()
+
+        return self._finish(
+            "failed", "open_space_limit", "OPEN_SPACE_PASS_LIMIT",
+            {"passes": self.OPEN_SPACE_MAX_PASSES,
+             "destinations": destinations},
+        )
+
+    async def _request_open_space_step(
+        self, state, after_revision, after_map_received_at
+    ):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.MAP_REFRESH_TIMEOUT
+        while True:
+            payload = {
+                "command": "navigate_local",
+                "action_id": self.action_id,
+                "local_command": self.target,
+                "open_space_state": state,
+            }
+            if after_revision is not None:
+                payload["after_map_revision"] = after_revision
+            if after_map_received_at is not None:
+                payload["after_map_received_at_unix_ns"] = (
+                    after_map_received_at
+                )
+            feedback = await self.send_robot_command(payload)
+            if not isinstance(feedback, dict):
+                await self._capture_map_render()
+                return {"status": "error", "message": str(feedback)}
+            if feedback.get("status") != "map_updating":
+                await self._capture_map_render(feedback.get("destination"))
+                return feedback
+            if loop.time() >= deadline:
+                return {
+                    "status": "error",
+                    "message": "Map did not refresh after the previous pass",
+                }
+            await asyncio.sleep(0.25)
 
     async def _run_exit_room(self):
         state = None

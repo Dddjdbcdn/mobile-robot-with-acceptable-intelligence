@@ -95,7 +95,6 @@ class TrackerSettings:
     coast_seconds: float = 0.75
     lost_seconds: float = 1.75
     initialization_timeout_seconds: float = 2.0
-    tracking_alive_timeout_seconds: float = 3.0
 
     @classmethod
     def from_node(cls, node: Node) -> TrackerSettings:
@@ -308,6 +307,7 @@ class PersonLidarTracker(Node):
         self.seed_lock = threading.Lock()
         self.last_seed_position: np.ndarray | None = None
         self.last_seed_at: float | None = None
+        self.last_seed_accepted_at: float | None = None
         self.seed_mismatch_hits = 0
         self.handoff_position: np.ndarray | None = None
         self.handoff_velocity = np.zeros(2, dtype=float)
@@ -318,9 +318,6 @@ class PersonLidarTracker(Node):
         self.acquisition_started_at: float | None = None
         self.last_detections: list[Detection] = []
         self.enabled = False
-        self.session_id: str | None = None
-        self.last_alive_at: float | None = None
-        self.pending_control = None
 
         self.zmq_running = True
         self.zmq_context = zmq.Context()
@@ -351,63 +348,34 @@ class PersonLidarTracker(Node):
             except zmq.ZMQError:
                 return
 
-            message_type = message.get("type")
-            action_id = message.get("action_id")
-            if message_type == "person_tracking_state":
-                with self.seed_lock:
-                    if message.get("active"):
-                        self.last_alive_at = time.monotonic()
-                    if not message.get("active"):
-                        self.latest_seed = None
-                continue
-            if message_type != "person_tof_position":
+            if message.get("type") != "person_tof_position":
                 continue
             try:
                 seed = {
                     "x": float(message["x"]),
                     "y": float(message["y"]),
                     "frame_id": str(message.get("frame_id") or self.base_frame),
-                    "received_at": time.monotonic(),
                 }
             except (KeyError, TypeError, ValueError):
                 continue
 
             with self.seed_lock:
-                self.pending_control = (True, action_id)
-                self.last_alive_at = time.monotonic()
                 self.latest_seed = seed
 
-    def _reset_tracking_state(self) -> None:
-        self.track = None
-        self.pending_position = None
-        self.pending_hits = 0
-        self.latest_seed = None
-        self.last_seed_position = None
-        self.last_seed_at = None
-        self.seed_mismatch_hits = 0
-        self._clear_seed_handoff()
-        self.acquisition_state = "waiting"
-        self.acquisition_started_at = None
-        self.last_detections = []
-
-    def _apply_pending_control(self) -> None:
+    def _activate_from_pending_seed(self) -> None:
+        """Enable processing once, when the first visual seed is available."""
+        if self.enabled:
+            return
         with self.seed_lock:
-            control = self.pending_control
-            self.pending_control = None
-        if control is None:
+            has_seed = self.latest_seed is not None
+        if not has_seed:
             return
 
-        active, action_id = control
-        if active:
-            first_activation = not self.enabled
-            self.enabled = True
-            self.session_id = action_id or "continuous"
-            if first_activation:
-                self.acquisition_state = "waiting"
-                self.get_logger().info(
-                    "Received first ToF seed; lidar person tracking enabled"
-                )
-        # Camera tracking leases end independently. Lidar awareness stays on.
+        self.enabled = True
+        self.acquisition_state = "waiting"
+        self.get_logger().info(
+            "Received first ToF seed; lidar person tracking enabled"
+        )
 
     def _take_seed(self):
         with self.seed_lock:
@@ -443,7 +411,7 @@ class PersonLidarTracker(Node):
         return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
 
     def scan_callback(self, scan: LaserScan) -> None:
-        self._apply_pending_control()
+        self._activate_from_pending_seed()
         if not self.enabled:
             self._publish_disabled(scan.header.stamp)
             return
@@ -567,6 +535,7 @@ class PersonLidarTracker(Node):
     def _accept_trusted_seed(self, seed_position: np.ndarray) -> None:
         self.last_seed_position = seed_position.copy()
         self.last_seed_at = time.monotonic()
+        self.last_seed_accepted_at = self.last_seed_at
 
         if self.track is None:
             if self.acquisition_state == "waiting":
@@ -827,6 +796,10 @@ class PersonLidarTracker(Node):
         )
         status = {
             "state": published_state,
+            "seed_accepted_age_seconds": (
+                max(0.0, time.monotonic() - self.last_seed_accepted_at)
+                if self.last_seed_accepted_at is not None else None
+            ),
             "candidate_count": len(self.last_detections),
             "initialization_hits": self.pending_hits,
             "seed_mismatch_hits": self.seed_mismatch_hits,

@@ -123,6 +123,59 @@ class ExplicitNavigationActionTests(unittest.IsolatedAsyncioTestCase):
             {"x": 2.0, "y": 0.0},
         )
 
+    async def test_open_space_explores_then_moves_to_room_core(self):
+        responses = [
+            {
+                "status": "accepted",
+                "open_space_phase": "stabilize_room_map",
+                "open_space_state": {"recovery_moves": 1, "passes": 1},
+                "recovery_reason": "no_room_core",
+                "map_revision": 10,
+                "destination": {"x": 0.5, "y": 0.0},
+            },
+            {"status": "map_updating"},
+            {
+                "status": "accepted",
+                "open_space_phase": "move_to_room_core",
+                "open_space_state": {"recovery_moves": 1, "passes": 2},
+                "map_revision": 20,
+                "destination": {"x": 1.5, "y": 0.5},
+            },
+        ]
+        requests = []
+        action = None
+
+        async def send_robot_command(payload):
+            requests.append(dict(payload))
+            response = responses.pop(0)
+            if response["status"] == "accepted":
+                asyncio.get_running_loop().call_soon(
+                    action.handle_navigation_event,
+                    {
+                        "event": "navigation", "action_id": "open-1",
+                        "status": "Goal Reached",
+                    },
+                )
+            return response
+
+        action = ExplicitNavigationAction(send_robot_command)
+        with patch(
+            "actions.explicit_navigation_action.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            await action.start("open_space_middle", "open-1")
+            result = await action.wait_until_finished()
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.outcome, "open_space_middle_reached")
+        self.assertEqual(result.data["passes"], 2)
+        self.assertEqual(result.data["destination"]["x"], 1.5)
+        self.assertEqual(requests[1]["after_map_revision"], 10)
+        self.assertEqual(requests[2]["after_map_revision"], 10)
+        self.assertEqual(
+            requests[2]["open_space_state"]["recovery_moves"], 1
+        )
+
     async def test_exit_room_stops_when_crossing_is_ready(self):
         responses = [
             {

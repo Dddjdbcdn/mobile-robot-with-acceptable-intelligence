@@ -54,7 +54,6 @@ class FollowPersonExecutor:
         try:
             acquired = await self._acquire_target()
             if acquired.status != "succeeded":
-                await self._stop_tracking("FOLLOW_ACQUISITION_FAILED")
                 self._finish(
                     "failed", "follow_failed",
                     acquired.reason_code or "FOLLOW_ACQUISITION_FAILED",
@@ -72,7 +71,6 @@ class FollowPersonExecutor:
                     if isinstance(feedback, dict)
                     else "invalid_follow_feedback"
                 )
-                await self._stop_tracking("FOLLOW_REJECTED")
                 self._finish(
                     "failed", "follow_rejected", "FOLLOW_REJECTED",
                     {"message": message},
@@ -93,7 +91,6 @@ class FollowPersonExecutor:
                     "command": "stop_follow_action",
                     "action_id": self.action_id,
                 })
-                await self._stop_tracking("FOLLOW_EXECUTION_ERROR")
                 self._finish(
                     "failed", "execution_error", "FOLLOW_EXECUTION_ERROR",
                     {"error": f"{type(error).__name__}: {error}"},
@@ -119,7 +116,6 @@ class FollowPersonExecutor:
         ):
             tracking_session_id = self.track_action.action_id
             seed = await self.track_action.wait_for_stable_target_seed(
-                self.track_action.TRACKED_TARGET_SEED_OWNER,
                 target=self.track_action.target,
                 session_id=tracking_session_id,
                 timeout=10.0,
@@ -163,12 +159,6 @@ class FollowPersonExecutor:
         """Retry vision indefinitely while lidar still owns a valid track."""
         tracking_action_id = f"{self.action_id}:track"
         while self.active and not self._stop_requested and not self._lidar_lost:
-            keep_alive = getattr(
-                self.track_action, "keep_person_tracker_alive", None
-            )
-            if keep_alive is not None:
-                await keep_alive(tracking_action_id)
-
             result = await self.track_action.start_tracking(
                 target="torso center",
                 action_id=tracking_action_id,
@@ -179,10 +169,6 @@ class FollowPersonExecutor:
                 return True
             await asyncio.sleep(0.25)
         return False
-
-    async def _stop_tracking(self, reason_code):
-        if self.track_action.active:
-            await self.track_action.stop_tracking(reason_code)
 
     async def handle_navigation_event(self, payload):
         if not self.active:
@@ -199,7 +185,6 @@ class FollowPersonExecutor:
                 "command": "stop_follow_action",
                 "action_id": self.action_id,
             })
-            await self._stop_tracking("LIDAR_TRACK_LOST")
             self._finish(
                 "failed", "target_lost", "LIDAR_TRACK_LOST",
                 {"tracker_state": "lost"},
@@ -210,7 +195,6 @@ class FollowPersonExecutor:
             return False
 
         status = str(payload.get("status", ""))
-        await self._stop_tracking("FOLLOW_NAVIGATION_ENDED")
         self._finish(
             "failed", "navigation_ended", "FOLLOW_NAVIGATION_ENDED",
             {"robot_status": status or "unknown"},
@@ -238,7 +222,6 @@ class FollowPersonExecutor:
             "command": "stop_follow_action",
             "action_id": self.action_id,
         })
-        await self._stop_tracking(reason_code)
         result = self._finish("cancelled", "stopped", reason_code)
         if runner is not None and runner is not asyncio.current_task():
             await asyncio.gather(runner, return_exceptions=True)

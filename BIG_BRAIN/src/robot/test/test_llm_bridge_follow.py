@@ -75,6 +75,45 @@ def bridge_for_pose_callback():
     return bridge
 
 
+def bridge_for_tracking_loop(pan_angle=95.0):
+    bridge = LLMRosBridge.__new__(LLMRosBridge)
+    bridge.servo = Mock()
+    bridge.servo.pan_angle = pan_angle
+    bridge.servo.min_pan_angle = 30.0
+    bridge.servo.max_pan_angle = 160.0
+    bridge.navigation_active = False
+    bridge.tracking_body_active = False
+    bridge.track_body_pan_margin_deg = 15.0
+    bridge.track_body_pan_hysteresis_deg = 5.0
+    bridge.track_body_kp = 0.08
+    bridge.track_body_max_angular_vel = 1.0
+    bridge.publish_cmd = Mock()
+    return bridge
+
+
+def test_tracking_turns_body_before_servo_hard_limit_and_keeps_turning():
+    bridge = bridge_for_tracking_loop(pan_angle=150.0)
+    bridge.servo.publish_servo_command.return_value = 0.0
+
+    bridge.track_action_loop()
+    bridge.track_action_loop()
+
+    assert bridge.tracking_body_active is True
+    assert bridge.publish_cmd.call_count == 2
+    bridge.publish_cmd.assert_called_with(0.0, pytest.approx(0.8))
+
+
+def test_tracking_stops_after_pan_reenters_hysteresis_band():
+    bridge = bridge_for_tracking_loop(pan_angle=150.0)
+    bridge.track_action_loop()
+    bridge.servo.pan_angle = 139.0
+
+    bridge.track_action_loop()
+
+    assert bridge.tracking_body_active is False
+    bridge.publish_cmd.assert_called_with(0.0, 0.0)
+
+
 def test_active_follow_generates_standoff_goal_update():
     bridge = bridge_for_pose_callback()
     pose = PoseStamped()

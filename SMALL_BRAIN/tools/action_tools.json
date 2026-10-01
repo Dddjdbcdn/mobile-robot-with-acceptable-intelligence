@@ -54,7 +54,7 @@
         "local_command": {
           "type": "string",
           "enum": ["nudge_forward", "nudge_backward", "nudge_left", "nudge_right", "rotate_left", "rotate_right", "rotate_around", "furthest_forward", "furthest_backward", "open_space_middle", "previous_position", "exit_room", "go_to_another_room", "go_to_room", "return_to_initial_place"],
-          "description": "Map the user's explicit wording to exactly one command. Use nudge_* for a short translation, rotate_* for an in-place turn, furthest_* for maximum reachable travel, open_space_middle for the center of free space, previous_position to undo the last navigation, exit_room to reach but not cross the current exit, go_to_another_room to cross into the adjacent room, go_to_room for a numbered room, and return_to_initial_place for the startup location in Room 1."
+          "description": "Map the user's explicit wording to exactly one command. Use nudge_* for a short translation, rotate_* for an in-place turn, furthest_* for maximum reachable travel, open_space_middle for the center of the current room's core open space (the robot may briefly explore until that core is mapped), previous_position to undo the last navigation, exit_room to reach but not cross the current exit, go_to_another_room to cross into the adjacent room, go_to_room for a numbered room, and return_to_initial_place for the startup location in Room 1."
         },
         "room_id": {
           "type": ["integer", "null"],

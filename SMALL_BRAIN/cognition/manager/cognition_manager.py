@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 import json
 from statistics import median
 import time
 import uuid
 
 from actions.action_result import ActionResult
-from actions.tracking.target_catalog import normalize_human_target
+from cognition.manager.action_reporting import action_envelope
+from cognition.manager.action_state import ActionState
 
 @dataclass(frozen=True, slots=True)
 class ToolRequest:
@@ -18,6 +19,10 @@ class ToolRequest:
     call_id: str
     action_id: str
     response_metadata: dict
+
+    @property
+    def silent(self):
+        return bool(self.response_metadata.get("silent"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +49,8 @@ class Shutdown:
 
 
 class CognitionManager:
+    HAND_APPROACH_STANDOFF_M = 0.05
+    HAND_APPROACH_TIMEOUT = 90.0
     OOB_TOOLS = {
         "assess_frame_search",
         "assess_batch_search",
@@ -68,7 +75,7 @@ class CognitionManager:
         proximity_cooldown=8.0,
         explicit_navigation_action=None,
         map_navigation_action=None,
-        hand_guided_navigation=None,
+        hand_gesture_interface=None,
     ):
         self.approach_action = approach_action
         self.search_action = search_action
@@ -76,7 +83,7 @@ class CognitionManager:
         self.track_action = track_action
         self.explicit_navigation_action = explicit_navigation_action
         self.map_navigation_action = map_navigation_action
-        self.hand_guided_navigation = hand_guided_navigation
+        self.hand_gesture_interface = hand_gesture_interface
         self.find_target_executor = find_target_executor
         self.follow_person_executor = follow_person_executor
         self.response_manager = response_manager
@@ -91,13 +98,28 @@ class CognitionManager:
         self._pending_world_state: dict | None = None
         self._world_state_queued = False
         self._last_proximity_reaction = 0.0
-        self._acquire_person_after_startup = True
+        self._acquire_person_after_startup = False
         self._startup_person_acquisition_pending = True
         self._autonomy_task: asyncio.Task | None = None
         self._tof_history = deque(maxlen=5)
         self._proximity_candidate_count = 0
+        self._hand_location = None
+        self._hand_approach_started_at = None
+
+        self.action_state = ActionState(
+            search=self.search_action,
+            tracking=self.track_action,
+            approach=self.approach_action,
+            explicit_navigation=self.explicit_navigation_action,
+            find_target=self.find_target_executor,
+            follow_person=self.follow_person_executor,
+        )
 
         self.proximity_cooldown = proximity_cooldown
+        if self.hand_gesture_interface is not None:
+            self.hand_gesture_interface.set_dispatcher(
+                self.handle_hand_command
+            )
 
     async def handle_tool_call(
         self,
@@ -127,11 +149,8 @@ class CognitionManager:
         if self.explicit_navigation_action is not None:
             self.explicit_navigation_action.handle_navigation_event(message)
         map_navigation = getattr(self, "map_navigation_action", None)
-        hand_navigation = getattr(self, "hand_guided_navigation", None)
         if map_navigation is not None:
             map_navigation.handle_navigation_event(message)
-        if hand_navigation is not None:
-            hand_navigation.handle_navigation_event(message)
 
     async def publish_world_state(self, payload):
         self._pending_world_state = dict(payload)
@@ -156,8 +175,8 @@ class CognitionManager:
     async def shutdown(self):
         if self.follow_person_executor.active:
             await self.follow_person_executor.stop("SHUTDOWN")
-        if self.hand_guided_navigation is not None:
-            await self.hand_guided_navigation.stop("SHUTDOWN")
+        if self.hand_gesture_interface is not None:
+            await self.hand_gesture_interface.stop("SHUTDOWN")
         if self.find_target_executor.active:
             await self.find_target_executor.stop("SHUTDOWN")
         elif self.explicit_navigation_action is not None and self.explicit_navigation_action.active:
@@ -167,6 +186,112 @@ class CognitionManager:
             autonomy_task.cancel()
             await asyncio.gather(autonomy_task, return_exceptions=True)
         await self.events.put(Shutdown())
+
+    async def handle_hand_command(self, command, data):
+        """Resolve gesture input against the same global actions used by tools."""
+
+        if command == "observe_gesture":
+            if self.action_state.person_tracking:
+                seed = self.track_action.stable_seeds.get(
+                    target="hand", session_id=self.track_action.action_id
+                )
+                if data.get("gesture") in {"welcome", "push"}:
+                    palm_center = data.get("palm_center")
+                    if palm_center is not None:
+                        self.track_action.set_visual_target_override(*palm_center)
+                    latest_seed = self.track_action.stable_seeds.get(
+                        target="hand", session_id=self.track_action.action_id
+                    )
+                    if isinstance(latest_seed, dict):
+                        seed = latest_seed
+                else:
+                    self.track_action.clear_visual_target_override()
+                if isinstance(seed, dict):
+                    self._hand_location = dict(seed)
+
+            approach_started_at = getattr(
+                self, "_hand_approach_started_at", None
+            )
+            if (
+                self.approach_action.active
+                and approach_started_at is not None
+                and time.monotonic() - approach_started_at
+                > self.HAND_APPROACH_TIMEOUT
+            ):
+                await self.approach_action.stop_approaching(
+                    "HAND_APPROACH_TIMEOUT"
+                )
+            if not self.approach_action.active:
+                self._hand_approach_started_at = None
+            return self.action_state.gesture_context
+
+        arguments = dict(data)
+        if command == "approach_target":
+            location = self._hand_location
+            if location is None:
+                return False
+            arguments.update({
+                "location": dict(location),
+                "standoff_m": self.HAND_APPROACH_STANDOFF_M,
+            })
+
+        supported_tools = (
+            self.STOP_TOOLS
+            | {
+                "watch_target",
+                "follow_person",
+                "approach_target",
+                "explicit_navigation",
+                "navigation_sequence",
+            }
+        )
+        if command not in supported_tools:
+            raise ValueError(f"Unknown hand gesture tool {command!r}")
+
+        self._hand_location = None
+        self.track_action.clear_visual_target_override()
+
+        request_id = uuid.uuid4().hex
+        await self.events.put(ToolRequest(
+            function_name=command,
+            arguments=arguments,
+            call_id=f"hand-gesture-{request_id}",
+            action_id=f"hand-{request_id}",
+            response_metadata={
+                "source": "hand_gesture",
+                "silent": True,
+            },
+        ))
+        return True
+
+    async def _run_navigation_sequence(self, commands, action_id):
+        if self.explicit_navigation_action is None:
+            return ActionResult(
+                action_id, "navigation_sequence", "failed",
+                reason_code="NAVIGATION_UNAVAILABLE",
+            )
+        try:
+            for index, command in enumerate(commands):
+                result = await self.execute_request(ToolRequest(
+                    function_name="explicit_navigation",
+                    arguments={"local_command": command, "room_id": None},
+                    call_id="hand-gesture",
+                    action_id=f"{action_id}:{index}:{command}",
+                    response_metadata={},
+                ))
+                if getattr(result, "status", None) == "running":
+                    result = await self.explicit_navigation_action.wait_until_finished()
+                if getattr(result, "status", None) != "succeeded":
+                    return result
+            return ActionResult(
+                action_id, "navigation_sequence", "succeeded",
+                outcome="sequence_completed",
+                data={"commands": list(commands)},
+            )
+        except asyncio.CancelledError:
+            if self.explicit_navigation_action.active:
+                await self.explicit_navigation_action.stop("COMMAND_CANCELLED")
+            raise
 
     async def cognition_loop(self):
         self._running = True
@@ -211,11 +336,15 @@ class CognitionManager:
                     "active_action_id": self.current_action.action_id,
                 },
             )
-            await self.response_manager.send_function_output(
-                request.call_id,
-                self._action_envelope("command_result", result),
-            )
-            await self.response_manager.create_voice_response()
+            if not request.silent:
+                await self.response_manager.send_function_output(
+                    request.call_id,
+                    action_envelope(
+                        "command_result", result,
+                        self.action_state.snapshot(self._autonomy_task),
+                    ),
+                )
+                await self.response_manager.create_voice_response()
             return
 
         self.current_action = request
@@ -239,14 +368,14 @@ class CognitionManager:
 
         camera_tools = {
             "find_target", "follow_person", "see_action",
-            "watch_target", "explicit_navigation",
+            "watch_target", "explicit_navigation", "navigation_sequence",
         }
         if name in camera_tools:
-            camera_owner = self._camera_owner()
+            camera_owner = self.action_state.camera_owner
             if camera_owner == "target_tracking":
                 can_reuse_tracking = (
                     name == "follow_person"
-                    and self._passive_person_tracking_active()
+                    and self.action_state.person_tracking
                 )
                 if can_reuse_tracking:
                     camera_owner = None
@@ -255,9 +384,11 @@ class CognitionManager:
                         reason_code="REPLACED",
                         status="cancelled",
                         outcome=f"replaced_by_{name}",
-                        reset_camera=name == "explicit_navigation",
+                        reset_camera=name in {
+                            "explicit_navigation", "navigation_sequence",
+                        },
                     )
-                    camera_owner = self._camera_owner()
+                    camera_owner = self.action_state.camera_owner
             if camera_owner is not None:
                 return ActionResult(
                     action_id=request.action_id,
@@ -272,10 +403,12 @@ class CognitionManager:
 
         if name in {
             "explicit_navigation", "watch_target", "find_target",
-            "follow_person",
+            "follow_person", "navigation_sequence",
         }:
-            active_actions = self._decision_state()["active_actions"]
-            if name == "follow_person" and self._passive_person_tracking_active():
+            active_actions = self.action_state.snapshot(
+                self._autonomy_task
+            )["active_actions"]
+            if name == "follow_person" and self.action_state.person_tracking:
                 active_actions = [
                     action for action in active_actions
                     if not (
@@ -303,6 +436,46 @@ class CognitionManager:
             return await self.explicit_navigation_action.start(
                 local_command, request.action_id
             )
+
+        if name == "navigation_sequence":
+            commands = args.get("commands")
+            if not isinstance(commands, list) or not commands:
+                return ActionResult(
+                    request.action_id, name, "failed",
+                    outcome="invalid_request",
+                    reason_code="NAVIGATION_SEQUENCE_REQUIRED",
+                )
+            return await self._run_navigation_sequence(
+                commands, request.action_id
+            )
+
+        if name == "approach_target":
+            active_actions = [
+                action
+                for action in self.action_state.snapshot(
+                    self._autonomy_task
+                )["active_actions"]
+                if action.get("action_type") != "track_action"
+            ]
+            if active_actions:
+                return ActionResult(
+                    request.action_id, name, "failed",
+                    target=args.get("target"),
+                    outcome="rejected",
+                    reason_code="ROBOT_BUSY",
+                    retryable=True,
+                )
+            result = await self.approach_action.start(
+                location=args.get("location"),
+                action_id=request.action_id,
+                target=args.get("target"),
+                standoff_m=args.get("standoff_m"),
+            )
+            if getattr(result, "status", None) in {
+                "running", "already_running",
+            } and args.get("target") == "hand":
+                self._hand_approach_started_at = time.monotonic()
+            return result
 
         if name == "watch_target":
             return await self.find_target_executor.start(
@@ -352,7 +525,7 @@ class CognitionManager:
 
     async def execute_stop(self, request):
         if request.function_name == "stop_watching_target":
-            camera_owner = self._camera_owner()
+            camera_owner = self.action_state.camera_owner
             if camera_owner not in {None, "target_tracking", "watch_target"}:
                 result = ActionResult(
                     action_id=request.action_id,
@@ -363,11 +536,15 @@ class CognitionManager:
                     retryable=False,
                     data={"camera_owner": camera_owner},
                 )
-                await self.response_manager.send_function_output(
-                    request.call_id,
-                    self._action_envelope("command_result", result),
-                )
-                await self.response_manager.create_voice_response()
+                if not request.silent:
+                    await self.response_manager.send_function_output(
+                        request.call_id,
+                        action_envelope(
+                            "command_result", result,
+                            self.action_state.snapshot(self._autonomy_task),
+                        ),
+                    )
+                    await self.response_manager.create_voice_response()
                 return
 
         action, stop_method_name = {
@@ -385,33 +562,44 @@ class CognitionManager:
             stop_method_name = "stop"
         if (
             request.function_name == "stop_navigation"
-            and self.hand_guided_navigation is not None
-            and self.hand_guided_navigation.active
+            and self.approach_action.active
         ):
-            action = self.hand_guided_navigation
+            action = self.approach_action
+            stop_method_name = "stop_approaching"
         was_active = bool(getattr(action, "active", False))
         if was_active:
-            stop_result = await getattr(action, stop_method_name)()
+            reason = request.arguments.get("reason")
+            stop_method = getattr(action, stop_method_name)
+            stop_result = await (
+                stop_method(reason) if reason is not None else stop_method()
+            )
             if isinstance(stop_result, ActionResult) and stop_result.status == "failed":
-                await self.response_manager.send_function_output(
-                    request.call_id, self._action_envelope("command_result", stop_result)
-                )
-                await self.response_manager.create_voice_response()
+                if not request.silent:
+                    await self.response_manager.send_function_output(
+                        request.call_id,
+                        action_envelope(
+                            "command_result", stop_result,
+                            self.action_state.snapshot(self._autonomy_task),
+                        ),
+                    )
+                    await self.response_manager.create_voice_response()
                 return
 
-        await self.response_manager.send_function_output(
-            request.call_id,
-            self._action_envelope(
-                "command_result",
-                {
-                    "command": request.function_name,
-                    "status": "completed" if was_active else "skipped",
-                    "outcome": "stopped" if was_active else "not_active",
-                },
-            ),
-        )
-        if request.function_name == "stop_watching_target" or not was_active:
-            await self.response_manager.create_voice_response()
+        if not request.silent:
+            await self.response_manager.send_function_output(
+                request.call_id,
+                action_envelope(
+                    "command_result",
+                    {
+                        "command": request.function_name,
+                        "status": "completed" if was_active else "skipped",
+                        "outcome": "stopped" if was_active else "not_active",
+                    },
+                    self.action_state.snapshot(self._autonomy_task),
+                ),
+            )
+            if request.function_name == "stop_watching_target" or not was_active:
+                await self.response_manager.create_voice_response()
 
     async def oob_assessment(self, request):
         if request.function_name == "select_navigation_pose":
@@ -456,10 +644,14 @@ class CognitionManager:
             )
         self.action_results.append(result)
 
-        await self.response_manager.send_function_output(
-            event.request.call_id,
-            self._action_envelope("command_result", result),
-        )
+        if not event.request.silent:
+            await self.response_manager.send_function_output(
+                event.request.call_id,
+                action_envelope(
+                    "command_result", result,
+                    self.action_state.snapshot(self._autonomy_task),
+                ),
+            )
 
         print(f"\n🌸 [ACTION RESULT]: {result}\n")
 
@@ -469,13 +661,14 @@ class CognitionManager:
                 "watch_target": self.find_target_executor,
                 "find_target": self.find_target_executor,
                 "follow_person": self.follow_person_executor,
+                "approach_target": self.approach_action,
             }.get(event.request.function_name)
 
             # Capture this run's future before another navigation can start.
             completion = (
                 action.completion_future
                 if event.request.function_name in {
-                    "explicit_navigation",
+                    "explicit_navigation", "approach_target",
                 }
                 else None
             )
@@ -500,7 +693,7 @@ class CognitionManager:
                     wait_for_completion(action),
                     name=f"cognition-finish-{event.request.action_id}",
                 )
-        else:
+        elif not event.request.silent:
             await self.response_manager.create_voice_response()
 
     async def handle_lifecycle_finished(self, event):
@@ -522,267 +715,22 @@ class CognitionManager:
             )
         self.action_results.append(result)
 
-        summary = (
-            "🌳 [ACTION LIFECYCLE FINISHED] "
-            + json.dumps(
-                self._action_envelope(
-                    "action_finished",
-                    result,
-                ),
-                separators=(",", ":"),
-            )
-        )
-        print(f"\n{summary}\n")
-        await self.response_manager.send_system_context(summary)
-        await self.response_manager.create_voice_response()
-
-    def _action_envelope(
-        self, event_type, result, decision_instruction=None
-    ):
-        envelope = {
-            "event_type": event_type,
-            "result": self._compact_result(result),
-            "decision_instruction": (
-                decision_instruction
-                if decision_instruction is not None
-                else self._decision_instruction(result)
-            ),
-        }
-        decision_state = self._decision_state()
-        if (
-            decision_state["active_actions"]
-            or decision_state["autonomy_active"]
-        ):
-            envelope["decision_state"] = decision_state
-        return envelope
-
-    @classmethod
-    def _compact_result(cls, result):
-        """Keep model context actionable; retain full results only internally."""
-        if not isinstance(result, ActionResult):
-            return cls._serialize(result)
-
-        compact = {
-            "action_type": result.action_type,
-            "status": result.status,
-        }
-        for key, value in (
-            ("target", result.target),
-            ("reason_code", result.reason_code),
-        ):
-            if value is not None:
-                compact[key] = value
-        if result.outcome is not None and (
-            result.status == "succeeded" or result.reason_code is None
-        ):
-            compact["outcome"] = result.outcome
-        if result.retryable:
-            compact["retryable"] = True
-
-        data = result.data if isinstance(result.data, dict) else {}
-        for key in ("goal", "direction", "failed_step", "camera_owner"):
-            value = data.get(key)
-            if value is not None:
-                compact[key] = value
-
-        step_result = data.get("step_result")
-        if isinstance(step_result, dict):
-            step_data = step_result.get("data")
-            if isinstance(step_data, dict):
-                if step_data.get("message"):
-                    compact["message"] = step_data["message"]
-                if step_data.get("error"):
-                    compact["error"] = step_data["error"]
-                if step_data.get("error_type"):
-                    compact["error_type"] = step_data["error_type"]
-                if step_data.get("error_stage"):
-                    compact["error_stage"] = step_data["error_stage"]
-            step_reason = step_result.get("reason_code")
-            if step_reason and step_reason != result.reason_code:
-                compact["step_reason_code"] = step_reason
-        elif data.get("message"):
-            compact["message"] = data["message"]
-        elif data.get("error"):
-            compact["error"] = data["error"]
-
-        guidance = data.get("continuation_guidance")
-        if isinstance(guidance, dict):
-            retry_answers = guidance.get("retry_answers")
-            compact_guidance = {}
-            if guidance.get("unresolved_action_type"):
-                compact_guidance["action"] = guidance["unresolved_action_type"]
-            if isinstance(retry_answers, dict):
-                compact_guidance["retry"] = retry_answers
-            if guidance.get("out_of_frame_requires_no_retry"):
-                compact_guidance["out_of_frame_stops"] = True
-            if compact_guidance:
-                compact["guidance"] = compact_guidance
-
-        if "verified" in data:
-            compact["verified"] = bool(data["verified"])
-        return compact
-
-    def _decision_instruction(self, result):
-        if (
-            isinstance(result, ActionResult)
-            and result.reason_code in {
-                "APPROACH_VERIFICATION_REQUIRED",
-                "APPROACH_VERIFICATION_TIMEOUT",
-                "APPROACH_RANGE_INVALID",
-                "STABLE_SEED_TIMEOUT",
-                "TARGET_NOT_TRACKED_AFTER_NAVIGATION",
-            }
-        ):
-            return (
-                "Briefly report that approach was not safely confirmed. Ask whether "
-                "to continue carefully or reposition the target; retry only if asked."
-            )
-        if (
-            isinstance(result, ActionResult)
-            and result.reason_code
-            in {"PERSON_DETECTION_FAILED", "OBJECT_DETECTION_FAILED"}
-            and result.data.get("user_confirms_visible") is True
-        ):
-            return (
-                "Report that direct detection failed. Do not retry or move without "
-                "new user guidance."
-            )
-        if (
-            isinstance(result, ActionResult)
-            and result.reason_code == "SEARCH_GUIDANCE_REQUIRED"
-        ):
-            action_type = result.data.get(
-                "continuation_guidance", {}
-            ).get("unresolved_action_type", result.action_type)
-            target = result.target
-            if result.data.get("direction") == "behind":
-                choices = "high, low, elsewhere out of frame, or best effort"
-                retry_rule = "Do not retry behind or elsewhere out of frame."
-            else:
-                choices = (
-                    "high, low, behind DJ, elsewhere out of frame, or best effort"
+        if not event.request.silent:
+            summary = (
+                "🌳 [ACTION LIFECYCLE FINISHED] "
+                + json.dumps(
+                    action_envelope(
+                        "action_finished",
+                        result,
+                        self.action_state.snapshot(self._autonomy_task),
+                    ),
+                    separators=(",", ":"),
                 )
-                retry_rule = "Do not retry if it is elsewhere out of frame."
-            return (
-                f"Ask one short question: is {target!r} {choices}? Retry "
-                f"{action_type} using the matching guidance. {retry_rule}"
             )
-        if (
-            isinstance(result, ActionResult)
-            and result.action_type == "watch_target"
-        ):
-            if result.status == "succeeded":
-                return (
-                    "The robot is now continuously watching the target. Confirm this "
-                    "briefly and do not call another tool."
-                )
-            return "Report the watch-target failure briefly."
-        if (
-            isinstance(result, ActionResult)
-            and result.action_type in {
-                "navigate_action", "explicit_navigation",
-            }
-        ):
-            if result.status == "succeeded":
-                return (
-                    "Navigation completed. Report completion briefly. Do not call "
-                    "explicit_navigation "
-                    "again unless the user gives a new movement goal."
-                )
-            return (
-                "Report the navigation reason briefly. Do not substitute blind motion. Retry only "
-                "if new sensor evidence or user guidance materially changes the situation."
-            )
-        if (
-            isinstance(result, ActionResult)
-            and result.action_type == "find_target"
-        ):
-            if result.status != "succeeded":
-                return (
-                    "The autonomous object/place search did not complete. "
-                    "Report the reason and checked-space summary briefly. Do not retry "
-                    "unless the user supplies new information or explicitly asks."
-                )
-            return (
-                "The robot completed the requested find goal. An object was approached "
-                "and reacquired, or a place was reached with its one-shot contextual move. "
-                "Report completion briefly and do not call another tool."
-            )
-        if (
-            isinstance(result, ActionResult)
-            and result.action_type == "follow_person"
-        ):
-            if result.status == "cancelled":
-                return "Briefly confirm that following has stopped."
-            return (
-                "Report why continuous following ended. Do not restart follow_person "
-                "unless the user explicitly asks."
-            )
-        return (
-            "Continue the unresolved goal if needed; do not repeat the finished action."
-        )
+            print(f"\n{summary}\n")
+            await self.response_manager.send_system_context(summary)
+            await self.response_manager.create_voice_response()
 
-    def _camera_owner(self):
-        if self.follow_person_executor.active:
-            return "follow_person"
-        hand_navigation = getattr(self, "hand_guided_navigation", None)
-        if hand_navigation is not None and hand_navigation.active:
-            return "hand_guided_navigation"
-        if self.find_target_executor.active:
-            return self.find_target_executor.action_type
-        if self.explicit_navigation_action is not None and self.explicit_navigation_action.active:
-            return "explicit_navigation"
-        if self.search_action.active:
-            return "search_action"
-        if self.track_action.active:
-            return "target_tracking"
-        if self.approach_action.active:
-            return "approach_action"
-        return None
-
-    def _passive_person_tracking_active(self):
-        return bool(
-            self.track_action.active
-            and normalize_human_target(self.track_action.target) is not None
-        )
-
-    def _decision_state(self):
-        active_actions = []
-        for action_type, action, active_attribute in (
-            ("search_action", self.search_action, "active"),
-            ("track_action", self.track_action, "active"),
-            ("approach_action", self.approach_action, "active"),
-            ("explicit_navigation", self.explicit_navigation_action, "active"),
-            (
-                "hand_guided_navigation",
-                getattr(self, "hand_guided_navigation", None),
-                "active",
-            ),
-            ("follow_person", self.follow_person_executor, "active"),
-        ):
-            if action is not None and getattr(action, active_attribute, False):
-                active_actions.append({
-                    "action_id": getattr(action, "action_id", None),
-                    "action_type": action_type,
-                    "target": getattr(action, "target", None),
-                })
-
-        if self.find_target_executor.active:
-            active_actions.append({
-                "action_id": self.find_target_executor.action_id,
-                "action_type": self.find_target_executor.action_type,
-                "target": self.find_target_executor.target,
-            })
-
-        state = {
-            "active_actions": active_actions,
-            "autonomy_active": (
-                self._autonomy_task is not None
-                and not self._autonomy_task.done()
-            ),
-        }
-
-        return state
 
     async def _handle_world_state(self, payload):
         self.world_state = dict(payload)
@@ -816,7 +764,7 @@ class CognitionManager:
             )
 
     def _robot_action_in_progress(self):
-        active = self._decision_state()["active_actions"]
+        active = self.action_state.snapshot(self._autonomy_task)["active_actions"]
         only_tracking = (
             len(active) == 1 and active[0]["action_type"] == "track_action"
         )
@@ -926,19 +874,3 @@ class CognitionManager:
                 "[Startup person acquisition error] "
                 f"{type(error).__name__}: {error}"
             )
-
-    @classmethod
-    def _serialize(cls, value):
-        if is_dataclass(value):
-            return asdict(value)
-        if isinstance(value, dict):
-            return {key: cls._serialize(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [cls._serialize(item) for item in value]
-        if hasattr(value, "__dict__"):
-            return {
-                key: cls._serialize(item)
-                for key, item in vars(value).items()
-                if not key.startswith("_")
-            }
-        return value
