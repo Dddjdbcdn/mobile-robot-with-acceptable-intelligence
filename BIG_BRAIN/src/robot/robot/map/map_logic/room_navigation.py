@@ -9,7 +9,13 @@ import numpy as np
 
 class RoomNavigationMixin:
     def resolve_open_space_middle_step(
-        self, prepared, pose, state=None, *, person_pose=None
+        self,
+        prepared,
+        pose,
+        state=None,
+        *,
+        person_pose=None,
+        face_person=False,
     ):
         """Move toward a mapped room core, exploring briefly if none exists."""
         grid = prepared["grid"]
@@ -30,8 +36,8 @@ class RoomNavigationMixin:
             self.cfg.exit_component_lookup_radius_m,
         )
         if core_label == 0:
-            recovery = self._exit_map_recovery_step(
-                prepared, pose, state, [], "no_room_core"
+            recovery = self._open_space_map_recovery_step(
+                prepared, pose, state, "no_room_core"
             )
             if recovery is not None:
                 return recovery
@@ -40,16 +46,17 @@ class RoomNavigationMixin:
             )
 
         rows, cols = np.nonzero(labels == core_label)
-        classification_free = (grid.data >= 0) & ~self._exit_wall_mask(grid)
-        clearance = cv2.distanceTransform(
-            classification_free.astype(np.uint8), cv2.DIST_L2, 5
-        ) * grid.resolution
+        clearance = self._exit_structural_clearance(grid)
         xs, ys = grid.world(cols, rows)
         distance_sq = (xs - pose["x"]) ** 2 + (ys - pose["y"]) ** 2
         index = int(np.lexsort((distance_sq, -clearance[rows, cols]))[0])
         x, y = float(xs[index]), float(ys[index])
         travel_yaw = math.atan2(y - pose["y"], x - pose["x"])
-        person_yaw = self._person_facing_yaw(x, y, person_pose)
+        person_yaw = (
+            self._person_facing_yaw(x, y, person_pose)
+            if face_person
+            else None
+        )
         state["passes"] = int(state.get("passes", 0)) + 1
         return {
             "complete": False,
@@ -200,6 +207,60 @@ class RoomNavigationMixin:
             ),
         }
 
+    def _open_space_map_recovery_step(
+        self, prepared, pose, state, reason
+    ):
+        """Visit the closest useful frontier before re-evaluating the room."""
+        recovery_moves = int(state.get("recovery_moves", 0))
+        if recovery_moves >= self.cfg.exit_recovery_max_moves:
+            return None
+
+        grid = prepared["grid"]
+        recovery_points = [
+            point for point in state.get("recovery_points") or []
+            if isinstance(point, list) and len(point) == 2
+        ]
+        candidates = []
+        for frontier in prepared.get("frontiers") or []:
+            x, y = float(frontier["x"]), float(frontier["y"])
+            distance = math.hypot(x - pose["x"], y - pose["y"])
+            if distance < grid.resolution:
+                continue
+            if any(
+                math.hypot(x - point[0], y - point[1])
+                < self.cfg.exit_recovery_revisit_m
+                for point in recovery_points
+            ):
+                continue
+            candidates.append((distance, x, y, frontier))
+
+        if not candidates:
+            return None
+
+        _, x, y, frontier = min(
+            candidates,
+            key=lambda item: (
+                item[0],
+                -float(item[3].get("information_gain_m2") or 0.0),
+            ),
+        )
+
+        recovery_points.append([x, y])
+        state.update(
+            recovery_points=recovery_points,
+            recovery_moves=recovery_moves + 1,
+            passes=int(state.get("passes", 0)) + 1,
+        )
+        return {
+            "complete": False,
+            "phase": "stabilize_room_map",
+            "state": state,
+            "recovery_reason": reason,
+            "destination": self._local_goal(
+                x, y, float(frontier["yaw"]), pose
+            ),
+        }
+
     def _exit_map_recovery_step(
         self, prepared, pose, state, visited_frontiers, reason
     ):
@@ -313,10 +374,7 @@ class RoomNavigationMixin:
         # Unknown space and structural walls bound rooms. Small occupied
         # components remain excluded by `reachable`, but do not create the
         # large clearance halo that can split one room around furniture.
-        classification_free = (grid.data >= 0) & ~self._exit_wall_mask(grid)
-        clearance = cv2.distanceTransform(
-            classification_free.astype(np.uint8), cv2.DIST_L2, 5
-        ) * grid.resolution
+        clearance = self._exit_structural_clearance(grid)
         open_space = reachable & (clearance >= self.cfg.exit_open_clearance_m)
         count, labels = cv2.connectedComponents(
             open_space.astype(np.uint8), connectivity=8
@@ -326,6 +384,12 @@ class RoomNavigationMixin:
             for label in range(1, count)
         }
         return labels, areas
+
+    def _exit_structural_clearance(self, grid):
+        classification_free = (grid.data >= 0) & ~self._exit_wall_mask(grid)
+        return cv2.distanceTransform(
+            classification_free.astype(np.uint8), cv2.DIST_L2, 5
+        ) * grid.resolution
 
     @staticmethod
     def _exit_reachable_room_labels(reachable, open_labels, room_labels):

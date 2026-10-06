@@ -1,0 +1,16 @@
+[Unit]
+Description=DJ robot ROS hardware and control layer
+PartOf=dj-robot.target
+Before=dj-small-brain.service
+
+[Service]
+Type=simple
+WorkingDirectory=@ROBOT_ROOT@/BIG_BRAIN
+EnvironmentFile=-%h/.config/dj-robot/environment
+ExecStart=@FACE_DIR@/scripts/start_ros.sh
+ExecStop=@FACE_DIR@/scripts/safe_stop.sh
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=dj-robot.target

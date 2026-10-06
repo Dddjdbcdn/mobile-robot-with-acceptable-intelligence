@@ -26,7 +26,8 @@
         <RecoveryNode number_of_retries="1" name="FollowPath">
           <FollowPath 
             path="{path}" 
-            controller_id="{selected_controller}" 
+            controller_id="{selected_controller}"
+            goal_checker_id="general_goal_checker"
             error_code_id="{follow_path_error_code}" />
           <Sequence>
             <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>

@@ -9,6 +9,7 @@ import time
 import uuid
 
 from actions.action_result import ActionResult
+from actions.navigation_action import PERSON_RELATIVE_COMMANDS
 from cognition.manager.action_reporting import action_envelope
 from cognition.manager.action_state import ActionState
 
@@ -57,31 +58,37 @@ class CognitionManager:
         "select_navigation_pose",
     }
     STOP_TOOLS = {
+        "stop_movement",
         "stop_goal",
         "stop_navigation",
         "stop_follow",
         "stop_watching_target",
     }
+    PREEMPTIVE_ACTIONS = {
+        "explicit_navigation",
+        "approach_target",
+        "watch_target",
+        "find_target",
+        "follow_person",
+    }
 
     def __init__(
         self,
-        approach_action,
+        navigation_action,
         search_action,
         see_action,
         track_action,
         find_target_executor,
         follow_person_executor,
         response_manager,
+        map_navigation_action,
+        hand_gesture_interface,
         proximity_cooldown=8.0,
-        explicit_navigation_action=None,
-        map_navigation_action=None,
-        hand_gesture_interface=None,
     ):
-        self.approach_action = approach_action
+        self.navigation_action = navigation_action
         self.search_action = search_action
         self.see_action = see_action
         self.track_action = track_action
-        self.explicit_navigation_action = explicit_navigation_action
         self.map_navigation_action = map_navigation_action
         self.hand_gesture_interface = hand_gesture_interface
         self.find_target_executor = find_target_executor
@@ -110,17 +117,13 @@ class CognitionManager:
         self.action_state = ActionState(
             search=self.search_action,
             tracking=self.track_action,
-            approach=self.approach_action,
-            explicit_navigation=self.explicit_navigation_action,
+            navigation=self.navigation_action,
             find_target=self.find_target_executor,
             follow_person=self.follow_person_executor,
         )
 
         self.proximity_cooldown = proximity_cooldown
-        if self.hand_gesture_interface is not None:
-            self.hand_gesture_interface.set_dispatcher(
-                self.handle_hand_command
-            )
+        self.hand_gesture_interface.set_dispatcher(self.handle_hand_command)
 
     async def handle_tool_call(
         self,
@@ -145,13 +148,9 @@ class CognitionManager:
         await self.events.put(request)
 
     async def handle_tool_msg(self, message):
-        self.approach_action.handle_navigation_event(message)
+        self.navigation_action.handle_navigation_event(message)
         await self.follow_person_executor.handle_navigation_event(message)
-        if self.explicit_navigation_action is not None:
-            self.explicit_navigation_action.handle_navigation_event(message)
-        map_navigation = getattr(self, "map_navigation_action", None)
-        if map_navigation is not None:
-            map_navigation.handle_navigation_event(message)
+        self.map_navigation_action.handle_navigation_event(message)
 
     async def publish_world_state(self, payload):
         self._pending_world_state = dict(payload)
@@ -176,12 +175,11 @@ class CognitionManager:
     async def shutdown(self):
         if self.follow_person_executor.active:
             await self.follow_person_executor.stop("SHUTDOWN")
-        if self.hand_gesture_interface is not None:
-            await self.hand_gesture_interface.stop("SHUTDOWN")
+        await self.hand_gesture_interface.stop("SHUTDOWN")
         if self.find_target_executor.active:
             await self.find_target_executor.stop("SHUTDOWN")
-        elif self.explicit_navigation_action is not None and self.explicit_navigation_action.active:
-            await self.explicit_navigation_action.stop("SHUTDOWN")
+        elif self.navigation_action.active:
+            await self.navigation_action.stop("SHUTDOWN")
         autonomy_task = self._autonomy_task
         if autonomy_task is not None and not autonomy_task.done():
             autonomy_task.cancel()
@@ -189,8 +187,6 @@ class CognitionManager:
         await self.events.put(Shutdown())
 
     async def handle_hand_command(self, command, data):
-        """Resolve gesture input against the same global actions used by tools."""
-
         if command == "observe_gesture":
             if self.action_state.person_tracking:
                 seed = self.track_action.stable_seeds.get(
@@ -208,19 +204,21 @@ class CognitionManager:
                 if isinstance(seed, dict):
                     self._hand_location = dict(seed)
 
-            approach_started_at = getattr(
-                self, "_hand_approach_started_at", None
-            )
+            approach_started_at = self._hand_approach_started_at
             if (
-                self.approach_action.active
+                self.navigation_action.active
+                and self.navigation_action.mode == "approach"
                 and approach_started_at is not None
                 and time.monotonic() - approach_started_at
                 > self.HAND_APPROACH_TIMEOUT
             ):
-                await self.approach_action.stop_approaching(
+                await self.navigation_action.stop(
                     "HAND_APPROACH_TIMEOUT"
                 )
-            if not self.approach_action.active:
+            if not (
+                self.navigation_action.active
+                and self.navigation_action.mode == "approach"
+            ):
                 self._hand_approach_started_at = None
             return self.action_state.gesture_context
 
@@ -241,7 +239,6 @@ class CognitionManager:
                 "follow_person",
                 "approach_target",
                 "explicit_navigation",
-                "navigation_sequence",
             }
         )
         if command not in supported_tools:
@@ -262,35 +259,6 @@ class CognitionManager:
             },
         ))
         return True
-
-    async def _run_navigation_sequence(self, commands, action_id):
-        if self.explicit_navigation_action is None:
-            return ActionResult(
-                action_id, "navigation_sequence", "failed",
-                reason_code="NAVIGATION_UNAVAILABLE",
-            )
-        try:
-            for index, command in enumerate(commands):
-                result = await self.execute_request(ToolRequest(
-                    function_name="explicit_navigation",
-                    arguments={"local_command": command, "room_id": None},
-                    call_id="hand-gesture",
-                    action_id=f"{action_id}:{index}:{command}",
-                    response_metadata={},
-                ))
-                if getattr(result, "status", None) == "running":
-                    result = await self.explicit_navigation_action.wait_until_finished()
-                if getattr(result, "status", None) != "succeeded":
-                    return result
-            return ActionResult(
-                action_id, "navigation_sequence", "succeeded",
-                outcome="sequence_completed",
-                data={"commands": list(commands)},
-            )
-        except asyncio.CancelledError:
-            if self.explicit_navigation_action.active:
-                await self.explicit_navigation_action.stop("COMMAND_CANCELLED")
-            raise
 
     async def cognition_loop(self):
         self._running = True
@@ -365,118 +333,40 @@ class CognitionManager:
         name = request.function_name
         args = request.arguments
 
-        camera_tools = {
-            "find_target", "follow_person", "see_action",
-            "watch_target",
-        }
-        if name in camera_tools:
-            camera_owner = self.action_state.camera_owner
-            if camera_owner == "target_tracking":
-                can_reuse_tracking = (
-                    name == "follow_person"
-                    and self.action_state.person_tracking
-                )
-                if can_reuse_tracking:
-                    camera_owner = None
-                else:
-                    await self.track_action.stop_tracking(
-                        reason_code="REPLACED",
-                        status="cancelled",
-                        outcome=f"replaced_by_{name}",
-                        reset_camera=name in {
-                            "explicit_navigation", "navigation_sequence",
-                        },
-                    )
-                    camera_owner = self.action_state.camera_owner
-            if camera_owner is not None:
-                return ActionResult(
-                    action_id=request.action_id,
-                    action_type=name,
-                    status="failed",
-                    target=args.get("target") or args.get("region"),
-                    outcome="precondition_failed",
-                    reason_code="CAMERA_IN_USE",
-                    retryable=True,
-                    data={"camera_owner": camera_owner},
-                )
-
-        if name in {
-            "explicit_navigation", "watch_target", "find_target",
-            "follow_person", "navigation_sequence",
-        }:
-            active_actions = self.action_state.snapshot(
-                self._autonomy_task
-            )["active_actions"]
-            can_run_with_tracking = (
-                name in {
-                    "explicit_navigation",
-                    "navigation_sequence",
-                    "follow_person",
-                }
-                and self.track_action.active
+        should_preempt = name in self.PREEMPTIVE_ACTIONS or (
+            name == "see_action" and args.get("region") is not None
+        )
+        if should_preempt:
+            await self._stop_active_goals(
+                f"REPLACED_BY_{name.upper()}"
             )
-            if can_run_with_tracking:
-                active_actions = [
-                    action for action in active_actions
-                    if action.get("action_type") != "track_action"
-                ]
-            if active_actions:
-                return ActionResult(
-                    request.action_id, name, "failed",
-                    reason_code="ROBOT_BUSY", retryable=True,
-                )
 
         if name == "explicit_navigation":
-            if self.explicit_navigation_action is None:
-                return ActionResult(
-                    request.action_id, name, "failed",
-                    reason_code="NAVIGATION_UNAVAILABLE",
-                )
             local_command = args.get("local_command")
+            if local_command in PERSON_RELATIVE_COMMANDS:
+                return await self._start_person_relative_navigation(
+                    local_command, request.action_id
+                )
             if local_command == "go_to_room":
-                return await self.explicit_navigation_action.start(
+                return await self.navigation_action.start_local(
                     local_command, request.action_id,
                     room_id=args.get("room_id"),
+                    face_person=bool(args.get("face_person")),
                 )
-            return await self.explicit_navigation_action.start(
-                local_command, request.action_id
-            )
-
-        if name == "navigation_sequence":
-            commands = args.get("commands")
-            if not isinstance(commands, list) or not commands:
-                return ActionResult(
-                    request.action_id, name, "failed",
-                    outcome="invalid_request",
-                    reason_code="NAVIGATION_SEQUENCE_REQUIRED",
-                )
-            return await self._run_navigation_sequence(
-                commands, request.action_id
+            return await self.navigation_action.start_local(
+                local_command,
+                request.action_id,
+                face_person=bool(args.get("face_person")),
             )
 
         if name == "approach_target":
-            active_actions = [
-                action
-                for action in self.action_state.snapshot(
-                    self._autonomy_task
-                )["active_actions"]
-                if action.get("action_type") != "track_action"
-            ]
-            if active_actions:
-                return ActionResult(
-                    request.action_id, name, "failed",
-                    target=args.get("target"),
-                    outcome="rejected",
-                    reason_code="ROBOT_BUSY",
-                    retryable=True,
-                )
-            result = await self.approach_action.start(
+            result = await self.navigation_action.start_approach(
                 location=args.get("location"),
                 action_id=request.action_id,
                 target=args.get("target"),
                 standoff_m=args.get("standoff_m"),
             )
-            if getattr(result, "status", None) in {
+            if result.status in {
                 "running", "already_running",
             } and args.get("target") == "hand":
                 self._hand_approach_started_at = time.monotonic()
@@ -490,12 +380,10 @@ class CognitionManager:
                 continuous_person_reacquisition=(
                     args.get("target_kind") == "person"
                 ),
+                initial_person=args.get("initial_person"),
             )
             if direct_tracking.status == "running":
-                return self._as_watch_target_result(
-                    direct_tracking,
-                    direct_tracker=True,
-                )
+                return self._watch_started_result(direct_tracking)
             return await self.find_target_executor.start(
                 target=args.get("target"),
                 action_id=request.action_id,
@@ -541,29 +429,141 @@ class CognitionManager:
             reason_code="UNKNOWN_ACTION",
         )
 
+    async def _start_person_relative_navigation(self, command, action_id):
+        """Acquire a reliable person track when needed, then navigate."""
+        if not self.action_state.person_tracking:
+            acquired = await self.find_target_executor.start(
+                target="person",
+                action_id=f"{action_id}:acquire-person",
+                target_kind="person",
+                approach=False,
+                continuous_person_reacquisition=True,
+                action_type="explicit_navigation",
+            )
+            if acquired.status == "running":
+                acquired = await asyncio.shield(
+                    self.find_target_executor.wait_until_finished()
+                )
+            if acquired.status != "succeeded":
+                return ActionResult(
+                    action_id, "explicit_navigation", "failed",
+                    target=command, outcome="person_acquisition_failed",
+                    reason_code=(
+                        acquired.reason_code or "PERSON_ACQUISITION_FAILED"
+                    ),
+                    retryable=True,
+                    data={
+                        "acquisition_status": acquired.status,
+                        "acquisition_outcome": acquired.outcome,
+                    },
+                )
+
+            tracking_session_id = self.track_action.session_id
+            seed = await self.track_action.wait_for_stable_target_seed(
+                target=self.track_action.target,
+                session_id=tracking_session_id,
+                timeout=10.0,
+            )
+            if seed is None:
+                return ActionResult(
+                    action_id, "explicit_navigation", "failed",
+                    target=command, outcome="person_pose_not_ready",
+                    reason_code="STABLE_SEED_TIMEOUT", retryable=True,
+                )
+
+            # Finish centering the base on the now-reliable lidar pose before
+            # asking for a position around the person.
+            facing = await self.navigation_action.start_local(
+                "face_person", f"{action_id}:face-person"
+            )
+            if facing.status == "running":
+                facing = await asyncio.shield(
+                    self.navigation_action.wait_until_finished()
+                )
+            if facing.status != "succeeded":
+                return ActionResult(
+                    action_id, "explicit_navigation", "failed",
+                    target=command, outcome="person_facing_failed",
+                    reason_code=(facing.reason_code or "PERSON_FACING_FAILED"),
+                    retryable=True,
+                    data={
+                        "facing_status": facing.status,
+                        "facing_outcome": facing.outcome,
+                    },
+                )
+
+        return await self.navigation_action.start_local(command, action_id)
+
+    async def _stop_active_goals(self, reason):
+        """Stop active high-level goals; shared tracking remains independent."""
+        for action in (
+            self.follow_person_executor,
+            self.find_target_executor,
+            self.navigation_action,
+            self.map_navigation_action,
+            self.search_action,
+        ):
+            if action.active:
+                await action.stop(reason)
+
     @staticmethod
-    def _as_watch_target_result(result, *, direct_tracker=False):
-        """Keep direct tracking behind the public watch-target lifecycle."""
+    def _watch_started_result(result):
+        """Report acquisition as complete while shared tracking keeps running."""
         if not isinstance(result, ActionResult):
             return result
         data = dict(result.data or {})
-        if direct_tracker:
-            data["watch_source"] = "direct_tracker"
+        data["watch_source"] = "direct_tracker"
         return ActionResult(
             action_id=result.action_id,
             action_type="watch_target",
-            status=result.status,
+            status="succeeded",
             target=result.target,
-            outcome=result.outcome,
+            outcome="watching_target",
             reason_code=result.reason_code,
             retryable=result.retryable,
             data=data,
         )
 
     async def execute_stop(self, request):
+        if request.function_name == "stop_movement":
+            was_active = any(
+                action.active
+                for action in (
+                    self.follow_person_executor,
+                    self.find_target_executor,
+                    self.navigation_action,
+                    self.map_navigation_action,
+                    self.search_action,
+                )
+            )
+            await self._stop_active_goals(
+                request.arguments.get("reason", "HAND_PUSH")
+            )
+            if not request.silent:
+                await self.response_manager.send_function_output(
+                    request.call_id,
+                    action_envelope(
+                        "command_result",
+                        {
+                            "command": "stop_movement",
+                            "status": "completed" if was_active else "skipped",
+                            "outcome": "stopped" if was_active else "not_active",
+                        },
+                        self.action_state.snapshot(self._autonomy_task),
+                    ),
+                )
+            return
+
         if request.function_name == "stop_watching_target":
-            camera_owner = self.action_state.camera_owner
-            if camera_owner not in {None, "target_tracking", "watch_target"}:
+            camera_owner = None
+            if self.follow_person_executor.active:
+                camera_owner = "follow_person"
+            elif (
+                self.find_target_executor.active
+                and self.find_target_executor.action_type != "watch_target"
+            ):
+                camera_owner = self.find_target_executor.action_type
+            if camera_owner is not None:
                 result = ActionResult(
                     action_id=request.action_id,
                     action_type=request.function_name,
@@ -584,11 +584,23 @@ class CognitionManager:
                     await self.response_manager.create_voice_response()
                 return
 
-        action, stop_method_name = {
-            "stop_goal": (self.find_target_executor, "stop"),
-            "stop_navigation": (self.explicit_navigation_action, "stop"),
-            "stop_follow": (self.follow_person_executor, "stop"),
-            "stop_watching_target": (self.track_action, "stop_tracking"),
+        action, stop_method = {
+            "stop_goal": (
+                self.find_target_executor,
+                self.find_target_executor.stop,
+            ),
+            "stop_navigation": (
+                self.navigation_action,
+                self.navigation_action.stop,
+            ),
+            "stop_follow": (
+                self.follow_person_executor,
+                self.follow_person_executor.stop,
+            ),
+            "stop_watching_target": (
+                self.track_action,
+                self.track_action.stop,
+            ),
         }[request.function_name]
         if (
             request.function_name == "stop_watching_target"
@@ -596,17 +608,17 @@ class CognitionManager:
             and self.find_target_executor.action_type == "watch_target"
         ):
             action = self.find_target_executor
-            stop_method_name = "stop"
+            stop_method = action.stop
         if (
             request.function_name == "stop_navigation"
-            and self.approach_action.active
+            and self.find_target_executor.active
+            and self.find_target_executor.action_type == "explicit_navigation"
         ):
-            action = self.approach_action
-            stop_method_name = "stop_approaching"
-        was_active = bool(getattr(action, "active", False))
+            action = self.find_target_executor
+            stop_method = action.stop
+        was_active = bool(action.active)
         if was_active:
             reason = request.arguments.get("reason")
-            stop_method = getattr(action, stop_method_name)
             stop_result = await (
                 stop_method(reason) if reason is not None else stop_method()
             )
@@ -640,10 +652,9 @@ class CognitionManager:
 
     async def oob_assessment(self, request):
         if request.function_name == "select_navigation_pose":
-            if self.map_navigation_action is not None:
-                await self.map_navigation_action.select_navigation_pose(
-                    request.arguments, request.response_metadata
-                )
+            await self.map_navigation_action.select_navigation_pose(
+                request.arguments, request.response_metadata
+            )
             return
         if request.function_name == "assess_frame_search":
             assessment = self.search_action.assess_frame_search(
@@ -693,35 +704,17 @@ class CognitionManager:
         print(f"\n🌸 [ACTION RESULT]: {result}\n")
 
         if result.status == "running":
-            direct_watch = (
-                event.request.function_name == "watch_target"
-                and isinstance(result, ActionResult)
-                and result.data.get("watch_source") == "direct_tracker"
-            )
             action = {
-                "explicit_navigation": self.explicit_navigation_action,
-                "watch_target": (
-                    self.track_action
-                    if direct_watch else self.find_target_executor
-                ),
+                "explicit_navigation": self.navigation_action,
+                "watch_target": self.find_target_executor,
                 "find_target": self.find_target_executor,
                 "follow_person": self.follow_person_executor,
-                "approach_target": self.approach_action,
-            }.get(event.request.function_name)
-
-            # Capture this run's future before another navigation can start.
-            completion = (
-                action.completion_future
-                if event.request.function_name in {
-                    "explicit_navigation", "approach_target",
-                }
-                else None
-            )
+                "approach_target": self.navigation_action,
+            }[event.request.function_name]
 
             async def wait_for_completion(action):
                 try:
-                    result = (await asyncio.shield(completion) if completion is not None
-                              else await action.wait_until_finished())
+                    result = await action.wait_until_finished()
                     lifecycle_event = ActionLifecycleFinished(
                         event.request,
                         result=result,
@@ -733,11 +726,10 @@ class CognitionManager:
                     )
                 await self.events.put(lifecycle_event)
 
-            if action is not None:
-                asyncio.create_task(
-                    wait_for_completion(action),
-                    name=f"cognition-finish-{event.request.action_id}",
-                )
+            asyncio.create_task(
+                wait_for_completion(action),
+                name=f"cognition-finish-{event.request.action_id}",
+            )
         elif not event.request.silent:
             await self.response_manager.create_voice_response()
 
@@ -757,15 +749,6 @@ class CognitionManager:
                         f"{type(event.error).__name__}: {event.error}"
                     )
                 },
-            )
-        elif (
-            event.request.function_name == "watch_target"
-            and isinstance(result, ActionResult)
-            and result.action_type == "track_action"
-        ):
-            result = self._as_watch_target_result(
-                result,
-                direct_tracker=True,
             )
         self.action_results.append(result)
 
@@ -820,10 +803,7 @@ class CognitionManager:
 
     def _robot_action_in_progress(self):
         active = self.action_state.snapshot(self._autonomy_task)["active_actions"]
-        only_tracking = (
-            len(active) == 1 and active[0]["action_type"] == "track_action"
-        )
-        return self.current_action_task is not None or bool(active) and not only_tracking
+        return self.current_action_task is not None or bool(active)
 
     def _replace_autonomy_task(self, coroutine, name):
         old_task = self._autonomy_task
@@ -884,18 +864,18 @@ class CognitionManager:
         if self._robot_action_in_progress():
             return
 
-        move_result = await self.explicit_navigation_action.start(
+        move_result = await self.navigation_action.start_local(
             "nudge_backward",
             action_id=f"autonomy-proximity-{uuid.uuid4().hex}",
         )
         if move_result.status == "running":
             try:
                 move_result = await asyncio.wait_for(
-                    asyncio.shield(self.explicit_navigation_action.wait_until_finished()),
+                    asyncio.shield(self.navigation_action.wait_until_finished()),
                     timeout=10.0,
                 )
             except TimeoutError:
-                move_result = await self.explicit_navigation_action.stop("AUTONOMY_TIMEOUT")
+                move_result = await self.navigation_action.stop("AUTONOMY_TIMEOUT")
         self.action_results.append(move_result)
 
     async def _run_startup_person_acquisition(self):

@@ -1,0 +1,4 @@
+[Unit]
+Description=Complete DJ robot runtime
+Requires=dj-ros.service dj-small-brain.service
+After=dj-ros.service dj-small-brain.service

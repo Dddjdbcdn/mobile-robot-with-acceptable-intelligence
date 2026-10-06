@@ -182,7 +182,10 @@ def action_envelope(event_type, result, action_state, decision=None):
             decision if decision is not None else decision_instruction(result)
         ),
     }
-    if action_state["active_actions"] or action_state["autonomy_active"]:
+    if (
+        action_state["active_actions"]
+        or action_state["autonomy_active"]
+        or action_state.get("tracking", {}).get("active")
+    ):
         envelope["decision_state"] = action_state
     return envelope
-

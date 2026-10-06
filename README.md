@@ -92,8 +92,7 @@ flowchart TB
 | `see_action` | Captures the current view and answers a focused visual question |
 | `search_action` | Checks the current frame, sweeps the pan/tilt camera, evaluates image batches, and centers the best candidate |
 | `track_action` | Tracks known objects, arbitrary text-described objects, people, or selected body parts |
-| `approach_action` | Waits for stable tracking, computes a local pose from servo angles and ToF range, then dispatches a Nav2 goal |
-| `explicit_navigation` | Executes a directly stated movement command |
+| `navigation_action` | Approaches a tracked target or executes a directly stated movement command through one shared lifecycle |
 | `watch_target` | Finds a person or object without approaching and continuously tracks it |
 | automatic hand guidance | Tracks a welcomed hand, approaches its stable ToF position after an upward flick, then returns when pushed back |
 | `find_target` | Finds and approaches objects, or finds and enters recognizable places |
@@ -161,7 +160,7 @@ A request such as **“find the bottle and go near it”** crosses the whole sta
 3. The best candidate is centered and returned as a structured result.
 4. `track_action` selects YOLO or GroundingDINO for acquisition, then closes the visual loop with pose tracking or CSRT.
 5. Pan/tilt error streams to ROS; the camera servos move first, and the base rotates when pan travel is exhausted.
-6. `approach_action` combines stable tracking, range, and camera azimuth into a local goal.
+6. `navigation_action` combines stable tracking, range, and camera azimuth into an approach goal.
 7. The bridge transforms that goal into `map`; Nav2 plans and executes a collision-aware path.
 8. Success, rejection, cancellation, or failure returns to cognition so the agent reassesses instead of assuming success.
 

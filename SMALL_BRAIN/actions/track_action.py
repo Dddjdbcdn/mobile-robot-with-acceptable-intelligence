@@ -9,6 +9,10 @@ from actions.tracking.person_pose import (
     person_keypoint,
     predict_next_keypoint,
 )
+from actions.tracking.person_association import (
+    select_tracked_person,
+    update_tracked_bbox,
+)
 from actions.tracking.stable_seed import StableTargetSeedTracker
 from actions.tracking.target_catalog import (
     HUMAN_TRACKABLE_PARTS,
@@ -16,19 +20,21 @@ from actions.tracking.target_catalog import (
     normalize_object_target,
 )
 from cognition.manager.world_state import robot_state
-from utilities.camera_sampler import pose_body_mask, project_tof_region
+from services.display.camera_display import pose_body_mask, project_tof_region
 
 HORIZONTAL_FOV_DEG = 85
 VERTICAL_FOV_DEG = 52
 
 
-class TrackAction:
+class TrackingService:
+    """One shareable visual-tracking session for all high-level actions."""
     OBJECT_FAILURE_GRACE_FRAMES = 3
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
     TARGET_SEED_SAMPLES = StableTargetSeedTracker.SAMPLE_COUNT
     PERSON_POINT_MAX_AGE_SECONDS = StableTargetSeedTracker.INPUT_MAX_AGE_SECONDS
     PERSON_SEED_UPDATE_HZ = 5.0
+    PERSON_TARGET_SMOOTHING_ALPHA = 0.35
 
     def __init__(
         self,
@@ -66,6 +72,15 @@ class TrackAction:
 
         self.person_path = []
         self.person_path_index = 0
+        self._tracked_person_bbox = None
+
+    @property
+    def session_id(self):
+        return self.action_id
+
+    def expected_person_detection(self, detections):
+        """Return the one person this tracking session would associate."""
+        return select_tracked_person(detections, self._tracked_person_bbox)
 
     def set_visual_target_override(self, normalized_x, normalized_y):
         """Temporarily aim person tracking at an externally observed point."""
@@ -76,23 +91,6 @@ class TrackAction:
             "updated_at": time.monotonic(),
         }
         if override_started:
-            self.stable_seeds.clear()
-
-        center_tolerance = getattr(self, "stable_threshold", 0.05)
-        if (
-            abs(self._visual_target_override["x"] - 0.5)
-            < center_tolerance
-            and abs(self._visual_target_override["y"] - 0.5)
-            < center_tolerance
-        ):
-            self.stable_seeds.update(
-                robot_state.get("camera"),
-                target="hand",
-                session_id=self.action_id,
-                person=robot_state.get("person"),
-                require_person_proximity=True,
-            )
-        else:
             self.stable_seeds.clear()
 
     def clear_visual_target_override(self):
@@ -148,17 +146,39 @@ class TrackAction:
         action_id,
         allow_grounding_dino=True,
         continuous_person_reacquisition=False,
+        initial_person=None,
     ):
-        if self.active:
-            await self.stop_tracking(
-                reason_code="REPLACED",
-                status="cancelled",
-                outcome="replaced_by_new_goal",
-            )
-
         normalized_target = (
             normalize_human_target(target) or normalize_object_target(target)
         )
+
+        if self.active and self.target == normalized_target:
+            self._allow_grounding_dino = (
+                self._allow_grounding_dino or bool(allow_grounding_dino)
+            )
+            self._continuous_person_reacquisition = (
+                self._continuous_person_reacquisition
+                or bool(continuous_person_reacquisition)
+            )
+            return ActionResult(
+                action_id=action_id,
+                action_type="track_action",
+                status="running",
+                target=self.target,
+                outcome="tracking_shared",
+                data={
+                    "tracking_session_id": self.action_id,
+                    "reused_tracking": True,
+                },
+            )
+
+        if self.active:
+            await self.stop(
+                reason_code="TARGET_CHANGED",
+                status="cancelled",
+                outcome="replaced_by_new_target",
+                reset_camera=False,
+            )
 
         self.action_id = action_id
         self.target = normalized_target
@@ -170,9 +190,13 @@ class TrackAction:
             continuous_person_reacquisition
         )
         self.last_stable_target_location = None
+        self._tracked_person_bbox = None
 
         if normalized_target in HUMAN_TRACKABLE_PARTS:
-            return await self._start_person_tracking(normalized_target)
+            return await self._start_person_tracking(
+                normalized_target,
+                initial_person=initial_person,
+            )
 
         jpeg_bytes = None
         snapshot = None
@@ -361,7 +385,7 @@ class TrackAction:
                     if reacquired:
                         failure_frames = 0
                     else:
-                        await self.stop_tracking(
+                        await self.stop(
                             reason_code="OBJECT_LOST",
                             status="failed",
                             outcome="target_lost_after_reacquisition",
@@ -405,7 +429,13 @@ class TrackAction:
         }
         self._memory_recorded_for_session = True
 
-    async def _start_person_tracking(self, target):
+    async def _start_person_tracking(self, target, initial_person=None):
+        initial_person_is_valid = (
+            isinstance(initial_person, dict)
+            and initial_person.get("class") == "person"
+            and initial_person.get("keypoints")
+            and initial_person.get("bbox")
+        )
         detections = [
             detection
             for detection in self.yolo.detections
@@ -413,7 +443,7 @@ class TrackAction:
             and "keypoints" in detection
         ]
 
-        if not detections:
+        if not detections and not initial_person_is_valid:
             action_id = self.action_id or "unassigned"
             self.action_id = None
             self.target = None
@@ -427,9 +457,17 @@ class TrackAction:
                 retryable=True,
             )
 
-        person = max(detections, key=lambda detection: detection["confidence"])
+        person = (
+            initial_person
+            if initial_person_is_valid
+            else max(
+                detections,
+                key=lambda detection: detection["confidence"],
+            )
+        )
         self.detection_confidence = float(person.get("confidence") or 1.0)
         self.person_path = find_best_person_path(person, target)
+        self._tracked_person_bbox = update_tracked_bbox(None, person)
 
         self.person_path_index = 0
         feedback = await self.send_robot_command({
@@ -467,7 +505,7 @@ class TrackAction:
             "session_id": seed.get("session_id"),
         })
 
-    def _update_person_seed(self, person):
+    def _update_person_seed(self, person, target):
         """Validate a centered person's ToF point against the pose mask."""
         camera_state = robot_state.get("camera") or {}
         timestamp = camera_state.get("timestamp")
@@ -514,7 +552,7 @@ class TrackAction:
 
         return self.stable_seeds.update(
             camera_state,
-            target=self.target,
+            target=target,
             session_id=self.action_id,
         )
 
@@ -529,6 +567,8 @@ class TrackAction:
         last_visual_override_updated_at = None
         last_seed_update_at = None
         last_seed_target = None
+        filtered_target = None
+        filtered_target_name = None
 
         while self.active:
             (
@@ -558,7 +598,7 @@ class TrackAction:
                     >= keypoint_timeout_seconds
                     and not self._continuous_person_reacquisition
                 ):
-                    await self.stop_tracking(
+                    await self.stop(
                         reason_code="PERSON_LOST",
                         status="failed",
                         outcome="target_lost_after_reacquisition",
@@ -576,7 +616,11 @@ class TrackAction:
                 and "keypoints" in detection
             ]
 
-            if not detections:
+            person = select_tracked_person(
+                detections,
+                self._tracked_person_bbox,
+            )
+            if person is None:
                 self.stable_seeds.clear()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
@@ -585,7 +629,7 @@ class TrackAction:
                     >= keypoint_timeout_seconds
                     and not self._continuous_person_reacquisition
                 ):
-                    await self.stop_tracking(
+                    await self.stop(
                         reason_code="PERSON_LOST",
                         status="failed",
                         outcome="target_lost_after_reacquisition",
@@ -594,10 +638,9 @@ class TrackAction:
                 await asyncio.sleep(0.05)
                 continue
             missing_person_since = None
-
-            person = max(
-                detections,
-                key=lambda detection: detection["confidence"]
+            self._tracked_person_bbox = update_tracked_bbox(
+                self._tracked_person_bbox,
+                person,
             )
             current_name = self.person_path[self.person_path_index]
             current_keypoint = person_keypoint(person, current_name)
@@ -611,7 +654,7 @@ class TrackAction:
                         >= keypoint_timeout_seconds
                         and not self._continuous_person_reacquisition
                     ):
-                        await self.stop_tracking(
+                        await self.stop(
                             reason_code="PERSON_KEYPOINT_TIMEOUT",
                             status="failed",
                             outcome="target_keypoint_lost",
@@ -655,6 +698,24 @@ class TrackAction:
 
             if visual_override is not None:
                 target_x, target_y = visual_override
+                filtered_target = None
+                filtered_target_name = None
+            else:
+                target_name = self.person_path[self.person_path_index]
+                if filtered_target is None or filtered_target_name != target_name:
+                    filtered_target = (target_x, target_y)
+                    filtered_target_name = target_name
+                else:
+                    alpha = self.PERSON_TARGET_SMOOTHING_ALPHA
+                    filtered_target = (
+                        filtered_target[0] + alpha * (
+                            target_x - filtered_target[0]
+                        ),
+                        filtered_target[1] + alpha * (
+                            target_y - filtered_target[1]
+                        ),
+                    )
+                target_x, target_y = filtered_target
 
             target_centered = (
                 abs(target_x - 0.5) < self.stable_threshold
@@ -707,11 +768,15 @@ class TrackAction:
                 })
 
             final_keypoint = self.person_path_index == len(self.person_path) - 1
+            # A hand seed only requires the palm target to be centered. For
+            # regular person targets, the pose-mask intersection verifies
+            # that the off-center ToF beam is still hitting them.
             seed_target = (
                 "hand"
-                if visual_override is not None
+                if visual_override is not None and target_centered
                 else self.target
-                if final_keypoint and target_centered
+                if visual_override is None
+                and final_keypoint
                 else None
             )
             if seed_target != last_seed_target:
@@ -726,43 +791,28 @@ class TrackAction:
                     or now - last_seed_update_at >= seed_update_interval
                 ):
                     seed = (
-                        self.stable_seeds.get(
+                        self.stable_seeds.update(
+                            robot_state.get("camera"),
                             target="hand",
                             session_id=self.action_id,
                         )
                         if visual_override is not None
-                        else self._update_person_seed(person)
+                        else self._update_person_seed(person, seed_target)
                     )
                     if seed is not None:
                         if visual_override is None:
                             self._remember_stable_target()
                         await self._publish_lidar_seed(seed)
                     last_seed_update_at = now
-            elif visual_override is None:
+            else:
                 self.stable_seeds.clear()
 
             await asyncio.sleep(0.01)
 
-    async def adopt_person_tracking(
-        self,
-        action_id,
-        continuous_person_reacquisition=False,
-    ):
-        """Transfer an active human track without restarting the camera servo."""
-        if not self.active or self.target not in HUMAN_TRACKABLE_PARTS:
-            return False
-
-        self.action_id = action_id
-        self.stable_seeds.clear()
-        if continuous_person_reacquisition:
-            self._continuous_person_reacquisition = True
-        return True
-
-
     async def wait_until_finished(self):
-        return await self.completion_future
+        return await asyncio.shield(self.completion_future)
 
-    async def stop_tracking(
+    async def stop(
         self,
         reason_code="USER_REQUESTED",
         status="cancelled",
@@ -843,6 +893,7 @@ class TrackAction:
         self.action_id = None
         self.target = None
         self._tracking_task = None
+        self._tracked_person_bbox = None
 
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)

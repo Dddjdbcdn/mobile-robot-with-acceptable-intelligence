@@ -47,19 +47,23 @@
   {
     "type": "function",
     "name": "explicit_navigation",
-    "description": "Execute one clear movement whose direction or destination is fully stated in the user's speech. Trigger phrases include 'move/go forward', 'back up', 'step/nudge left', 'turn/rotate right', 'turn around', 'go as far forward as possible', 'move to the middle of this open space', 'go back to the previous position', 'leave/exit this room', 'go into the next room', 'go to Room 2', and 'return to where you started'. Do not infer a direction from a gesture or vague word. Use watch_target for 'look at me' or 'watch the bottle', and find_target when the destination is a named object or visually recognizable place. Hand-guided movement is automatic and has no tool call.",
+    "description": "Execute one clear movement whose direction or destination is fully stated in the user's speech. Trigger phrases include 'move/go forward', 'back up', 'step/nudge left', 'turn/rotate right', 'turn around', 'go as far forward as possible', 'move to the middle of this open space', 'go back to the previous position', 'leave/exit this room', 'go into the next room', 'go to Room 2', 'return to where you started', 'move in front of me/the person', 'move to my/the person's right', and 'move to my/the person's left'. For a requested position around a person, always use the matching move_to_person_* command; these commands acquire person tracking when needed, use the lidar person pose, choose the nearest safe pose in that direction, and face the person. Do not substitute nudge_left/nudge_right, watch_target, follow_person, or find_target. Do not infer a direction from a gesture or vague word. Use watch_target for 'look at me' or 'watch the bottle', and find_target when the destination is a named non-person object or visually recognizable place. Hand-guided movement is automatic and has no tool call.",
     "parameters": {
       "type": "object",
       "properties": {
         "local_command": {
           "type": "string",
-          "enum": ["nudge_forward", "nudge_backward", "nudge_left", "nudge_right", "rotate_left", "rotate_right", "rotate_around", "furthest_forward", "furthest_backward", "open_space_middle", "previous_position", "exit_room", "go_to_another_room", "go_to_room", "return_to_initial_place"],
-          "description": "Map the user's explicit wording to exactly one command. Use nudge_* for a short translation, rotate_* for an in-place turn, furthest_* for maximum reachable travel, open_space_middle for the center of the current room's core open space (the robot may briefly explore until that core is mapped), previous_position to undo the last navigation, exit_room to reach but not cross the current exit, go_to_another_room to cross into the adjacent room, go_to_room for a numbered room, and return_to_initial_place for the startup location in Room 1."
+          "enum": ["nudge_forward", "nudge_backward", "nudge_left", "nudge_right", "rotate_left", "rotate_right", "rotate_around", "furthest_forward", "furthest_backward", "open_space_middle", "previous_position", "exit_room", "go_to_another_room", "go_to_room", "return_to_initial_place", "move_to_person_front", "move_to_person_right", "move_to_person_left"],
+          "description": "Map the user's explicit wording to exactly one command. Use move_to_person_front when asked to move in front of the person with phrases include 'come here', 'come next to me', move_to_person_right for the person's right side, and move_to_person_left for the person's left side. These are positions around the person, not directions relative to the robot. Use nudge_* for a short robot-relative translation, rotate_* for an in-place turn, furthest_* for maximum reachable travel, open_space_middle for the center of the current room's core open space (the robot may briefly explore until that core is mapped), previous_position to undo the last navigation, exit_room to reach but not cross the current exit, go_to_another_room to cross into the adjacent room, go_to_room for a numbered room, and return_to_initial_place for the startup location in Room 1."
         },
         "room_id": {
           "type": ["integer", "null"],
           "minimum": 1,
           "description": "Required room number only when local_command is go_to_room; use null for every other command."
+        },
+        "face_person": {
+          "type": "boolean",
+          "description": "Set true only when an ordinary movement should arrive oriented toward the currently tracked person. It is unnecessary for move_to_person_front/right/left because those commands always face the person."
         }
       },
       "required": ["local_command", "room_id"],
@@ -69,7 +73,7 @@
   {
     "type": "function",
     "name": "watch_target",
-    "description": "Continuously watch a person or object without approaching it. Trigger phrases include 'look at me', 'face me', 'watch me', 'keep looking at me', 'watch the bottle', and 'keep your eyes on the door'. The robot first tries immediate tracking without Grounding DINO; if that fails, it runs the normal find-target search with approach disabled. Once acquired, TrackAction remains active until stop_watching_target or another camera-owning action. Do not use this for a one-shot visual question, person-indicated navigation, or following a moving person with the robot base.",
+    "description": "Continuously watch a person or object without approaching it. Trigger phrases include 'look at me', 'face me', 'watch me', 'keep looking at me', 'watch the bottle', and 'keep your eyes on the door'. The robot first tries immediate tracking without Grounding DINO; if that fails, it runs the normal find-target search with approach disabled. Once acquired, the shared tracking service remains active until stop_watching_target, a target change, or explicit camera movement. Do not use this for a one-shot visual question, person-indicated navigation, or following a moving person with the robot base.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -90,7 +94,7 @@
   {
     "type": "function",
     "name": "follow_person",
-    "description": "Continuously move behind a person. Trigger phrases include 'follow me', 'come with me', 'walk with me', 'stay with me', 'trail me', and 'follow that person'. The robot finds the person, initializes camera/ToF-assisted lidar tracking, and repeatedly follows the estimated pose with Nav2 until stop_follow is called. Do not use follow_person for hand gestures or for 'look at me' (use watch_target).",
+    "description": "Continuously move behind a person. Trigger phrases include 'follow me', 'come with me', 'walk with me', 'stay with me', 'trail me', and 'follow that person'. The robot finds the person, initializes camera/ToF-assisted lidar tracking, and repeatedly follows the estimated pose with Nav2 until stop_follow is called. Do not use follow_person for 'look at me' (use watch_target) or 'come here' (use explicit navigation).",
     "parameters": {
       "type": "object",
       "properties": {

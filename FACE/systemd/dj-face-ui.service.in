@@ -1,0 +1,12 @@
+[Unit]
+Description=DJ robot dedicated touchscreen interface
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%t/gdm/Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/python3 @FACE_DIR@/face.py
+Restart=on-failure
+RestartSec=1
+

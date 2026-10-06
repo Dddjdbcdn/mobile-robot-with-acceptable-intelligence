@@ -1,6 +1,9 @@
 # Navigation actions
 
-Navigation is split into three small actions.
+Foreground local movement and target approach share one `NavigationAction`
+lifecycle. Their request validation remains separate through `start_local` and
+`start_approach`, while one active flag enforces the single-robot-motion
+constraint. Find-loop map navigation remains an internal action.
 
 ## Explicit navigation
 
@@ -18,8 +21,21 @@ Navigation is split into three small actions.
 - navigate to a known numbered room.
 
 The realtime model never selects coordinates or a marker from a rendered map.
-`BIG_BRAIN/src/robot/robot/map/map_logic.py` resolves the named command against the current
-reachable occupancy grid and the bridge sends the resulting pose to Nav2.
+Small Brain sends one named command and waits for one terminal event. The ROS
+bridge owns the complete execution loop: prepare the current map, ask map logic
+for the next step, send the resulting pose to Nav2, wait for a newer map when
+needed, and repeat or finish. One-shot and sequential commands share the same
+Nav2 goal dispatcher. Sequential room/open-space state is isolated in
+`SequentialNavigationResolver`, leaving the bridge's one-shot path independent
+of the multi-goal state machine.
+
+`open_space_middle` normally moves to the maximum structural-wall-clearance
+cell in the nearest sufficiently large room core. If that core is not mapped
+yet, recovery moves to the maximum-clearance pose in all currently known,
+reachable space instead of moving toward a frontier. After arrival it waits for
+a newer occupancy grid and evaluates the room-core condition again. Recovery
+remains bounded to three moves and stops early if the best pose would be a
+no-op or revisit the previous recovery position.
 
 Map logic treats sufficiently open reachable regions separated by narrow
 clearance bands as geometric chambers. The first observed chamber is retained
@@ -65,9 +81,31 @@ the current person target. A hand ToF seed is accepted only when it remains
 close to the lidar person pose, and validated hand and person seeds are both
 forwarded to lidar tracking. Welcome followed by fingers-up approaches the
 saved hand seed. Push followed by fingers-down returns to and faces the person.
+Hand-guided translations set `face_person` on the same local-navigation request,
+so map logic gives the destination a person-facing yaw and Nav2 completes the
+move and final orientation as one goal rather than a follow-up rotation.
 Recognized commands enter CognitionManager as ordinary `ToolRequest` events
 with LLM and voice reporting disabled, so they use the same arbitration and
 lifecycle path as spoken commands.
+
+## Person-relative navigation
+
+`move_to_person_front`, `move_to_person_right`, and `move_to_person_left` use
+the fresh lidar person pose. Front follows the person-to-robot ray. Right and
+left rotate that ray clockwise or counterclockwise by 90 degrees around the
+person. Map logic uses the nearest safe reachable cell on the requested ray,
+searching no farther than 0.5 m from the person without enforcing a fixed
+standoff, and every goal faces the person. If the exact side ray has no safe
+pose, map logic walks back toward the front in five-degree steps and uses the
+furthest safe angle.
+
+Existing person tracking is reused immediately. Otherwise the robot acquires
+and faces the person, waits for a stable visual/ToF seed for lidar tracking,
+then sends the requested person-relative goal.
+
+While person tracking is active, a confirmed `thumb_left` hand pose directly
+dispatches `move_to_person_left`, and `thumb_right` directly dispatches
+`move_to_person_right`.
 
 ## Find-loop map navigation
 

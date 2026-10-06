@@ -99,42 +99,39 @@ class FollowPersonExecutor:
     async def _acquire_target(self):
         acquisition_id = f"{self.action_id}:acquire-person"
         tracking_action_id = f"{self.action_id}:track"
-        adopt_tracking = getattr(
-            self.track_action, "adopt_person_tracking", None
-        )
         person_tracking_active = bool(
             self.track_action.active
             and normalize_human_target(self.track_action.target) is not None
         )
-        if (
-            person_tracking_active
-            and adopt_tracking is not None
-            and await adopt_tracking(
-                tracking_action_id,
+        if person_tracking_active:
+            shared_tracking = await self.track_action.start_tracking(
+                target=self.track_action.target,
+                action_id=tracking_action_id,
+                allow_grounding_dino=False,
                 continuous_person_reacquisition=True,
             )
-        ):
-            tracking_session_id = self.track_action.action_id
-            seed = await self.track_action.wait_for_stable_target_seed(
-                target=self.track_action.target,
-                session_id=tracking_session_id,
-                timeout=10.0,
-            )
-            if seed is not None:
-                return ActionResult(
-                    self.action_id, "follow_person", "succeeded",
-                    target="person", outcome="person_tracking_reused",
-                    data={
-                        "reused_person_tracking": True,
-                        "stable_seed": dict(seed),
-                    },
+            if shared_tracking.status == "running":
+                tracking_session_id = self.track_action.session_id
+                seed = await self.track_action.wait_for_stable_target_seed(
+                    target=self.track_action.target,
+                    session_id=tracking_session_id,
+                    timeout=10.0,
                 )
-            return ActionResult(
-                self.action_id, "follow_person", "failed", target="person",
-                outcome="stable_seed_timeout",
-                reason_code="STABLE_SEED_TIMEOUT",
-                retryable=True,
-            )
+                if seed is not None:
+                    return ActionResult(
+                        self.action_id, "follow_person", "succeeded",
+                        target="person", outcome="person_tracking_reused",
+                        data={
+                            "reused_person_tracking": True,
+                            "stable_seed": dict(seed),
+                        },
+                    )
+                return ActionResult(
+                    self.action_id, "follow_person", "failed", target="person",
+                    outcome="stable_seed_timeout",
+                    reason_code="STABLE_SEED_TIMEOUT",
+                    retryable=True,
+                )
 
         result = await self.find_target_executor.start(
             target="person",

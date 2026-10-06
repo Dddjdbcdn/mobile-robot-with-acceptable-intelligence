@@ -76,6 +76,7 @@ SMALL_BRAIN/vision_models/sam2_tools/sam2/
 **/*_openvino_model/
 **/*_openvino_model_*/
 SMALL_BRAIN/vision_models/hand_landmark_tools/hand_landmarker.task
+SMALL_BRAIN/vision_models/reid_tools/person-reidentification-retail-0288/
 
 # Inference/compiler caches and runtime output
 **/.ov_cache*/

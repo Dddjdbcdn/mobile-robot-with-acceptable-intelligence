@@ -17,6 +17,7 @@
       </RateController>
       <KeepRunningUntilFailure>
         <FollowPath path="{follow_path}" controller_id="{selected_controller}"
+          goal_checker_id="general_goal_checker"
           error_code_id="{follow_path_error_code}"/>
       </KeepRunningUntilFailure>
     </PipelineSequence>

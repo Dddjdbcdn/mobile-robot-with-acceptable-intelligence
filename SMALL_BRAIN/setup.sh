@@ -5,3 +5,5 @@ alias chat='clear && python main.py'
 
 export DISPLAY=:0
 export QT_QPA_PLATFORM=xcb
+
+alias stop_gui='systemctl --user stop dj-robot.target && systemctl --user stop dj-face-ui.service'

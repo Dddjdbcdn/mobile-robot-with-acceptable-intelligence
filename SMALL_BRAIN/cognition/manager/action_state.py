@@ -13,15 +13,13 @@ class ActionState:
         *,
         search,
         tracking,
-        approach,
-        explicit_navigation,
+        navigation,
         find_target,
         follow_person,
     ):
         self.search = search
         self.tracking = tracking
-        self.approach = approach
-        self.explicit_navigation = explicit_navigation
+        self.navigation = navigation
         self.find_target = find_target
         self.follow_person = follow_person
 
@@ -33,55 +31,128 @@ class ActionState:
         )
 
     @property
-    def camera_owner(self):
-        if self.follow_person.active:
-            return "follow_person"
-        if self.find_target.active:
-            return self.find_target.action_type
-        if self.search.active:
-            return "search_action"
-        if self.tracking.active:
-            return "target_tracking"
-        if self.approach.active:
-            return "approach_action"
-        return None
-
-    @property
     def gesture_context(self):
+        map_navigation = getattr(
+            self.find_target, "map_navigation_action", None
+        )
+        find_navigation_active = bool(
+            getattr(map_navigation, "active", False)
+        )
+        navigation_active = bool(
+            self.navigation.active or find_navigation_active
+        )
+        movement_active = bool(
+            self.follow_person.active
+            or navigation_active
+        )
         if self.follow_person.active:
             mode = "following"
-        elif self.approach.active:
+            action = {
+                "action_id": self.follow_person.action_id,
+                "action_type": "follow_person",
+                "target": self.follow_person.target,
+                "state": "running",
+            }
+        elif self.navigation.active and self.navigation.mode == "approach":
             mode = "approaching"
+            action = {
+                "action_id": self.navigation.action_id,
+                "action_type": "approach_action",
+                "target": self.navigation.target,
+                "state": "running",
+            }
+        elif self.navigation.active:
+            mode = "navigating"
+            command = self.navigation.target
+            target = command
+            if command == "go_to_room":
+                room_id = self.navigation.room_id
+                if room_id is not None:
+                    target = f"room {room_id}"
+            action = {
+                "action_id": self.navigation.action_id,
+                "action_type": "explicit_navigation",
+                "target": target,
+                "command": command,
+                "state": "running",
+            }
+        elif getattr(map_navigation, "active", False):
+            mode = "navigating"
+            action = {
+                "action_id": map_navigation.action_id,
+                "action_type": "map_navigation",
+                "target": map_navigation.target,
+                "state": getattr(map_navigation, "stage", "running"),
+            }
+        elif self.search.active:
+            mode = "searching"
+            action = {
+                "action_id": self.search.action_id,
+                "action_type": "search_action",
+                "target": self.search.target,
+                "state": "running",
+            }
+        elif self.find_target.active:
+            mode = "finding_target"
+            action = {
+                "action_id": self.find_target.action_id,
+                "action_type": self.find_target.action_type,
+                "target": self.find_target.target,
+                "state": "running",
+            }
         elif self.person_tracking:
             mode = "tracking_person"
+            action = {
+                "action_id": getattr(
+                    self.tracking, "session_id", self.tracking.action_id
+                ),
+                "action_type": "track_action",
+                "target": self.tracking.target,
+                "state": "running",
+            }
+        elif self.tracking.active:
+            mode = "tracking_target"
+            action = {
+                "action_id": getattr(
+                    self.tracking, "session_id", self.tracking.action_id
+                ),
+                "action_type": "track_action",
+                "target": self.tracking.target,
+                "state": "running",
+            }
         else:
-            mode = "watching_person"
+            mode = "idle"
+            action = {
+                "action_id": None,
+                "action_type": None,
+                "target": None,
+                "state": "idle",
+            }
         return {
             "mode": mode,
+            "action": action,
             "tracking_active": bool(self.tracking.active),
             "tracking_person": self.person_tracking,
             "following_active": bool(self.follow_person.active),
-            "approach_active": bool(self.approach.active),
-            "navigation_active": bool(
-                self.explicit_navigation is not None
-                and self.explicit_navigation.active
+            "approach_active": bool(
+                self.navigation.active and self.navigation.mode == "approach"
             ),
+            "navigation_active": navigation_active,
+            "movement_active": movement_active,
         }
 
     def snapshot(self, autonomy_task=None):
         active_actions = []
         for action_type, action in (
             ("search_action", self.search),
-            ("track_action", self.tracking),
-            ("approach_action", self.approach),
-            ("explicit_navigation", self.explicit_navigation),
+            (self.navigation.action_type, self.navigation),
             ("follow_person", self.follow_person),
         ):
-            if action is not None and getattr(action, "active", False):
+            if action.active:
                 active_actions.append({
-                    "action_id": getattr(action, "action_id", None),
+                    "action_id": action.action_id,
                     "action_type": action_type,
-                    "target": getattr(action, "target", None),
+                    "target": action.target,
                 })
 
         if self.find_target.active:
@@ -93,6 +164,13 @@ class ActionState:
 
         return {
             "active_actions": active_actions,
+            "tracking": {
+                "active": bool(self.tracking.active),
+                "session_id": getattr(
+                    self.tracking, "session_id", self.tracking.action_id
+                ),
+                "target": self.tracking.target,
+            },
             "autonomy_active": bool(
                 autonomy_task is not None and not autonomy_task.done()
             ),

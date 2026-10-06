@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DJ Robot
+Comment=Start and stop the robot locally
+Exec=/usr/bin/systemctl --user start dj-face-ui.service
+Icon=@FACE_DIR@/assets/dj-robot.svg
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

@@ -18,9 +18,11 @@ class LogicConfig:
 
     # Local navigation
     sample_radius: float = 3.0
-    nudge_distance_m: float = 0.25
+    nudge_distance_m: float = 0.5
     candidate_min_separation_m: float = 0.30
     local_person_pose_max_age_seconds: float = 1.0
+    person_navigation_max_distance_m: float = 0.50
+    person_navigation_angle_step_deg: float = 5.0
 
     # Frontiers
     frontier_hole_min_area: float = 0.5

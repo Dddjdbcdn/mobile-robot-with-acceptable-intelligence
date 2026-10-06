@@ -14,26 +14,24 @@ import zmq
 import zmq.asyncio
 from typing import Any
 
-from utilities.camera_sampler import display_camera_loop
+from services.display.camera_display import display_camera_loop
 
-from actions.approach_action import ApproachAction
 from actions.search_action import SearchAction
 from actions.see_action import SeeAction
-from actions.track_action import TrackAction
-from actions.explicit_navigation_action import ExplicitNavigationAction
+from actions.track_action import TrackingService
+from actions.move_camera_action import MoveCameraAction
+from actions.navigation_action import NavigationAction
 from actions.map_navigation_action import MapNavigationAction
 
-from services.audio_stream import AudioApp, send_mic_audio
-from services.camera_stream import CameraStream
-from services.map_client import MapClient
-from services.response_manager import ResponseManager
+from services.stream.audio_stream import AudioApp, send_mic_audio
+from services.stream.camera_stream import CameraStream
+from services.stream.map_client import MapClient
+from services.stream.response_manager import ResponseManager
 
-from services.groundingdino_service import GroundingDINOService
-from services.csrt_tracker import CSRTTrackingManager
-from services.depthanything_service import DepthAnythingService # unused
-from services.hand_landmark_service import HandLandmarkService
-from services.sam2_service import SAM2OpenVINOService # unused
-from services.yolo_service import YoloService
+from services.vision.groundingdino_service import GroundingDINOService
+from services.vision.csrt_tracker import CSRTTrackingManager
+from services.vision.hand_landmark_service import HandLandmarkService
+from services.vision.yolo_service import YoloService
 
 from cognition.manager.cognition_manager import CognitionManager
 from cognition.sequence.follow_person_executor import FollowPersonExecutor
@@ -122,16 +120,16 @@ async def background_status_monitor(cognitive_manager):
                 stable_seed = (
                     active_tracker.stable_seeds.get(
                         target=active_tracker.target,
-                        session_id=active_tracker.action_id,
+                        session_id=active_tracker.session_id,
                     )
-                    if active_tracker is not None else None
+                    if active_tracker.active else None
                 )
                 await cognitive_manager.publish_world_state({
                     **message,
-                    "track_action_active": active_tracker is not None,
+                    "track_action_active": bool(active_tracker.active),
                     "stable_seed_ready": stable_seed is not None,
                     "tracked_target": (
-                        active_tracker.target if active_tracker is not None else None
+                        active_tracker.target if active_tracker.active else None
                     ),
                 })
 
@@ -164,6 +162,9 @@ async def _read_stdin_line(prompt):
 
 
 async def send_typed_messages(response_manager, cognitive_manager=None):
+    if not sys.stdin.isatty():
+        print("[System: Typed chat disabled; no interactive terminal is attached.]")
+        return
     print("[System: Typed chat ready. Type a message and press Enter.]")
 
     while True:
@@ -403,9 +404,6 @@ async def main():
                 timeout=5.0,
             )
 
-    async def send_map_overlay(payload):
-        return await map_client.command(payload)
-
     headers = {
         "Authorization": "Bearer " + OPENAI_API_KEY,
         "OpenAI-Safety-Identifier": "hashed-user-id",
@@ -416,12 +414,7 @@ async def main():
 
             response_manager = ResponseManager(ws=ws,app=app)
 
-            search_action = SearchAction(
-                ws=ws,
-                send_robot_command=send_robot_command,
-                camera=camera,
-            )
-            track_action = TrackAction(
+            track_action = TrackingService(
                 csrt_tracker=csrt_tracker,
                 grounding_dino=grounding_dino,
                 yolo=yolo,
@@ -430,34 +423,40 @@ async def main():
                 person_tracker_pub_socket=person_tracker_pub_socket,
                 send_robot_command=send_robot_command,
             )
-            approach_action = ApproachAction(
+            move_camera_action = MoveCameraAction(
+                camera=camera,
                 send_robot_command=send_robot_command,
+                tracking=track_action,
             )
+            search_action = SearchAction(
+                ws=ws,
+                send_robot_command=send_robot_command,
+                camera=camera,
+                move_camera_action=move_camera_action,
+            )
+            navigation_action = NavigationAction(send_robot_command)
             see_action = SeeAction(
                 ws=ws,
                 camera=camera,
                 send_robot_command=send_robot_command,
-            )
-            explicit_navigation_action = ExplicitNavigationAction(
-                send_robot_command,
-                request_map_snapshot=map_client.request_snapshot,
-                save_map_snapshot=map_client.save_snapshot,
+                move_camera_action=move_camera_action,
             )
             map_navigation_action = MapNavigationAction(
                 ws, camera, send_robot_command,
                 request_map_snapshot=map_client.request_snapshot,
                 save_map_snapshot=map_client.save_snapshot,
                 see_action=see_action,
-                send_map_overlay=send_map_overlay,
+                send_map_overlay=map_client.command,
+                move_camera_action=move_camera_action,
             )
             find_target_executor = FindTargetExecutor(
                 search_action=search_action,
                 track_action=track_action,
-                approach_action=approach_action,
+                navigation_action=navigation_action,
                 see_action=see_action,
                 map_navigation_action=map_navigation_action,
-                local_navigation_action=explicit_navigation_action,
-                send_map_overlay=send_map_overlay,
+                send_map_overlay=map_client.command,
+                move_camera_action=move_camera_action,
             )
             hand_gesture_interface = HandGestureInterface(hand_landmarks)
             follow_person_executor = FollowPersonExecutor(
@@ -467,11 +466,10 @@ async def main():
             )
 
             cognitive_manager = CognitionManager(
-                approach_action=approach_action,
+                navigation_action=navigation_action,
                 search_action=search_action,
                 see_action=see_action,
                 track_action=track_action,
-                explicit_navigation_action=explicit_navigation_action,
                 map_navigation_action=map_navigation_action,
                 hand_gesture_interface=hand_gesture_interface,
                 find_target_executor=find_target_executor,

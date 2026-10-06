@@ -57,18 +57,21 @@ class FindTargetExecutor:
         self,
         search_action,
         track_action,
-        approach_action,
+        navigation_action,
         see_action,
-        map_navigation_action=None,
-        local_navigation_action=None,
-        send_map_overlay=None,
+        map_navigation_action,
+        send_map_overlay,
+        move_camera_action=None,
     ):
         self.search_action = search_action
         self.track_action = track_action
-        self.approach_action = approach_action
+        self.navigation_action = navigation_action
         self.see_action = see_action
+        self.move_camera_action = (
+            move_camera_action
+            or getattr(see_action, "move_camera_action", see_action)
+        )
         self.map_navigation_action = map_navigation_action
-        self.local_navigation_action = local_navigation_action
         self.send_map_overlay = send_map_overlay
         self.find_loop = FindLoopConfig()
 
@@ -81,7 +84,6 @@ class FindTargetExecutor:
         self.completion_future: asyncio.Future[ActionResult] | None = None
         self._runner: asyncio.Task | None = None
         self._completed_steps: list[str] = []
-        self._started_tracking = False
         self._approach_result_data: dict = {}
         self._search_poses: list[dict] = []
         self._map_overlay_revision = 0
@@ -133,7 +135,6 @@ class FindTargetExecutor:
             continuous_person_reacquisition
         )
         self._completed_steps = []
-        self._started_tracking = False
         self._approach_result_data = {}
         self._search_poses = []
         self._search_waypoint_count = 0
@@ -157,7 +158,7 @@ class FindTargetExecutor:
         )
 
     async def wait_until_finished(self) -> ActionResult:
-        return await self.completion_future
+        return await asyncio.shield(self.completion_future)
 
     async def stop(self, reason_code="USER_REQUESTED") -> ActionResult | None:
         if not self.active:
@@ -167,19 +168,12 @@ class FindTargetExecutor:
         if runner is not None and runner is not asyncio.current_task():
             runner.cancel()
 
-        if self.approach_action.active:
-            await self.approach_action.stop_approaching(reason_code)
-        if self.map_navigation_action is not None and self.map_navigation_action.active:
+        if self.navigation_action.active:
+            await self.navigation_action.stop(reason_code)
+        if self.map_navigation_action.active:
             await self.map_navigation_action.stop(reason_code)
-        if (
-            self.local_navigation_action is not None
-            and self.local_navigation_action.active
-        ):
-            await self.local_navigation_action.stop(reason_code)
         if self.search_action.active:
-            await self.search_action.stop_searching(reason_code)
-        if self._started_tracking and self.track_action.active:
-            await self.track_action.stop_tracking(reason_code)
+            await self.search_action.stop(reason_code)
 
         result = self._complete(
             status="cancelled",
@@ -196,18 +190,17 @@ class FindTargetExecutor:
             person = robot_state.get("person") or {}
             robot_pose = robot_state.get("pose") or {}
             if (
-                getattr(self, "target_kind", "object") == "person"
-                and getattr(self, "local_navigation_action", None) is not None
+                self.target_kind == "person"
                 and self._person_pose_is_fresh(person)
                 and self._person_bearing_exceeds_face_threshold(
                     person, robot_pose
                 )
             ):
-                facing = await self.local_navigation_action.start(
+                facing = await self.navigation_action.start_local(
                     "face_person", self._step_id("face_known_person")
                 )
                 facing = await self._terminal_result(
-                    self.local_navigation_action, facing
+                    self.navigation_action, facing
                 )
                 if facing.status == "succeeded":
                     self._completed_steps.append("faced_known_person")
@@ -242,15 +235,15 @@ class FindTargetExecutor:
             return
 
         acquisition_only = (
-            getattr(self, "target_kind", "object") != "place"
-            and not getattr(self, "approach_target", True)
+            self.target_kind != "place"
+            and not self.approach_target
         )
-        if getattr(self, "target_kind", "object") == "place":
+        if self.target_kind == "place":
             outcome = "place_reached"
         elif acquisition_only:
             outcome = (
                 "person_acquired"
-                if getattr(self, "target_kind", "object") == "person"
+                if self.target_kind == "person"
                 else "target_acquired"
             )
         else:
@@ -266,11 +259,10 @@ class FindTargetExecutor:
             "action_id": self._step_id(step),
             "allow_grounding_dino": allow_grounding_dino,
         }
-        if getattr(self, "_continuous_person_reacquisition", False):
+        if self._continuous_person_reacquisition:
             tracking_options["continuous_person_reacquisition"] = True
         result = await self.track_action.start_tracking(**tracking_options)
         if result.status == "running":
-            self._started_tracking = True
             return ActionResult(
                 action_id=result.action_id,
                 action_type=result.action_type,
@@ -317,7 +309,7 @@ class FindTargetExecutor:
     async def _acquire_target_without_approach(self, attempt):
         """Start tracking and leave ongoing alignment/reacquisition to it."""
         suffix = "" if attempt == 0 else f"_{attempt}"
-        person_target = getattr(self, "target_kind", "object") == "person"
+        person_target = self.target_kind == "person"
         target_label = "person" if person_target else "target"
         self._completed_steps.append(
             "target_found" if attempt == 0 else f"target_refound_{attempt}"
@@ -360,13 +352,13 @@ class FindTargetExecutor:
                 retryable=True,
             )
 
-        result = await self.approach_action.start(
+        result = await self.navigation_action.start_approach(
             location=location,
             action_id=self._step_id(step),
             target=self.target,
             standoff_m=self._approach_standoff_m,
         )
-        result = await self._terminal_result(self.approach_action, result)
+        result = await self._terminal_result(self.navigation_action, result)
         if result.status == "succeeded":
             self._approach_result_data = dict(result.data)
         return result
@@ -398,14 +390,6 @@ class FindTargetExecutor:
         # waypoint budget as a search navigation step.
         self._search_waypoint_count += 1
         self._completed_steps.append(f"approach_waypoint_{attempt}")
-
-        if self.track_action.active:
-            await self.track_action.stop_tracking(
-                reason_code="APPROACH_NAVIGATION_COMPLETE",
-                status="succeeded",
-                outcome="ready_for_post_approach_reacquisition",
-                reset_camera=False,
-            )
 
         step = f"post_approach_search_{attempt}"
         search_result = await self._search(
@@ -480,13 +464,10 @@ class FindTargetExecutor:
                 return limit_result
 
             if pending_result is None:
-                if self.track_action.active:
-                    await self.track_action.stop_tracking(
-                        reason_code="REPLACED",
-                        status="cancelled",
-                        outcome="replaced_by_new_goal",
-                    )
-                centered = await self.see_action.move_to_region(
+                camera_motion = getattr(
+                    self, "move_camera_action", self.see_action
+                )
+                centered = await camera_motion.move_to_region(
                     region="center",
                     action_id=self._step_id(f"{step}_center_camera"),
                 )
@@ -515,7 +496,7 @@ class FindTargetExecutor:
             pending_result = None
 
             if found or candidate_type == "visual":
-                if getattr(self, "target_kind", "object") == "place":
+                if self.target_kind == "place":
                     if observation is None:
                         return ActionResult(
                             self._step_id("place_view_missing"), "search_action", "failed",
@@ -530,10 +511,10 @@ class FindTargetExecutor:
                 self.search_action.last_observation_frame = None
                 waypoint_count_before = self._search_waypoint_count
                 if (
-                    getattr(self, "target_kind", "object") != "place"
-                    and not getattr(self, "approach_target", True)
+                    self.target_kind != "place"
+                    and not self.approach_target
                 ):
-                    if getattr(self, "target_kind", "object") == "person":
+                    if self.target_kind == "person":
                         verified = await self._acquire_person_without_approach(
                             candidate_attempt
                         )
@@ -549,14 +530,6 @@ class FindTargetExecutor:
                     return verified
                 if verified.reason_code not in self.REACQUISITION_MISS_CODES:
                     return verified
-                if self.track_action.active:
-                    await self.track_action.stop_tracking(
-                        reason_code="CANDIDATE_REJECTED",
-                        status="cancelled",
-                        outcome="candidate_not_verified",
-                        reset_camera=False,
-                    )
-
                 if (
                     visual_observation is not None
                     and verified.reason_code
@@ -668,8 +641,8 @@ class FindTargetExecutor:
             self.search_action.active
             and self._normalize_target(self.search_action.target)
             == self._normalize_target(self.target)
-            and getattr(self.search_action, "search_mode", "specific")
-            == ("place" if getattr(self, "target_kind", "object") == "place" else "specific")
+            and self.search_action.search_mode
+            == ("place" if self.target_kind == "place" else "specific")
         ):
             search_result = await self.search_action.wait_until_finished()
         else:
@@ -681,17 +654,18 @@ class FindTargetExecutor:
                 sweep_directions=sweep_directions,
                 candidate_context=candidate_context,
                 search_mode=(
-                    "place" if getattr(self, "target_kind", "object") == "place"
+                    "place" if self.target_kind == "place"
                     else "specific"
                 ),
             )
             search_result = await self._terminal_result(
                 self.search_action, search_result
             )
-        coverage_frames = getattr(
-            self.search_action, "last_coverage_frames", None
-        ) or ([self.search_action.last_observation_frame]
-              if self.search_action.last_observation_frame else [])
+        coverage_frames = self.search_action.last_coverage_frames or (
+            [self.search_action.last_observation_frame]
+            if self.search_action.last_observation_frame
+            else []
+        )
         if self._remember_search_pose(step, frames=coverage_frames):
             await self._publish_map_overlay()
         return search_result
@@ -783,8 +757,6 @@ class FindTargetExecutor:
         return changed
 
     async def _publish_map_overlay(self, mode=None, observation=None):
-        if self.send_map_overlay is None or not self.action_id:
-            return self._map_overlay_revision
         self._map_overlay_revision += 1
         frame_id = (
             self._search_poses[0]["frame_id"]
@@ -845,8 +817,6 @@ class FindTargetExecutor:
         return self._map_overlay_revision
 
     def _discard_map_overlay(self, action_id):
-        if self.send_map_overlay is None or not action_id:
-            return
         asyncio.create_task(self.send_map_overlay({
             "schema_version": 1,
             "operation": "clear",
@@ -866,7 +836,7 @@ class FindTargetExecutor:
         if within_duration and within_waypoints:
             return None
         prefix = (
-            "PLACE_SEARCH" if getattr(self, "target_kind", "object") == "place"
+            "PLACE_SEARCH" if self.target_kind == "place"
             else "OBJECT_SEARCH"
         )
         reason_code = f"{prefix}_{'WAYPOINT' if not within_waypoints else 'DURATION'}_LIMIT"
@@ -896,7 +866,7 @@ class FindTargetExecutor:
             outcome="search_space_exhausted",
             reason_code=(
                 "PLACE_SEARCH_EXHAUSTED"
-                if getattr(self, "target_kind", "object") == "place"
+                if self.target_kind == "place"
                 else "OBJECT_SEARCH_EXHAUSTED"
             ),
             data=data,
@@ -924,7 +894,7 @@ class FindTargetExecutor:
             reason_code=reason_code,
             retryable=status == "failed",
             data={
-                "goal": getattr(self, "goal", None),
+                "goal": self.goal,
                 "completed_steps": list(self._completed_steps),
                 "search_waypoint_count": self._search_waypoint_count,
                 "search_poses": list(self._search_poses),

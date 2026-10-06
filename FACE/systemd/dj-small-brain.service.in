@@ -1,0 +1,19 @@
+[Unit]
+Description=DJ robot cognition and perception layer
+BindsTo=dj-ros.service
+After=dj-ros.service
+PartOf=dj-robot.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROBOT_ROOT@/SMALL_BRAIN
+EnvironmentFile=-%h/.config/dj-robot/environment
+Environment=DISPLAY=:0
+Environment=QT_QPA_PLATFORM=xcb
+ExecStart=@FACE_DIR@/scripts/start_small_brain.sh
+KillSignal=SIGINT
+TimeoutStartSec=60
+TimeoutStopSec=20
+
+[Install]
+WantedBy=dj-robot.target

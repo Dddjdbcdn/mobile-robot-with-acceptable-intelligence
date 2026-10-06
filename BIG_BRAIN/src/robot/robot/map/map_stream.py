@@ -15,9 +15,6 @@ from robot.map.room_registry import RoomRegistry
 
 BASE_FRAME = "base_footprint"
 IMAGE_ENDPOINT = "tcp://127.0.0.1:5559"
-# The navigation model only consumes the robot-centred crop. Keep the costly
-# second full-map render disabled unless a debugging session explicitly needs it.
-INCLUDE_FULL_IMAGE = False
 
 
 class MapImageStream:
@@ -28,7 +25,6 @@ class MapImageStream:
         self.node = node
         self.tf = tf_buffer
         self.base_frame = BASE_FRAME
-        self.include_full_image = INCLUDE_FULL_IMAGE
 
         self.logic = MapLogic()
         self.room_registry = RoomRegistry(self.logic)
@@ -39,14 +35,8 @@ class MapImageStream:
         self.state_lock = threading.Lock()
         self.map_msg = None
         self.cost_msg = None
-        self.prepared = None
         self._map_revision = 0
         self._map_received_at_unix_ns = 0
-        self._not_ready_reason = "Waiting for /map and /global_costmap/costmap"
-        self._last_render_error = None
-        self._coverage_key = None
-        self._coverage_counts = None
-        self._coverage_mask = None
         self.analysis_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sequence = 0
@@ -79,6 +69,11 @@ class MapImageStream:
         with self.state_lock:
             self.cost_msg = msg
 
+    def map_revision(self):
+        """Return the revision of the latest received /map message."""
+        with self.state_lock:
+            return self._map_revision
+
     def _pose(self, frame_id):
         import rclpy.time
         try:
@@ -91,7 +86,7 @@ class MapImageStream:
             orientation = transform.transform.rotation
         except Exception:
             return None
-        
+
         def yaw_of(q):
             return math.atan2(
                 2 * (q.w * q.z + q.x * q.y),
@@ -205,8 +200,8 @@ class MapImageStream:
                 normalized[key] = view[key]
         return normalized
 
-    def prepare_on_demand(self):
-        """Analyze the latest map once for a requesting consumer."""
+    def prepare_map(self):
+        """Analyze the latest messages into one map-and-pose context."""
         with self.analysis_lock:
             with self.state_lock:
                 map_msg = self.map_msg
@@ -214,30 +209,26 @@ class MapImageStream:
                 map_revision = self._map_revision
                 map_received_at_unix_ns = self._map_received_at_unix_ns
             if map_msg is None:
-                self._not_ready_reason = "Waiting for OccupancyGrid on /map"
-                return None
+                raise ValueError("Waiting for OccupancyGrid on /map")
             if cost_msg is None:
-                self._not_ready_reason = (
+                raise ValueError(
                     "Waiting for OccupancyGrid on /global_costmap/costmap"
                 )
-                return None
 
             pose = self._pose(map_msg.header.frame_id)
             if pose is None:
-                self._not_ready_reason = (
+                raise ValueError(
                     f"TF unavailable: {map_msg.header.frame_id} -> {self.base_frame}"
                 )
-                return None
 
             started_at = time.monotonic()
             try:
                 prepared = self.logic.prepare(map_msg, cost_msg, pose)
             except Exception as error:
-                self._not_ready_reason = (
-                    f"Map analysis failed: {type(error).__name__}: {error}"
-                )
                 self.node.get_logger().warning(f"Map analysis: {error}")
-                return None
+                raise ValueError(
+                    f"Map analysis failed: {type(error).__name__}: {error}"
+                ) from error
 
             finished_at = time.monotonic()
             prepared["analysis_ms"] = round(
@@ -248,10 +239,7 @@ class MapImageStream:
             prepared["map_revision"] = map_revision
             prepared["map_received_at_unix_ns"] = map_received_at_unix_ns
             self.room_registry.ensure_startup_room(prepared, pose)
-            with self.state_lock:
-                self.prepared = prepared
-            self._not_ready_reason = None
-            return prepared
+            return prepared, pose
 
     def _stream_loop(self):
         """Serve ordered map requests without background map analysis."""
@@ -285,30 +273,29 @@ class MapImageStream:
             pending_navigation_pose = self._overlay_pose(
                 message.get("pending_navigation_pose")
             )
-            encoded = None
-            if self.prepare_on_demand() is not None:
-                encoded = self._encode_snapshot(
-                    crop_size_m=crop_size_m,
-                    render_frontiers=render_frontiers,
-                    pending_navigation_pose=pending_navigation_pose,
-                )
-            if encoded is None:
+            try:
+                prepared, pose = self.prepare_map()
+            except ValueError as error:
                 self.socket.send_json({
                     "ok": False,
-                    "error": (
-                        self._last_render_error
-                        or self._not_ready_reason or "Map snapshot is not ready"
-                    ),
-                    "retryable": self._last_render_error is None,
+                    "error": str(error),
+                    "retryable": True,
                 })
                 return
-            metadata, jpeg, full_jpeg = encoded
+            metadata, jpeg = self._encode_snapshot(
+                prepared,
+                pose,
+                crop_size_m=crop_size_m,
+                render_frontiers=render_frontiers,
+                pending_navigation_pose=pending_navigation_pose,
+            )
             response_metadata = dict(metadata)
-            response_metadata["snapshot_request_id"] = str(message.get("request_id") or "")
-            parts = [json.dumps(response_metadata).encode("utf-8"), jpeg]
-            if full_jpeg is not None:
-                parts.append(full_jpeg)
-            self.socket.send_multipart(parts)
+            response_metadata["snapshot_request_id"] = str(
+                message.get("request_id") or ""
+            )
+            self.socket.send_multipart([
+                json.dumps(response_metadata).encode("utf-8"), jpeg,
+            ])
         except Exception as error:
             self.node.get_logger().warning(f"Map request: {error}")
             self.socket.send_json({
@@ -324,23 +311,12 @@ class MapImageStream:
         """Coordinate planning, visibility analysis, rendering, and metadata."""
         overlay = self.search_overlay
         grid = prepared["grid"]
-        overlay_key = (
-            (overlay.get("action_id"), int(overlay.get("revision", 0)))
-            if isinstance(overlay, dict)
-            else (None, None)
-        )
-        coverage_key = (id(grid), *overlay_key)
-        if coverage_key != self._coverage_key:
-            self._coverage_counts = self.logic.coverage_counts(grid, overlay)
-            self._coverage_mask = self._coverage_counts > 0
-            self._coverage_key = coverage_key
-
-        coverage_counts = self._coverage_counts
+        coverage_counts = self.logic.coverage_counts(grid, overlay)
         candidates = self.logic.plan_candidates(
             prepared,
             pose,
             overlay,
-            coverage=self._coverage_mask,
+            coverage=coverage_counts > 0,
         )
 
         live_fov = self.logic.live_camera_fov(pose, camera_pan_angle)
@@ -385,10 +361,6 @@ class MapImageStream:
             return image, rendered["view"]
 
         image, image_view = render_view(crop_size_m)
-        full_image = None
-        full_image_view = None
-        if crop_size_m is not None and self.include_full_image:
-            full_image, full_image_view = render_view(None)
 
         mode = str((overlay or {}).get("mode") or "goal")
         search_poses = (overlay or {}).get("search_poses") or []
@@ -451,132 +423,39 @@ class MapImageStream:
                 if inside_robot_crop(item)
             ]
             metadata["map_crop_size_m"] = size
-            if full_image_view is not None:
-                metadata["full_image_robot_view"] = {
-                    key: full_image_view[key]
-                    for key in (
-                        "xmin", "xmax", "ymin", "ymax", "origin_x",
-                        "origin_y", "heading_yaw",
-                    )
-                }
-        return image, metadata, full_image
-
-    @staticmethod
-    def _crop_snapshot(image, metadata, crop_size_m):
-        """Legacy pixel crop retained for callers outside the snapshot path."""
-        size = float(crop_size_m)
-        if not math.isfinite(size) or size <= 0.0:
-            raise ValueError("crop_size_m must be a positive finite number")
-        pose = metadata["robot_pose"]
-        view = metadata["image_robot_view"]
-        height, width = image.shape[:2]
-        ppm_x = width / (view["xmax"] - view["xmin"])
-        ppm_y = height / (view["ymax"] - view["ymin"])
-        crop_width = max(1, round(size * ppm_x))
-        crop_height = max(1, round(size * ppm_y))
-        center_x = round(-view["xmin"] * ppm_x)
-        center_y = round(view["ymax"] * ppm_y)
-        x0 = center_x - crop_width // 2
-        y0 = center_y - crop_height // 2
-        x1, y1 = x0 + crop_width, y0 + crop_height
-        source_x0, source_y0 = max(0, x0), max(0, y0)
-        source_x1, source_y1 = min(width, x1), min(height, y1)
-        cropped = image[source_y0:source_y1, source_x0:source_x1]
-        cropped = cv2.copyMakeBorder(
-            cropped,
-            source_y0 - y0, y1 - source_y1,
-            source_x0 - x0, x1 - source_x1,
-            cv2.BORDER_CONSTANT, value=(62, 62, 62),
-        )
-        MapRenderer._draw_orientation_legend(cropped)
-        half = size / 2.0
-        metadata = dict(metadata)
-        metadata["full_image_robot_view"] = view
-        metadata["image_robot_view"] = {
-            **view,
-            "xmin": -half,
-            "xmax": half,
-            "ymin": -half,
-            "ymax": half,
-        }
-        metadata["map_crop_size_m"] = size
-        if metadata.get("selection_policy") == "vision":
-            yaw = float(pose["yaw"])
-
-            def inside_robot_crop(item):
-                dx = float(item["x"]) - float(pose["x"])
-                dy = float(item["y"]) - float(pose["y"])
-                right = dx * math.sin(yaw) - dy * math.cos(yaw)
-                forward = dx * math.cos(yaw) + dy * math.sin(yaw)
-                return abs(right) <= half and abs(forward) <= half
-
-            metadata["candidates"] = [
-                item for item in metadata["candidates"]
-                if inside_robot_crop(item)
-            ]
-        return cropped, metadata
-
+        return image, metadata
 
     def _encode_snapshot(
-        self, crop_size_m=None, render_frontiers=False,
+        self, prepared, pose, crop_size_m=None, render_frontiers=False,
         pending_navigation_pose=None,
     ):
-        self._last_render_error = None
-        with self.state_lock:
-            prepared = self.prepared
-        if prepared is None:
-            return None
-
-        pose = self._pose(prepared["frame_id"])
-        if pose is None:
-            self._not_ready_reason = (
-                f"TF unavailable: {prepared['frame_id']} -> {self.base_frame}"
-            )
-            return None
-
         started_at = time.monotonic()
         captured_at_unix_ns = time.time_ns()
-        try:
-            camera_pan_angle = self.logic.cfg.camera_center_pan_deg
-            image, metadata, full_image = self._compose_snapshot(
-                prepared, pose, camera_pan_angle, crop_size_m=crop_size_m,
-                render_frontiers=render_frontiers,
-                pending_navigation_pose=pending_navigation_pose,
-            )
-            ok, jpeg = cv2.imencode(
-                ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]
-            )
-            if not ok:
-                raise RuntimeError("OpenCV failed to encode the map JPEG")
-            full_jpeg = None
-            if full_image is not None:
-                full_ok, full_encoded = cv2.imencode(
-                    ".jpg", full_image, [cv2.IMWRITE_JPEG_QUALITY, 85]
-                )
-                if not full_ok:
-                    raise RuntimeError("OpenCV failed to encode the full map JPEG")
-                full_jpeg = full_encoded.tobytes()
-            encoded_at = time.monotonic()
-            self.sequence += 1
-            metadata.update({
-                "sequence": self.sequence,
-                "publish_mode": "on_request",
-                "analysis_ms": prepared["analysis_ms"],
-                "analysis_age_ms": round(
-                    (started_at - prepared["prepared_at_monotonic"]) * 1000, 1
-                ),
-                "captured_at_unix_ns": captured_at_unix_ns,
-                "generated_at_unix_ns": time.time_ns(),
-                "render_ms": round((encoded_at - started_at) * 1000, 1),
-            })
-            self._not_ready_reason = None
-            return metadata, jpeg.tobytes(), full_jpeg
-        except Exception as error:
-            self._last_render_error = (
-                f"Map render failed: {type(error).__name__}: {error}"
-            )
-            self.node.get_logger().warning(self._last_render_error)
-            return None
+        camera_pan_angle = self.logic.cfg.camera_center_pan_deg
+        image, metadata = self._compose_snapshot(
+            prepared, pose, camera_pan_angle, crop_size_m=crop_size_m,
+            render_frontiers=render_frontiers,
+            pending_navigation_pose=pending_navigation_pose,
+        )
+        ok, jpeg = cv2.imencode(
+            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+        if not ok:
+            raise RuntimeError("OpenCV failed to encode the map JPEG")
+        encoded_at = time.monotonic()
+        self.sequence += 1
+        metadata.update({
+            "sequence": self.sequence,
+            "publish_mode": "on_request",
+            "analysis_ms": prepared["analysis_ms"],
+            "analysis_age_ms": round(
+                (started_at - prepared["prepared_at_monotonic"]) * 1000, 1
+            ),
+            "captured_at_unix_ns": captured_at_unix_ns,
+            "generated_at_unix_ns": time.time_ns(),
+            "render_ms": round((encoded_at - started_at) * 1000, 1),
+        })
+        return metadata, jpeg.tobytes()
 
     def close(self):
         self.stop_event.set()

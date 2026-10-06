@@ -34,9 +34,10 @@ setup(
             'llm_bridge.py = robot.bridge.llm_bridge:main',
             'trajectory.py = robot.store.trajectory:main',
             'ring_bridge.py = robot.store.ring_bridge:main',
-            'test_servo.py = robot.utilities.camera_servo:main',
+            'test_servo.py = robot.control.camera_servo:main',
             'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
             'system_watchdog.py = robot.watchdog.system_watchdog:main',
+            'velocity_clamper.py = robot.control.velocity_clamper:main',
         ],
     },
 )

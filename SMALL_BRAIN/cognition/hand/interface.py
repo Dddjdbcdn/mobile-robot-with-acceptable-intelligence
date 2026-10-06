@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 import time
 
@@ -14,14 +15,16 @@ class HandGestureInterface:
 
     MONITOR_HZ = 15.0
     STATUS_MAX_AGE_SECONDS = 1.0
-    IDLE_WELCOME_CONFIRM_FRAMES = 5
+    IDLE_WELCOME_CONFIRM_FRAMES = 10
     TRACKING_STOP_CONFIRM_FRAMES = 5
-    FOLLOW_STOP_CONFIRM_FRAMES = 5
-    APPROACHING_STOP_CONFIRM_FRAMES = 5
+    MOVEMENT_STOP_CONFIRM_FRAMES = 10
     MODIFIER_CONFIRM_FRAMES = 3
     COMMAND_CONFIRM_FRAMES = 2
     COMMAND_TIMEOUT_FRAMES = 45
     MISS_TOLERANCE = 3
+    WELCOME_PERSON_MIN_CONFIDENCE = 0.50
+    WELCOME_WRIST_MIN_CONFIDENCE = 0.50
+    WELCOME_PALM_WRIST_MAX_DISTANCE = 0.18
 
     def __init__(self, hand_landmarks):
         self.hand_landmarks = hand_landmarks
@@ -32,7 +35,6 @@ class HandGestureInterface:
         self._latest_status = None
         self._armed_gesture = None
         self._armed_frames_remaining = 0
-        self._approach_was_requested = False
 
         self._idle_welcome = FrameConfirmation(
             "welcome",
@@ -44,14 +46,17 @@ class HandGestureInterface:
             self.TRACKING_STOP_CONFIRM_FRAMES,
             miss_tolerance=self.MISS_TOLERANCE,
         )
-        self._following_push = FrameConfirmation(
+        self._tracking_direction_confirmations = {
+            name: FrameConfirmation(
+                name,
+                self.COMMAND_CONFIRM_FRAMES,
+                miss_tolerance=self.MISS_TOLERANCE,
+            )
+            for name in ("thumb_left", "thumb_right")
+        }
+        self._movement_push = FrameConfirmation(
             "push",
-            self.FOLLOW_STOP_CONFIRM_FRAMES,
-            miss_tolerance=self.MISS_TOLERANCE,
-        )
-        self._approaching_push = FrameConfirmation(
-            "push",
-            self.APPROACHING_STOP_CONFIRM_FRAMES,
+            self.MOVEMENT_STOP_CONFIRM_FRAMES,
             miss_tolerance=self.MISS_TOLERANCE,
         )
         self._modifier_confirmations = {
@@ -114,27 +119,25 @@ class HandGestureInterface:
         for confirmation in self._command_confirmations.values():
             confirmation.reset()
         self._tracking_thumb_up.reset()
+        for confirmation in self._tracking_direction_confirmations.values():
+            confirmation.reset()
 
     def _reset_all(self):
-        self._approach_was_requested = False
         self._reset_sequence()
         self._idle_welcome.reset()
-        self._following_push.reset()
-        self._approaching_push.reset()
+        self._movement_push.reset()
 
     async def _sample(self, yolo):
         frame_source = None
-        camera = getattr(self.hand_landmarks, "camera", None)
-        if camera is not None:
-            try:
-                snapshot = camera.snapshot()
-                frame_bgr = getattr(snapshot, "full_bgr", None)
-                sequence = getattr(snapshot, "sequence", None)
-                if getattr(frame_bgr, "ndim", None) == 3 and isinstance(sequence, int):
-                    _, detections = yolo.detection_snapshot()
-                    frame_source = "camera"
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                frame_source = None
+        try:
+            snapshot = self.hand_landmarks.camera.snapshot()
+            frame_bgr = snapshot.full_bgr
+            sequence = snapshot.sequence
+            if frame_bgr.ndim == 3 and isinstance(sequence, int):
+                _, detections = yolo.detection_snapshot()
+                frame_source = "camera"
+        except (RuntimeError, TypeError, ValueError):
+            frame_source = None
 
         if frame_source is None:
             sequence, detections, frame_bgr, _ = yolo.detection_snapshot_with_frame()
@@ -174,13 +177,14 @@ class HandGestureInterface:
 
         pose = HandGestureClassifier.classify(hand)
         context = await self._observe_gesture(
-            pose["gesture"], pose["palm_center"]
+            pose["gesture"], pose["palm_center"], detections
         )
         self._latest_status = {
             "updated_at": time.monotonic(),
             "sequence": sequence,
             "inference_sequence": self._inference_sequence,
-            "state": context.get("mode", "watching_person"),
+            "state": context.get("mode", "idle"),
+            "action": dict(context.get("action") or {}),
             "gesture": pose.get("gesture"),
             "person": person,
             "hand": hand,
@@ -188,37 +192,65 @@ class HandGestureInterface:
             "armed_gesture": self._armed_gesture,
         }
 
-    async def _observe_gesture(self, gesture, palm_center):
+    @classmethod
+    def _welcome_person_candidate(cls, detections, palm_center):
+        if palm_center is None:
+            return None
+        candidates = []
+        for person in detections or ():
+            if not isinstance(person, dict) or person.get("class") != "person":
+                continue
+            try:
+                person_confidence = float(person.get("confidence") or 0.0)
+                wrist = (person.get("keypoints") or {})["right_wrist"]
+                wrist_confidence = float(
+                    (person.get("keypoint_confidences") or {}).get(
+                        "right_wrist",
+                        wrist.get("confidence") or 0.0,
+                    )
+                )
+                distance = math.hypot(
+                    float(palm_center[0]) - float(wrist["normalized_x"]),
+                    float(palm_center[1]) - float(wrist["normalized_y"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                person_confidence < cls.WELCOME_PERSON_MIN_CONFIDENCE
+                or wrist_confidence < cls.WELCOME_WRIST_MIN_CONFIDENCE
+                or distance > cls.WELCOME_PALM_WRIST_MAX_DISTANCE
+            ):
+                continue
+            candidates.append((distance, -person_confidence, person))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[:2])[2]
+
+    async def _observe_gesture(self, gesture, palm_center, detections=None):
         context = await self._dispatch(
             "observe_gesture", gesture=gesture, palm_center=palm_center
         )
         tracking_person = bool(context.get("tracking_person"))
-        following_active = bool(context.get("following_active"))
-        approach_active = bool(context.get("approach_active"))
-
-        if following_active:
-            self._approaching_push.reset()
+        if context.get("movement_active"):
             self._reset_sequence()
-            if self._following_push.observe(gesture):
-                await self._dispatch("stop_follow", reason="HAND_PUSH")
+            if self._movement_push.observe(gesture):
+                await self._dispatch("stop_movement", reason="HAND_PUSH")
             return context
 
-        if approach_active:
-            self._following_push.reset()
-            self._reset_sequence()
-            if self._approaching_push.observe(gesture):
-                await self._dispatch("stop_navigation", reason="HAND_PUSH")
-            return context
-
-        self._following_push.reset()
-        self._approaching_push.reset()
+        self._movement_push.reset()
         if not tracking_person:
             self._reset_sequence()
-            if self._idle_welcome.observe(gesture):
+            welcome_person = self._welcome_person_candidate(
+                detections,
+                palm_center,
+            )
+            observed_gesture = gesture if welcome_person is not None else None
+            if self._idle_welcome.observe(observed_gesture):
                 await self._dispatch(
                     "watch_target",
                     target="person",
                     target_kind="person",
+                    initial_person=welcome_person,
                 )
                 self._idle_welcome.reset()
             return context
@@ -229,6 +261,22 @@ class HandGestureInterface:
             )
             self._reset_all()
             return context
+
+        person_movements = {
+            "thumb_left": "move_to_person_left",
+            "thumb_right": "move_to_person_right",
+        }
+        for name, confirmation in (
+            self._tracking_direction_confirmations.items()
+        ):
+            if confirmation.observe(gesture):
+                await self._dispatch(
+                    "explicit_navigation",
+                    local_command=person_movements[name],
+                    room_id=None,
+                )
+                self._reset_all()
+                return context
 
         if self._armed_gesture is None:
             for name, confirmation in self._modifier_confirmations.items():
@@ -259,31 +307,25 @@ class HandGestureInterface:
             return
 
         if modifier == "welcome" and command == "finger_curl_up":
-            started = await self._dispatch("approach_target", target="hand")
-            self._approach_was_requested = bool(started)
+            await self._dispatch("approach_target", target="hand")
             return
 
         if modifier == "push" and command == "get_space":
             await self._dispatch(
-                "navigation_sequence",
-                commands=["open_space_middle", "face_person"],
+                "explicit_navigation",
+                local_command="open_space_middle",
+                room_id=None,
+                face_person=True,
             )
-            self._approach_was_requested = False
             return
 
         if modifier == "push" and command == "finger_curl_down":
-            if self._approach_was_requested:
-                await self._dispatch(
-                    "navigation_sequence",
-                    commands=["previous_position", "face_person"],
-                )
-                self._approach_was_requested = False
-            else:
-                await self._dispatch(
-                    "explicit_navigation",
-                    local_command="nudge_backward",
-                    room_id=None,
-                )
+            await self._dispatch(
+                "explicit_navigation",
+                local_command="nudge_backward",
+                room_id=None,
+                face_person=True,
+            )
 
     async def run(self, yolo):
         self._running = True

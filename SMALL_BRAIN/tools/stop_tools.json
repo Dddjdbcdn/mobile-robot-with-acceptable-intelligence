@@ -22,7 +22,7 @@
   {
     "type": "function",
     "name": "stop_follow",
-    "description": "Stop only the active continuous follow_person operation, including its person tracking and Nav2 following. Trigger phrases include 'stop following me', 'don't follow me', 'wait here', 'stay here', and 'stop trailing that person'. Do not use this merely because the robot is looking at a person without following.",
+    "description": "Stop only the active continuous follow_person movement. Shared visual tracking may continue so the robot can keep watching the person. Trigger phrases include 'stop following me', 'don't follow me', 'wait here', 'stay here', and 'stop trailing that person'. Do not use this merely because the robot is looking at a person without following.",
     "parameters": {
       "type": "object",
       "properties": {},

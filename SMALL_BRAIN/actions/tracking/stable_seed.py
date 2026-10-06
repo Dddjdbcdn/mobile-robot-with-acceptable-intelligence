@@ -11,7 +11,6 @@ class StableTargetSeedTracker:
     MAX_SPREAD_M = 0.12
     MAX_AGE_SECONDS = 0.75
     INPUT_MAX_AGE_SECONDS = 0.50
-    HAND_PERSON_MAX_DISTANCE_M = 0.85
 
     def __init__(self):
         self._samples = deque(maxlen=self.SAMPLE_COUNT)
@@ -29,8 +28,6 @@ class StableTargetSeedTracker:
         *,
         target=None,
         session_id=None,
-        person=None,
-        require_person_proximity=False,
     ):
         camera = dict(camera or {})
         now = time.monotonic()
@@ -58,19 +55,6 @@ class StableTargetSeedTracker:
             isinstance(value, (int, float)) and math.isfinite(float(value))
             for value in (map_x, map_y)
         )
-        if valid and require_person_proximity:
-            person_x = person.get("x") if isinstance(person, dict) else None
-            person_y = person.get("y") if isinstance(person, dict) else None
-            valid = map_valid and all(
-                isinstance(value, (int, float)) and math.isfinite(float(value))
-                for value in (person_x, person_y)
-            )
-            if valid:
-                valid = math.hypot(
-                    float(map_x) - float(person_x),
-                    float(map_y) - float(person_y),
-                ) <= self.HAND_PERSON_MAX_DISTANCE_M
-
         if not valid:
             self.clear()
             return None

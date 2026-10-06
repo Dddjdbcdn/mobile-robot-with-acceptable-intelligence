@@ -88,9 +88,17 @@ class MapNavigationAction:
     JPEG_QUALITY = 75
 
     def __init__(
-        self, ws, camera, send_robot_command, debug_dir=None,
-        request_map_snapshot=None, map_crop_size_m=None,
-        see_action=None, send_map_overlay=None, save_map_snapshot=None,
+        self,
+        ws,
+        camera,
+        send_robot_command,
+        request_map_snapshot,
+        save_map_snapshot,
+        see_action,
+        send_map_overlay,
+        debug_dir=None,
+        map_crop_size_m=None,
+        move_camera_action=None,
     ):
         self.ws = ws
         self.camera = camera
@@ -99,6 +107,10 @@ class MapNavigationAction:
         self.save_map_snapshot = save_map_snapshot
         self.send_map_overlay = send_map_overlay
         self.see_action = see_action
+        self.move_camera_action = (
+            move_camera_action
+            or getattr(see_action, "move_camera_action", see_action)
+        )
         definitions_path = Path(__file__).resolve().parents[1] / "tools" / "vision_oob_tools.json"
         definitions = json.loads(definitions_path.read_text())
         self.selection_tool_template = next(
@@ -251,16 +263,20 @@ class MapNavigationAction:
                 self._result_data.update(
                     error_type=error_type, error=error_message, error_stage=self.stage
                 )
-                self._finish("failed", "navigation_failed",
-                             getattr(error, "code", "NAVIGATION_ERROR"))
+                reason_code = (
+                    error.code
+                    if isinstance(error, NavigationError)
+                    else "NAVIGATION_ERROR"
+                )
+                self._finish(
+                    "failed", "navigation_failed", reason_code
+                )
 
     async def _center_camera(self):
-        if self.see_action is None:
-            raise NavigationError(
-                "CAMERA_CENTER_UNAVAILABLE",
-                "Navigation map/camera comparison requires camera centering",
-            )
-        centered = await self.see_action.move_to_region(
+        camera_motion = getattr(
+            self, "move_camera_action", self.see_action
+        )
+        centered = await camera_motion.move_to_region(
             region="center", action_id=f"{self.action_id}:center-camera"
         )
         if centered.status != "succeeded":
@@ -269,10 +285,6 @@ class MapNavigationAction:
             )
 
     async def _capture(self):
-        if self.request_map_snapshot is None:
-            raise NavigationError(
-                "MAP_STREAM_UNAVAILABLE", "Map request client is not configured"
-            )
         # Center first so the rendered CURRENT VIEW and the camera image agree.
         if self._mode == "exploration":
             await self._center_camera()
@@ -307,13 +319,12 @@ class MapNavigationAction:
             )
 
         self._snapshot_id = metadata["snapshot_id"]
-        if self.save_map_snapshot is not None:
-            try:
-                saved = self.save_map_snapshot(snapshot)
-                if saved is not None:
-                    self._result_data["map_renders"] = saved
-            except (OSError, KeyError, TypeError, ValueError) as error:
-                self._result_data["debug_save_error"] = str(error)
+        try:
+            saved = self.save_map_snapshot(snapshot)
+            if saved is not None:
+                self._result_data["map_renders"] = saved
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            self._result_data["debug_save_error"] = str(error)
         candidates = [dict(item) for item in metadata.get("candidates") or []]
         self._candidates = {item["id"]: item for item in candidates}
         if not self._candidates:
@@ -336,11 +347,6 @@ class MapNavigationAction:
 
     async def _save_pending_map_render(self, destination):
         """Save a diagnostic render with all frontiers and the dispatched pose."""
-        if (
-            self.request_map_snapshot is None
-            or getattr(self, "save_map_snapshot", None) is None
-        ):
-            return
         request_id = uuid.uuid4().hex
         request = {
             "schema_version": 1,
@@ -630,7 +636,7 @@ class MapNavigationAction:
         self.active = False
         self.stage = "idle"
         self._request_id = None
-        if self._owns_overlay and self.send_map_overlay is not None:
+        if self._owns_overlay:
             asyncio.create_task(self.send_map_overlay({
                 "schema_version": 1,
                 "operation": "clear",

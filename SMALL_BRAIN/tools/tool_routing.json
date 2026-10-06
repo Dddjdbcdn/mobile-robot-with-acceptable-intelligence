@@ -9,7 +9,7 @@
   "action_vocabulary": {
     "find_target": "find, search for, look for, locate, approach, move next to, or go to a named non-person object or recognizable place",
     "see_action": "what do you see, can you see, is there, what color, inspect, check, or look in a clear camera direction and report what is visible",
-    "explicit_navigation": "move, go, back up, nudge, turn, rotate, turn around, exit, move to the center, middle, open space, next room, numbered room, previous position, or starting place when the direction or destination is explicit",
+    "explicit_navigation": "move, go, back up, nudge, turn, rotate, turn around, exit, move to the center, middle, open space, next room, numbered room, previous position, starting place, or a front/right/left position around a person when the destination is explicit",
     "watch_target": "look at me, face me, watch me, watch the named object, keep looking, or keep your eyes on the target",
     "follow_person": "follow me, come with me, walk with me, stay with me, trail me, or follow that person"
   },
@@ -18,6 +18,7 @@
     "Look at me means continuous person-facing camera tracking: watch_target with target_kind person.",
     "Look left means a one-shot observation only when the user wants visual information; use see_action with region left.",
     "Turn left or move left changes the robot pose: explicit_navigation.",
+    "Move in front of a person, to the person's right, or to the person's left uses exactly one explicit_navigation call with move_to_person_front, move_to_person_right, or move_to_person_left. These are person-relative destinations and are not nudge commands, watching, finding, or following.",
     "Do not call a tool for a hand gesture; the background hand-guidance controller owns it.",
     "Go to the kitchen names a recognizable place: find_target. Go to Room 2 names a map command: explicit_navigation."
   ],

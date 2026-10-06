@@ -11,6 +11,13 @@ from typing import Any
 import uuid
 
 from cognition.manager.world_state import robot_state
+from actions.move_camera_action import (
+    CAMERA_RECOVERY_TIMEOUT_SECONDS,
+    CAMERA_SETTLE_SECONDS,
+    MoveCameraAction,
+    PAN_POSITION_ANGLE,
+    TILT_POSITION_ANGLE,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = REPO_ROOT / "tools" / "vision_oob_tools.json"
@@ -37,21 +44,6 @@ CAMERA_HORIZONTAL_FOV_DEG = 85
 CAMERA_VERTICAL_FOV_DEG = 52
 AIM_GAIN = 1.0
 CAMERA_MOVE_TIMEOUT_SECONDS = 2.0
-CAMERA_SETTLE_SECONDS = 1.5
-CAMERA_RECOVERY_TIMEOUT_SECONDS = 3.0
-
-PAN_POSITION_ANGLE = {
-    "center": 95.0,
-    "leftmost": 155.0,
-    "rightmost": 35.0,
-}
-
-TILT_POSITION_ANGLE = {
-    "center": 90.0,
-    "upmost": 30.0,
-    "downmost": 120.0,
-}
-
 PAN_SWEEP_ORDER = ("leftmost", "center", "rightmost")
 SIDE_SWEEP_ORDER = ("leftmost", "rightmost")
 SWEEP_TILT_ORDER = ("center", "upmost", "downmost")
@@ -65,10 +57,14 @@ SEARCH_EFFORT_ROWS = {
 from actions.action_result import ActionResult
 
 class SearchAction:
-    def __init__(self, ws, send_robot_command, camera):
+    def __init__(self, ws, send_robot_command, camera, move_camera_action=None):
         self.ws = ws
         self.send_robot_command = send_robot_command
         self.camera = camera
+        self.move_camera_action = move_camera_action or MoveCameraAction(
+            camera=camera,
+            send_robot_command=send_robot_command,
+        )
         self.search_task = None
         self.action_id = None
 
@@ -158,29 +154,17 @@ class SearchAction:
         return target_pan, target_tilt
 
     async def move_camera_angles(self, target_pan: float, target_tilt: float) -> None:
-        delta_pan = target_pan - float(self.pan_angle)
-        delta_tilt = target_tilt - float(self.tilt_angle)
-
-        payload = {
-            "command": "move_camera",
-            "delta_pan_angle": delta_pan,
-            "delta_tilt_angle": delta_tilt,
-        }
-
-        await self.send_robot_command(payload)
-
-        self.pan_angle += delta_pan
-        self.tilt_angle += delta_tilt
-
-        await asyncio.sleep(CAMERA_SETTLE_SECONDS)
-        move_completed_at = time.monotonic()
-        frame_ready = await asyncio.to_thread(
-            self.camera.wait_for_frame_captured_after,
-            move_completed_at,
-            CAMERA_RECOVERY_TIMEOUT_SECONDS,
+        result = await self.move_camera_action.move_to_angles(
+            target_pan,
+            target_tilt,
+            action_id=f"{self.action_id or 'search'}:move-camera",
+            current_pan=self.pan_angle,
+            current_tilt=self.tilt_angle,
         )
-        if not frame_ready:
-            raise RuntimeError("Camera did not recover after pan/tilt movement")
+        if result.status != "succeeded":
+            raise RuntimeError(result.reason_code or "Camera movement failed")
+        self.pan_angle = float(target_pan)
+        self.tilt_angle = float(target_tilt)
 
     async def capture_sweep_batch(self) -> None:
         if not self.active:
@@ -668,7 +652,10 @@ class SearchAction:
         )
 
     async def wait_until_finished(self):
-        return await self.completion_future
+        return await asyncio.shield(self.completion_future)
+
+    async def stop(self, reason_code="USER_REQUESTED"):
+        return await self.stop_searching(reason_code)
 
     async def stop_searching(self,reason=None):
         if not self.active:
