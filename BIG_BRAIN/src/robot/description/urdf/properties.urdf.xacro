@@ -37,7 +37,7 @@
   <xacro:property name="tof_length" value="0.003"/>
   <xacro:property name="tof_width" value="0.015"/>
   <xacro:property name="tof_height" value="0.01"/>
-  <xacro:property name="tof_z_offset" value="0.01"/> <!-- TOF center to camera bottom -->
+  <xacro:property name="tof_z_offset" value="0.0"/> <!-- TOF center to camera bottom -->
   <xacro:property name="tof_x_offset" value="0.006"/> <!-- TOF centor to camera center -->
 
   <!-- IMU -->

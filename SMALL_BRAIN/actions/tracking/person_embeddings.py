@@ -11,7 +11,6 @@ from typing import Any, Sequence
 
 import numpy as np
 
-
 PERSON_VIEWS = ("front", "side", "back")
 
 
@@ -43,6 +42,7 @@ class EmbeddingSample:
     embedding: np.ndarray
     quality: float
     captured_at: float
+    image_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,27 +79,23 @@ class PersonEmbeddingRecord:
         self.person_id = person_id
         self.model_name = model_name
         self.samples_per_view = int(samples_per_view)
-        self.embedding_size = (
-            None if embedding_size is None else int(embedding_size)
-        )
+        self.embedding_size = (None if embedding_size is None else
+                               int(embedding_size))
         self._samples: dict[str, list[EmbeddingSample]] = {
-            view: [] for view in PERSON_VIEWS
+            view: []
+            for view in PERSON_VIEWS
         }
 
     @property
     def complete(self) -> bool:
         return all(
             len(self._samples[view]) >= self.samples_per_view
-            for view in PERSON_VIEWS
-        )
+            for view in PERSON_VIEWS)
 
     @property
     def missing_views(self) -> tuple[str, ...]:
-        return tuple(
-            view
-            for view in PERSON_VIEWS
-            if len(self._samples[view]) < self.samples_per_view
-        )
+        return tuple(view for view in PERSON_VIEWS
+                     if len(self._samples[view]) < self.samples_per_view)
 
     def samples(self, view: str) -> tuple[EmbeddingSample, ...]:
         self._validate_view(view)
@@ -108,21 +104,16 @@ class PersonEmbeddingRecord:
     @staticmethod
     def _validate_view(view: str) -> None:
         if view not in PERSON_VIEWS:
-            raise ValueError(
-                f"view must be one of {', '.join(PERSON_VIEWS)}"
-            )
+            raise ValueError(f"view must be one of {', '.join(PERSON_VIEWS)}")
 
     def _validated_embedding(
-        self, embedding: np.ndarray | Sequence[float]
-    ) -> np.ndarray:
+            self, embedding: np.ndarray | Sequence[float]) -> np.ndarray:
         vector = normalize_embedding(embedding)
         if self.embedding_size is None:
             self.embedding_size = int(vector.size)
         elif vector.size != self.embedding_size:
-            raise ValueError(
-                f"expected embedding size {self.embedding_size}, "
-                f"received {vector.size}"
-            )
+            raise ValueError(f"expected embedding size {self.embedding_size}, "
+                             f"received {vector.size}")
         return vector
 
     def add(
@@ -131,6 +122,7 @@ class PersonEmbeddingRecord:
         embedding: np.ndarray | Sequence[float],
         quality: float,
         captured_at: float | None = None,
+        image_path: str | None = None,
     ) -> bool:
         """Add a sample or replace the lowest-quality sample for that view.
 
@@ -142,11 +134,19 @@ class PersonEmbeddingRecord:
         quality = float(quality)
         if not math.isfinite(quality) or quality < 0.0:
             raise ValueError("quality must be finite and non-negative")
-        captured_at = time.time() if captured_at is None else float(captured_at)
+        captured_at = time.time() if captured_at is None else float(
+            captured_at)
         if not math.isfinite(captured_at):
             raise ValueError("captured_at must be finite")
         vector = self._validated_embedding(embedding)
-        sample = EmbeddingSample(vector, quality, captured_at)
+        normalized_image_path = (None if image_path is None else
+                                 str(image_path).strip() or None)
+        sample = EmbeddingSample(
+            vector,
+            quality,
+            captured_at,
+            normalized_image_path,
+        )
         view_samples = self._samples[view]
         if len(view_samples) < self.samples_per_view:
             view_samples.append(sample)
@@ -171,26 +171,20 @@ class PersonEmbeddingRecord:
         if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
             raise ValueError("threshold must be between -1 and 1")
         candidate = normalize_embedding(embedding)
-        if (
-            self.embedding_size is not None
-            and candidate.size != self.embedding_size
-        ):
-            raise ValueError(
-                f"expected embedding size {self.embedding_size}, "
-                f"received {candidate.size}"
-            )
+        if (self.embedding_size is not None
+                and candidate.size != self.embedding_size):
+            raise ValueError(f"expected embedding size {self.embedding_size}, "
+                             f"received {candidate.size}")
         per_view: dict[str, float] = {}
         for view, samples in self._samples.items():
             if samples:
                 per_view[view] = max(
-                    float(np.clip(np.dot(candidate, sample.embedding), -1.0, 1.0))
-                    for sample in samples
-                )
+                    float(
+                        np.clip(np.dot(candidate, sample.embedding), -1.0,
+                                1.0)) for sample in samples)
         if not per_view:
             return EmbeddingMatch(False, -1.0, threshold, None, {})
-        best_view, similarity = max(
-            per_view.items(), key=lambda item: item[1]
-        )
+        best_view, similarity = max(per_view.items(), key=lambda item: item[1])
         return EmbeddingMatch(
             similarity >= threshold,
             similarity,
@@ -207,14 +201,12 @@ class PersonEmbeddingRecord:
             "embedding_size": self.embedding_size,
             "samples_per_view": self.samples_per_view,
             "views": {
-                view: [
-                    {
-                        "embedding": sample.embedding.tolist(),
-                        "quality": sample.quality,
-                        "captured_at": sample.captured_at,
-                    }
-                    for sample in samples
-                ]
+                view: [{
+                    "embedding": sample.embedding.tolist(),
+                    "quality": sample.quality,
+                    "captured_at": sample.captured_at,
+                    "image_path": sample.image_path,
+                } for sample in samples]
                 for view, samples in self._samples.items()
             },
         }
@@ -247,6 +239,7 @@ class PersonEmbeddingRecord:
                     sample["embedding"],
                     quality=sample["quality"],
                     captured_at=sample["captured_at"],
+                    image_path=sample.get("image_path"),
                 )
         return record
 

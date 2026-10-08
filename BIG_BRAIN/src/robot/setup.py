@@ -38,6 +38,7 @@ setup(
             'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
             'system_watchdog.py = robot.watchdog.system_watchdog:main',
             'velocity_clamper.py = robot.control.velocity_clamper:main',
+            'cliff_detector.py = robot.control.cliff_detector:main',
         ],
     },
 )

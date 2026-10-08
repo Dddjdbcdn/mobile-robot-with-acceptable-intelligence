@@ -22,6 +22,7 @@ def person(wrist_x, confidence=0.8, wrist_confidence=0.8):
 
 
 class WelcomePersonBindingTests(unittest.TestCase):
+
     def test_selects_box_whose_wrist_is_closest_to_confirmed_palm(self):
         high_confidence_duplicate = person(0.62, confidence=0.95)
         palm_aligned = person(0.51, confidence=0.70)
@@ -45,6 +46,7 @@ class WelcomePersonBindingTests(unittest.TestCase):
 
 
 class WelcomePersonDispatchTests(unittest.IsolatedAsyncioTestCase):
+
     async def test_confirmed_welcome_passes_exact_person_to_tracking(self):
         interface = HandGestureInterface(hand_landmarks=None)
         target = person(0.50)
@@ -67,6 +69,24 @@ class WelcomePersonDispatchTests(unittest.IsolatedAsyncioTestCase):
         watch_calls = [item for item in calls if item[0] == "watch_target"]
         self.assertEqual(len(watch_calls), 1)
         self.assertIs(watch_calls[0][1]["initial_person"], target)
+
+    async def test_confirmed_ok_requests_person_enrollment_while_tracking(
+            self):
+        interface = HandGestureInterface(hand_landmarks=None)
+        calls = []
+
+        async def dispatch(command, data):
+            calls.append((command, data))
+            if command == "observe_gesture":
+                return {"tracking_person": True, "movement_active": False}
+            return True
+
+        interface.set_dispatcher(dispatch)
+        for _ in range(interface.TRACKING_ENROLL_CONFIRM_FRAMES):
+            await interface._observe_gesture("ok", (0.50, 0.50), [])
+
+        enroll_calls = [item for item in calls if item[0] == "enroll_person"]
+        self.assertEqual(len(enroll_calls), 1)
 
 
 if __name__ == "__main__":

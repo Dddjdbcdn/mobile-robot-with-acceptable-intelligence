@@ -15,6 +15,12 @@ def generate_launch_description():
         output='screen',
         arguments=['--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
     )
+    cliff_detector = Node(
+        package='robot',
+        executable='cliff_detector.py',
+        output='screen',
+        arguments=['--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
+    )
     llm_bridge = Node(
         package='robot',
         executable='llm_bridge.py',
@@ -37,6 +43,7 @@ def generate_launch_description():
     )
     return LaunchDescription([
         topic_bridge,
+        cliff_detector,
         llm_bridge,
         person_lidar_tracker,
     ])

@@ -11,12 +11,15 @@ from actions.tracking.person_embeddings import (
 
 
 class PersonEmbeddingRecordTests(unittest.TestCase):
+
     def test_cosine_similarity_normalizes_inputs(self):
         self.assertAlmostEqual(cosine_similarity([2, 0], [5, 0]), 1.0)
         self.assertAlmostEqual(cosine_similarity([1, 0], [0, 1]), 0.0)
 
     def test_retains_highest_quality_samples_per_view(self):
-        record = PersonEmbeddingRecord("owner", "test-model", samples_per_view=2)
+        record = PersonEmbeddingRecord("owner",
+                                       "test-model",
+                                       samples_per_view=2)
 
         self.assertTrue(record.add("front", [1, 0], quality=0.4))
         self.assertTrue(record.add("front", [0.9, 0.1], quality=0.8))
@@ -27,7 +30,9 @@ class PersonEmbeddingRecordTests(unittest.TestCase):
         self.assertEqual(qualities, [0.9, 0.8])
 
     def test_matches_against_all_recorded_views(self):
-        record = PersonEmbeddingRecord("owner", "test-model", samples_per_view=1)
+        record = PersonEmbeddingRecord("owner",
+                                       "test-model",
+                                       samples_per_view=1)
         record.add("front", [1, 0, 0], quality=1.0)
         record.add("back", [0, 1, 0], quality=1.0)
 
@@ -53,8 +58,16 @@ class PersonEmbeddingRecordTests(unittest.TestCase):
         self.assertIsNone(record.embedding_size)
 
     def test_json_round_trip_preserves_matching(self):
-        record = PersonEmbeddingRecord("owner", "test-model", samples_per_view=1)
-        record.add("front", [1, 2, 3], quality=0.75, captured_at=123.0)
+        record = PersonEmbeddingRecord("owner",
+                                       "test-model",
+                                       samples_per_view=1)
+        record.add(
+            "front",
+            [1, 2, 3],
+            quality=0.75,
+            captured_at=123.0,
+            image_path="images/front.jpg",
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "owner.json"
@@ -65,6 +78,10 @@ class PersonEmbeddingRecordTests(unittest.TestCase):
         self.assertTrue(match.matched)
         self.assertEqual(restored.person_id, "owner")
         self.assertEqual(restored.embedding_size, 3)
+        self.assertEqual(
+            restored.samples("front")[0].image_path,
+            "images/front.jpg",
+        )
 
 
 if __name__ == "__main__":

@@ -31,7 +31,10 @@ from services.stream.response_manager import ResponseManager
 from services.vision.groundingdino_service import GroundingDINOService
 from services.vision.csrt_tracker import CSRTTrackingManager
 from services.vision.hand_landmark_service import HandLandmarkService
+from services.vision.person_reid_service import PersonReIDService
 from services.vision.yolo_service import YoloService
+
+from actions.tracking.person_identity_tracker import PersonIdentityTracker
 
 from cognition.manager.cognition_manager import CognitionManager
 from cognition.sequence.follow_person_executor import FollowPersonExecutor
@@ -54,9 +57,7 @@ zmq_pub_socket.connect("tcp://localhost:5557")
 person_tracker_pub_socket = context.socket(zmq.PUB)
 person_tracker_pub_socket.setsockopt(zmq.SNDHWM, 10)
 person_tracker_pub_socket.connect(
-    os.environ.get("PERSON_TRACKER_ENDPOINT", "tcp://localhost:5560")
-)
-
+    os.environ.get("PERSON_TRACKER_ENDPOINT", "tcp://localhost:5560"))
 
 zmq_req_lock = asyncio.Lock()
 
@@ -79,32 +80,39 @@ URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
 DEBUG_MODE = False
 
 GROUNDING_DINO_REPO = Path("vision_models/groundingdino_tools/GroundingDINO")
-GROUNDING_DINO_CONFIG = Path("vision_models/groundingdino_tools/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
-GROUNDING_DINO_MODEL = Path("vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml")
+GROUNDING_DINO_CONFIG = Path(
+    "vision_models/groundingdino_tools/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+)
+GROUNDING_DINO_MODEL = Path(
+    "vision_models/groundingdino_tools/models/groundingdino_swint_512x768_onnx.xml"
+)
 
 tool_tasks: set[asyncio.Task[Any]] = set()
+
 
 def load_json(path):
     with Path(path).open(encoding="utf-8") as json_file:
         return json.load(json_file)
+
 
 def handle_task_done(task):
     tool_tasks.discard(task)
 
     if task.cancelled(): return
 
-    try: task.result()
+    try:
+        task.result()
     except Exception as error:
-        print(
-            f"[Background task error: {task.get_name()}] "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"[Background task error: {task.get_name()}] "
+              f"{type(error).__name__}: {error}")
 
-def create_tool_task(coroutine,name) :
+
+def create_tool_task(coroutine, name):
     task = asyncio.create_task(coroutine, name=name)
     tool_tasks.add(task)
     task.add_done_callback(handle_task_done)
     return task
+
 
 async def background_status_monitor(cognitive_manager):
     print("[System: Background Monitor Listening for ROS 2 feedback...]")
@@ -117,25 +125,24 @@ async def background_status_monitor(cognitive_manager):
             elif message.get("type") == "state":
                 update_state(message)
                 active_tracker = cognitive_manager.track_action
-                stable_seed = (
-                    active_tracker.stable_seeds.get(
-                        target=active_tracker.target,
-                        session_id=active_tracker.session_id,
-                    )
-                    if active_tracker.active else None
-                )
+                stable_seed = (active_tracker.stable_seeds.get(
+                    target=active_tracker.target,
+                    session_id=active_tracker.session_id,
+                ) if active_tracker.active else None)
                 await cognitive_manager.publish_world_state({
                     **message,
-                    "track_action_active": bool(active_tracker.active),
-                    "stable_seed_ready": stable_seed is not None,
-                    "tracked_target": (
-                        active_tracker.target if active_tracker.active else None
-                    ),
+                    "track_action_active":
+                    bool(active_tracker.active),
+                    "stable_seed_ready":
+                    stable_seed is not None,
+                    "tracked_target":
+                    (active_tracker.target if active_tracker.active else None),
                 })
 
         except Exception as e:
             print(f"[System Error in Monitor]: {e}")
             await asyncio.sleep(1)
+
 
 async def _read_stdin_line(prompt):
     loop = asyncio.get_running_loop()
@@ -163,7 +170,9 @@ async def _read_stdin_line(prompt):
 
 async def send_typed_messages(response_manager, cognitive_manager=None):
     if not sys.stdin.isatty():
-        print("[System: Typed chat disabled; no interactive terminal is attached.]")
+        print(
+            "[System: Typed chat disabled; no interactive terminal is attached.]"
+        )
         return
     print("[System: Typed chat ready. Type a message and press Enter.]")
 
@@ -179,7 +188,8 @@ async def send_typed_messages(response_manager, cognitive_manager=None):
 
         await response_manager.send_user_text(message.rstrip("\n"))
 
-async def receive_events(ws,app,response_manager,camera,cognitive_manager):
+
+async def receive_events(ws, app, response_manager, camera, cognitive_manager):
     human_speaking = False
 
     async for message in ws:
@@ -189,20 +199,17 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         if event_type == "error":
             error = event.get("error", {})
 
-            print(
-                "\n\n❌ OPENAI ERROR"
-                f"\ntype: {error.get('type')}"
-                f"\ncode: {error.get('code')}"
-                f"\nmessage: {error.get('message')}"
-                f"\nparam: {error.get('param')}"
-                f"\nevent_id: {error.get('event_id')}"
-                "\n"
-            )
+            print("\n\n❌ OPENAI ERROR"
+                  f"\ntype: {error.get('type')}"
+                  f"\ncode: {error.get('code')}"
+                  f"\nmessage: {error.get('message')}"
+                  f"\nparam: {error.get('param')}"
+                  f"\nevent_id: {error.get('event_id')}"
+                  "\n")
 
         elif event_type == "response.created":
             response = event.get("response", {})
             response_manager.handle_response_created(response)
-
 
         elif event_type == "response.done":
             response = event.get("response", {})
@@ -230,7 +237,6 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
                     },
                     "\n",
                 )
-
 
             if response.get("status") != "completed":
                 continue
@@ -273,7 +279,8 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "input_audio_buffer.speech_stopped":
             if human_speaking:
                 human_speaking = False
-                create_tool_task(response_manager.create_voice_response(),name="response_task")
+                create_tool_task(response_manager.create_voice_response(),
+                                 name="response_task")
 
         elif event_type == "response.output_audio.delta":
             audio_base64 = event.get("delta")
@@ -284,7 +291,9 @@ async def receive_events(ws,app,response_manager,camera,cognitive_manager):
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
 
+
 def build_system_prompt(identity, memory, tool_routing=None):
+
     def format_value(value):
         if isinstance(value, list):
             return "\n".join(f"- {item}" for item in value)
@@ -295,7 +304,8 @@ def build_system_prompt(identity, memory, tool_routing=None):
                 prefix, separator, label = name.partition("_")
                 heading = label if separator and prefix.isdigit() else name
                 heading = heading.replace("_", " ").upper()
-                parts.append(f"### {heading} ###\n{format_value(nested_value)}")
+                parts.append(
+                    f"### {heading} ###\n{format_value(nested_value)}")
             return "\n".join(parts)
 
         return str(value)
@@ -314,14 +324,14 @@ def build_system_prompt(identity, memory, tool_routing=None):
         sections.append(section("TOOL ROUTING", tool_routing))
 
     remembered = [
-        f"{key}: {'; '.join(value)}"
-        for key, value in memory.items()
+        f"{key}: {'; '.join(value)}" for key, value in memory.items()
         if isinstance(value, list) and value
     ]
     if remembered:
         sections.append("=== WHAT YOU REMEMBER ===\n" + "\n".join(remembered))
 
     return "\n\n".join(sections)
+
 
 async def main():
     print("\n🤖 DJ STARTING TO CONNECT")
@@ -345,33 +355,29 @@ async def main():
 
     map_client = MapClient(
         context,
-        endpoint=os.environ.get(
-            "MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"
-        ),
+        endpoint=os.environ.get("MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"),
     )
 
     camera = CameraStream(
-            camera_index=0,
-            capture_width=1280,
-            capture_height=720,
-            tracking_width=640,
-            tracking_height=360,
-            history_frames=60,
-            fps=30,
-            usb_controls=CameraStream.usb_controls_from_env(),
-            usb_device=os.environ.get(
-                "USB_CAMERA_DEVICE",
-                "/dev/v4l/by-id/usb-HBVCAM_Camera_"
-                "USB_Camera_HB202400001-video-index0",
-            ),
-        )
+        camera_index=0,
+        capture_width=1280,
+        capture_height=720,
+        tracking_width=640,
+        tracking_height=360,
+        history_frames=60,
+        fps=30,
+        usb_controls=CameraStream.usb_controls_from_env(),
+        usb_device=os.environ.get(
+            "USB_CAMERA_DEVICE",
+            "/dev/v4l/by-id/usb-HBVCAM_Camera_"
+            "USB_Camera_HB202400001-video-index0",
+        ),
+    )
     camera.start()
     print("\n✅ CAMERA IS READY")
 
-    csrt_tracker = CSRTTrackingManager(
-        camera=camera,
-        max_initial_replay_frames=15
-    )
+    csrt_tracker = CSRTTrackingManager(camera=camera,
+                                       max_initial_replay_frames=15)
 
     csrt_tracker.start_worker()
     print("\n✅ CSRT TRACKER IS READY")
@@ -382,10 +388,19 @@ async def main():
         model=GROUNDING_DINO_MODEL,
         device="GPU",
     )
-    yolo = YoloService(
-        camera=camera
-    )
+    yolo = YoloService(camera=camera)
     hand_landmarks = HandLandmarkService(camera)
+    person_reid = PersonReIDService(
+        device=os.environ.get("PERSON_REID_DEVICE", "GPU"),
+        cache_dir=SMALL_BRAIN_ROOT / "__pycache__" / ".ov_cache_reid",
+    )
+    person_identity_tracker = PersonIdentityTracker(
+        person_reid,
+        profile_path=SMALL_BRAIN_ROOT / "results" / "person_reid" /
+        "follow_target" / "profile.json",
+        artifact_directory=SMALL_BRAIN_ROOT / "results" / "person_reid" /
+        "follow_target" / "images",
+    )
 
     grounding_dino.start_background()
     yolo.start_background()
@@ -393,9 +408,11 @@ async def main():
     async def wait_for_dino():
         await grounding_dino.wait_until_ready()
         print("\n✅ GROUNDING DINO IS READY")
+
     async def wait_for_yolo():
         await yolo.wait_until_ready()
         print("\n✅ YOLO IS READY")
+
     async def send_robot_command(payload):
         async with zmq_req_lock:
             await zmq_req_socket.send_json(payload)
@@ -412,7 +429,7 @@ async def main():
         async with websockets.connect(URL, additional_headers=headers) as ws:
             print("\n✅ CONNECTED TO GPT REALTIME AGENT.\n")
 
-            response_manager = ResponseManager(ws=ws,app=app)
+            response_manager = ResponseManager(ws=ws, app=app)
 
             track_action = TrackingService(
                 csrt_tracker=csrt_tracker,
@@ -421,6 +438,7 @@ async def main():
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
                 person_tracker_pub_socket=person_tracker_pub_socket,
+                person_identity_tracker=person_identity_tracker,
                 send_robot_command=send_robot_command,
             )
             move_camera_action = MoveCameraAction(
@@ -442,7 +460,9 @@ async def main():
                 move_camera_action=move_camera_action,
             )
             map_navigation_action = MapNavigationAction(
-                ws, camera, send_robot_command,
+                ws,
+                camera,
+                send_robot_command,
                 request_map_snapshot=map_client.request_snapshot,
                 save_map_snapshot=map_client.save_snapshot,
                 see_action=see_action,
@@ -510,7 +530,6 @@ async def main():
                             "voice": "shimmer",
                         }
                     },
-
                     "instructions": system_prompt,
                     "tools": tools_file
                 }
@@ -520,17 +539,18 @@ async def main():
             await asyncio.gather(
                 send_mic_audio(ws, app),
                 send_typed_messages(response_manager, cognitive_manager),
-                receive_events(ws,app,response_manager,camera,cognitive_manager),
+                receive_events(ws, app, response_manager, camera,
+                               cognitive_manager),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
                 display_camera_loop(
-                    camera, csrt_tracker, yolo, track_action,
+                    camera,
+                    csrt_tracker,
+                    yolo,
+                    track_action,
                     hand_gesture_interface,
-                ),
-                hand_gesture_interface.run(yolo),
-                wait_for_dino(),
-                wait_for_yolo()
-            )
+                ), hand_gesture_interface.run(yolo), wait_for_dino(),
+                wait_for_yolo())
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed by server.")
     except Exception as e:
@@ -547,6 +567,7 @@ async def main():
         await yolo.close()
         await hand_landmarks.close()
         map_client.close()
+
 
 if __name__ == "__main__":
     try:

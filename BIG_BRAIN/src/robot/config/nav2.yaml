@@ -56,11 +56,11 @@ controller_server:
       time_steps: 56
       model_dt: 0.1
       batch_size: 1000
-      ax_max: 3.0
-      ax_min: -3.0
-      ay_max: 3.0
-      ay_min: -3.0
-      az_max: 3.5
+      ax_max: 2.0
+      ax_min: -2.0
+      ay_max: 2.0
+      ay_min: -2.0
+      az_max: 2.5
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
@@ -152,7 +152,7 @@ local_costmap:
       resolution: 0.05
       footprint: "[ [0.12, 0.12], [0.12, -0.12], [-0.12, -0.12], [-0.12, 0.12] ]"
       footprint_padding: 0.05
-      plugins: ["range_layer","obstacle_layer","stvl_layer", "inflation_layer"]
+      plugins: ["range_layer","obstacle_layer","stvl_layer","cliff_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: True
@@ -231,6 +231,22 @@ local_costmap:
         enabled: True
         topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
+      # Independent mark-only storage prevents scan/depth clearing rays from
+      # removing cliff cells. Detector points are shifted 0.10 m toward the
+      # robot for safety. The layer is cleared only by resetting this costmap.
+      cliff_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: "cliff_points"
+        cliff_points:
+          topic: /cliff_layer
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.3
+          obstacle_max_range: 0.8
+          obstacle_min_range: 0.0
         
       always_send_full_costmap: True
 
@@ -249,7 +265,7 @@ global_costmap:
       footprint_padding: 0.05
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["range_layer","obstacle_layer","stvl_layer","inflation_layer"]
+      plugins: ["range_layer","obstacle_layer","stvl_layer","cliff_layer","inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -345,6 +361,22 @@ global_costmap:
         enabled: True
         topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
+      # Independent mark-only storage prevents scan/depth clearing rays from
+      # removing cliff cells. Detector points are shifted 0.10 m toward the
+      # robot for safety. The layer is cleared only by resetting this costmap.
+      cliff_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: "cliff_points"
+        cliff_points:
+          topic: /cliff_layer
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.3
+          obstacle_max_range: 0.8
+          obstacle_min_range: 0.0
 
 planner_server:
   ros__parameters:

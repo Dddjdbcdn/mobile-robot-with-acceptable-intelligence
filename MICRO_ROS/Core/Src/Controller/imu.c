@@ -45,12 +45,16 @@ uint32_t prev_tick = 0;
 
 bool mpu_calibration_done = false;
 bool mpu_init_status = false;
+volatile uint32_t imu_last_read_ms = 0;
 
 // Functions
 bool MPU6050_Init(I2C_HandleTypeDef *hi2c) {
 
     uint8_t check = 0;
     uint8_t data;
+
+    mpu_init_status = false;
+    imu_last_read_ms = 0;
 
     HAL_StatusTypeDef status;
     status = HAL_I2C_Mem_Read(hi2c, MPU6050_I2C_ADDR, MPU6050_WHO_AM_I, I2C_MEMADD_SIZE_8BIT, &check, 1, MPU_I2C_TIMEOUT);
@@ -73,19 +77,27 @@ bool MPU6050_Init(I2C_HandleTypeDef *hi2c) {
 
     // Set Data Rate (Sample Rate Divider)
     data = 0x00; // 1kHz sample rate
-    HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_SMPLRT_DIV, I2C_MEMADD_SIZE_8BIT, &data, 1, MPU_I2C_TIMEOUT);
+    if (HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_SMPLRT_DIV,
+                          I2C_MEMADD_SIZE_8BIT, &data, 1,
+                          MPU_I2C_TIMEOUT) != HAL_OK) return false;
 
     // Set Configuration (Digital Low Pass Filter for BOTH Gyro and Accel in MPU6050)
     data = 0x03; // ~42Hz bandwidth
-    HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_CONFIG, I2C_MEMADD_SIZE_8BIT, &data, 1, MPU_I2C_TIMEOUT);
+    if (HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_CONFIG,
+                          I2C_MEMADD_SIZE_8BIT, &data, 1,
+                          MPU_I2C_TIMEOUT) != HAL_OK) return false;
 
     // Configure Gyroscope
     data = 0x08; // +/- 500 dps
-    HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_GYRO_CONFIG, I2C_MEMADD_SIZE_8BIT, &data, 1, MPU_I2C_TIMEOUT);
+    if (HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_GYRO_CONFIG,
+                          I2C_MEMADD_SIZE_8BIT, &data, 1,
+                          MPU_I2C_TIMEOUT) != HAL_OK) return false;
 
     // Configure Accelerometer
     data = 0x08; // +/- 4g
-    HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_ACCEL_CONFIG, I2C_MEMADD_SIZE_8BIT, &data, 1, MPU_I2C_TIMEOUT);
+    if (HAL_I2C_Mem_Write(hi2c, MPU6050_I2C_ADDR, MPU6050_ACCEL_CONFIG,
+                          I2C_MEMADD_SIZE_8BIT, &data, 1,
+                          MPU_I2C_TIMEOUT) != HAL_OK) return false;
 
     mpu_init_status = true;
     return true;
@@ -176,13 +188,15 @@ bool MPU6050_Read_All(I2C_HandleTypeDef *hi2c) {
     return false;
 }
 
-void MPU6050_Calibrate(I2C_HandleTypeDef *hi2c) {
+bool MPU6050_Calibrate(I2C_HandleTypeDef *hi2c) {
     float ax_sum = 0, ay_sum = 0, az_sum = 0;
     float gx_sum = 0, gy_sum = 0, gz_sum = 0;
 
     for (int i = 0; i < MPU_CALIBRATION_SAMPLES; i++) {
-        MPU6050_Read_Accel(hi2c);
-        MPU6050_Read_Gyro(hi2c);
+        if (!MPU6050_Read_Accel(hi2c) || !MPU6050_Read_Gyro(hi2c)) {
+            mpu_calibration_done = false;
+            return false;
+        }
 
         ax_sum += Ax;
         ay_sum += Ay;
@@ -201,6 +215,7 @@ void MPU6050_Calibrate(I2C_HandleTypeDef *hi2c) {
     Gz_bias = gz_sum / MPU_CALIBRATION_SAMPLES;
 
     mpu_calibration_done = true;
+    return true;
 }
 
 void Calculate_Angles(void) {
@@ -241,6 +256,7 @@ bool Read_IMU(void) {
           return false;
         }
         else {
+            imu_last_read_ms = HAL_GetTick();
             return true;
         }
   }

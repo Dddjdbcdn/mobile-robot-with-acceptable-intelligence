@@ -9,11 +9,12 @@ extern volatile float Ay;
 extern volatile float Gz;
 extern bool mpu_init_status;
 extern bool mpu_calibration_done;
+extern volatile uint32_t imu_last_read_ms;
 
 bool MPU6050_Init(I2C_HandleTypeDef *hi2c);
 bool MPU6050_Read_Accel(I2C_HandleTypeDef *hi2c);
 bool MPU6050_Read_Gyro(I2C_HandleTypeDef *hi2c);
-void MPU6050_Calibrate(I2C_HandleTypeDef *hi2c);
+bool MPU6050_Calibrate(I2C_HandleTypeDef *hi2c);
 bool Read_IMU(void);
 
 #endif // IMU_H

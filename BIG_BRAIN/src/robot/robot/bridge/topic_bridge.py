@@ -75,25 +75,33 @@ class Stm32SensorBridge(Node):
         points = []
         
         for i, dist_mm in enumerate(msg.data):
-            if dist_mm <= 0: continue
+            x_dir, y_dir, z_dir = self.ray_dirs[i]
+
+            if dist_mm <= 0:
+                # Keep invalid pixels so consumers can retain the 8x8 image
+                # layout.  X/Y preserve the ray direction while Z identifies
+                # the measurement as invalid.
+                points.append([x_dir, y_dir, math.nan])
+                continue
 
             dist_m = dist_mm / 1000.0
-            x_dir, y_dir, z_dir = self.ray_dirs[i]
-            
-            # Calculate the 3D point
-            x = dist_m * x_dir
-            y = dist_m * y_dir
-            z = dist_m * z_dir
-            
-            points.append([x, y, z])
+            points.append([
+                dist_m * x_dir,
+                dist_m * y_dir,
+                dist_m * z_dir,
+            ])
             
         # Create header
         header = Header()
-        header.stamp = Time(seconds=0, nanoseconds=0).to_msg()
+        header.stamp = self.get_clock().now().to_msg()
         header.frame_id = 'tof_link'
         
         # Generate and publish PointCloud2 message
         pc2_msg = point_cloud2.create_cloud_xyz32(header, points)
+        pc2_msg.height = 8
+        pc2_msg.width = 8
+        pc2_msg.row_step = pc2_msg.point_step * pc2_msg.width
+        pc2_msg.is_dense = False
         self.tof_pc_publisher.publish(pc2_msg)
 
     # ==========================================

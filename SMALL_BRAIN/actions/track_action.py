@@ -10,9 +10,8 @@ from actions.tracking.person_pose import (
     predict_next_keypoint,
 )
 from actions.tracking.person_association import (
-    select_tracked_person,
-    update_tracked_bbox,
-)
+    select_tracked_person, )
+from actions.tracking.person_identity_tracker import EnrollmentCandidate
 from actions.tracking.stable_seed import StableTargetSeedTracker
 from actions.tracking.target_catalog import (
     HUMAN_TRACKABLE_PARTS,
@@ -46,12 +45,14 @@ class TrackingService:
         send_robot_command,
         STABLE_THRESHOLD=0.05,
         person_tracker_pub_socket=None,
+        person_identity_tracker=None,
     ):
         self.csrt_tracker = csrt_tracker
         self.grounding_dino = grounding_dino
         self.yolo = yolo
         self.zmq_pub_socket = zmq_pub_socket
         self.person_tracker_pub_socket = person_tracker_pub_socket
+        self.person_identity_tracker = person_identity_tracker
         self.send_robot_command = send_robot_command
         self.camera = camera
 
@@ -80,6 +81,8 @@ class TrackingService:
 
     def expected_person_detection(self, detections):
         """Return the one person this tracking session would associate."""
+        if self.person_identity_tracker is not None:
+            return self.person_identity_tracker.geometric_candidate(detections)
         return select_tracked_person(detections, self._tracked_person_bbox)
 
     def set_visual_target_override(self, normalized_x, normalized_y):
@@ -121,14 +124,10 @@ class TrackingService:
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         expected_target = self.target if target is None else target
-        expected_session_id = (
-            self.action_id if session_id is None else session_id
-        )
-        while (
-            self.active
-            and self.target == expected_target
-            and self.action_id == expected_session_id
-        ):
+        expected_session_id = (self.action_id
+                               if session_id is None else session_id)
+        while (self.active and self.target == expected_target
+               and self.action_id == expected_session_id):
             seed = self.stable_seeds.get(
                 target=expected_target,
                 session_id=expected_session_id,
@@ -148,18 +147,15 @@ class TrackingService:
         continuous_person_reacquisition=False,
         initial_person=None,
     ):
-        normalized_target = (
-            normalize_human_target(target) or normalize_object_target(target)
-        )
+        normalized_target = (normalize_human_target(target)
+                             or normalize_object_target(target))
 
         if self.active and self.target == normalized_target:
-            self._allow_grounding_dino = (
-                self._allow_grounding_dino or bool(allow_grounding_dino)
-            )
+            self._allow_grounding_dino = (self._allow_grounding_dino
+                                          or bool(allow_grounding_dino))
             self._continuous_person_reacquisition = (
                 self._continuous_person_reacquisition
-                or bool(continuous_person_reacquisition)
-            )
+                or bool(continuous_person_reacquisition))
             return ActionResult(
                 action_id=action_id,
                 action_type="track_action",
@@ -187,10 +183,11 @@ class TrackingService:
         self._memory_recorded_for_session = False
         self._allow_grounding_dino = allow_grounding_dino
         self._continuous_person_reacquisition = bool(
-            continuous_person_reacquisition
-        )
+            continuous_person_reacquisition)
         self.last_stable_target_location = None
         self._tracked_person_bbox = None
+        if self.person_identity_tracker is not None:
+            self.person_identity_tracker.reset()
 
         if normalized_target in HUMAN_TRACKABLE_PARTS:
             return await self._start_person_tracking(
@@ -283,8 +280,7 @@ class TrackingService:
         if allow_grounding_dino:
             if jpeg_bytes is None:
                 jpeg_bytes = await asyncio.to_thread(
-                    self.camera.jpeg_bytes_snapshot, 70, False
-                )
+                    self.camera.jpeg_bytes_snapshot, 70, False)
             grounding_result = await self.grounding_dino.detect(
                 image_source=jpeg_bytes,
                 target=target,
@@ -341,18 +337,18 @@ class TrackingService:
                 target_x = tracking_update.normalized_x
                 target_y = tracking_update.normalized_y
                 delta_pan_angle, delta_tilt_angle = self.target_to_angles(
-                    target_x, target_y
-                )
+                    target_x, target_y)
 
-                centered = (
-                    abs(target_x - 0.5) < self.stable_threshold
-                    and abs(target_y - 0.5) < self.stable_threshold
-                )
+                centered = (abs(target_x - 0.5) < self.stable_threshold
+                            and abs(target_y - 0.5) < self.stable_threshold)
                 if not centered:
                     await self.zmq_pub_socket.send_json({
-                        "delta_pan_angle": delta_pan_angle,
-                        "delta_tilt_angle": delta_tilt_angle,
-                        "tracking_sequence": f"csrt:{tracking_update.sequence}",
+                        "delta_pan_angle":
+                        delta_pan_angle,
+                        "delta_tilt_angle":
+                        delta_tilt_angle,
+                        "tracking_sequence":
+                        f"csrt:{tracking_update.sequence}",
                     })
 
                 if centered:
@@ -377,7 +373,8 @@ class TrackingService:
                             self.target,
                             allow_grounding_dino=self._allow_grounding_dino,
                         )
-                        await asyncio.sleep(self.OBJECT_REACQUIRE_DELAY_SECONDS)
+                        await asyncio.sleep(self.OBJECT_REACQUIRE_DELAY_SECONDS
+                                            )
                         if detection is not None:
                             reacquired = True
                             break
@@ -409,11 +406,11 @@ class TrackingService:
             camera.get("object_map_y"),
             camera.get("camera_tof_range"),
         )
-        if (
-            not all(isinstance(value, (int, float)) for value in required_location)
-            or not all(math.isfinite(float(value)) for value in required_location)
-            or float(camera["camera_tof_range"]) <= 0.05
-        ):
+        if (not all(
+                isinstance(value, (int, float)) for value in required_location)
+                or not all(
+                    math.isfinite(float(value)) for value in required_location)
+                or float(camera["camera_tof_range"]) <= 0.05):
             return
 
         self.last_stable_target_location = {
@@ -430,17 +427,13 @@ class TrackingService:
         self._memory_recorded_for_session = True
 
     async def _start_person_tracking(self, target, initial_person=None):
-        initial_person_is_valid = (
-            isinstance(initial_person, dict)
-            and initial_person.get("class") == "person"
-            and initial_person.get("keypoints")
-            and initial_person.get("bbox")
-        )
+        initial_person_is_valid = (isinstance(initial_person, dict)
+                                   and initial_person.get("class") == "person"
+                                   and initial_person.get("keypoints")
+                                   and initial_person.get("bbox"))
         detections = [
-            detection
-            for detection in self.yolo.detections
-            if detection["class"] == "person"
-            and "keypoints" in detection
+            detection for detection in self.yolo.detections
+            if detection["class"] == "person" and "keypoints" in detection
         ]
 
         if not detections and not initial_person_is_valid:
@@ -457,17 +450,15 @@ class TrackingService:
                 retryable=True,
             )
 
-        person = (
-            initial_person
-            if initial_person_is_valid
-            else max(
-                detections,
-                key=lambda detection: detection["confidence"],
-            )
-        )
+        person = (initial_person if initial_person_is_valid else max(
+            detections,
+            key=lambda detection: detection["confidence"],
+        ))
         self.detection_confidence = float(person.get("confidence") or 1.0)
         self.person_path = find_best_person_path(person, target)
-        self._tracked_person_bbox = update_tracked_bbox(None, person)
+        if self.person_identity_tracker is None:
+            raise RuntimeError("Person identity tracker is not configured")
+        self.person_identity_tracker.start(person)
 
         self.person_path_index = 0
         feedback = await self.send_robot_command({
@@ -497,33 +488,89 @@ class TrackingService:
         if self.person_tracker_pub_socket is None or seed is None:
             return
         await self.person_tracker_pub_socket.send_json({
-            "type": "person_tof_position",
-            "x": seed["x"],
-            "y": seed["y"],
-            "frame_id": "base_footprint",
-            "target": seed.get("target"),
-            "session_id": seed.get("session_id"),
+            "type":
+            "person_tof_position",
+            "x":
+            seed["x"],
+            "y":
+            seed["y"],
+            "frame_id":
+            "base_footprint",
+            "target":
+            seed.get("target"),
+            "session_id":
+            seed.get("session_id"),
         })
+
+    async def enroll_tracked_person(self):
+        """Collect a short, quality-filtered burst for the next person view."""
+        if (not self.active or self.target not in HUMAN_TRACKABLE_PARTS
+                or self.person_identity_tracker is None):
+            return {
+                "accepted": 0,
+                "reason": "person_tracking_not_active",
+            }
+
+        sequence, _ = self.yolo.detection_snapshot()
+        candidates = []
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while len(candidates) < 6 and asyncio.get_running_loop().time(
+        ) < deadline:
+            if not await self.yolo.wait_for_inference_after(sequence,
+                                                            timeout=0.4):
+                continue
+            sequence, detections, frame_bgr, timing = (
+                self.yolo.detection_snapshot_with_frame())
+            if frame_bgr is None:
+                continue
+            people = [
+                detection for detection in detections
+                if detection.get("class") == "person"
+                and detection.get("keypoints")
+            ]
+            person = self.person_identity_tracker.geometric_candidate(people)
+            if person is None:
+                continue
+            quality = self.person_identity_tracker.candidate_quality(
+                frame_bgr,
+                person,
+                enrollment=True,
+            )
+            captured_at = timing.get("source_captured_at")
+            if quality is None or not isinstance(captured_at, (int, float)):
+                continue
+            candidates.append(
+                EnrollmentCandidate(
+                    frame_bgr=frame_bgr,
+                    person=person,
+                    quality=quality,
+                    captured_at=float(captured_at),
+                ))
+
+        result = await self.person_identity_tracker.enroll(candidates)
+        print("[PERSON REID ENROLLMENT] "
+              f"view={result['view']} accepted={result['accepted']} "
+              f"complete={result['complete']}")
+        return result
 
     def _update_person_seed(self, person, target):
         """Validate a centered person's ToF point against the pose mask."""
         camera_state = robot_state.get("camera") or {}
         timestamp = camera_state.get("timestamp")
         distance = camera_state.get("camera_tof_range")
-        if (
-            not isinstance(timestamp, (int, float))
-            or not isinstance(distance, (int, float))
-            or not math.isfinite(float(timestamp))
-            or not math.isfinite(float(distance))
-            or float(distance) <= 0.05
-            or time.monotonic() - float(timestamp)
-            > self.PERSON_POINT_MAX_AGE_SECONDS
-        ):
+        if (not isinstance(timestamp, (int, float))
+                or not isinstance(distance, (int, float))
+                or not math.isfinite(float(timestamp))
+                or not math.isfinite(float(distance))
+                or float(distance) <= 0.05
+                or time.monotonic() - float(timestamp)
+                > self.PERSON_POINT_MAX_AGE_SECONDS):
             self.stable_seeds.clear()
             return None
 
         try:
-            frame_height, frame_width = self.camera.snapshot().tracking_bgr.shape[:2]
+            frame_height, frame_width = self.camera.snapshot(
+            ).tracking_bgr.shape[:2]
             bbox = person["bbox"]
             projected = {
                 name: (int(point["x"]), int(point["y"]))
@@ -534,13 +581,14 @@ class TrackingService:
                 (frame_height, frame_width),
                 projected,
                 (
-                    int(bbox["x1"]), int(bbox["y1"]),
-                    int(bbox["x2"]), int(bbox["y2"]),
+                    int(bbox["x1"]),
+                    int(bbox["y1"]),
+                    int(bbox["x2"]),
+                    int(bbox["y2"]),
                 ),
             )
-            _, tof_center = project_tof_region(
-                frame_width, frame_height, max(float(distance), 0.02)
-            )
+            _, tof_center = project_tof_region(frame_width, frame_height,
+                                               max(float(distance), 0.02))
         except (KeyError, TypeError, ValueError, RuntimeError):
             self.stable_seeds.clear()
             return None
@@ -574,30 +622,22 @@ class TrackingService:
             (
                 inference_sequence,
                 inference_detections,
+                inference_frame_bgr,
                 inference_timing,
-            ) = (
-                self.yolo.detection_snapshot_with_timing()
-            )
+            ) = self.yolo.detection_snapshot_with_frame()
             visual_override = self._current_visual_target_override()
             override_state = self._visual_target_override
             visual_override_updated_at = (
-                override_state.get("updated_at")
-                if visual_override is not None
-                and isinstance(override_state, dict)
-                else None
-            )
+                override_state.get("updated_at") if visual_override is not None
+                and isinstance(override_state, dict) else None)
             inference_is_new = inference_sequence != last_inference_sequence
-            override_is_new = (
-                visual_override_updated_at
-                != last_visual_override_updated_at
-            )
+            override_is_new = (visual_override_updated_at
+                               != last_visual_override_updated_at)
             if not inference_is_new and not override_is_new:
-                if (
-                    missing_person_since is not None
-                    and loop.time() - missing_person_since
-                    >= keypoint_timeout_seconds
-                    and not self._continuous_person_reacquisition
-                ):
+                if (missing_person_since is not None
+                        and loop.time() - missing_person_since
+                        >= keypoint_timeout_seconds
+                        and not self._continuous_person_reacquisition):
                     await self.stop(
                         reason_code="PERSON_LOST",
                         status="failed",
@@ -610,25 +650,23 @@ class TrackingService:
                 last_inference_sequence = inference_sequence
             last_visual_override_updated_at = visual_override_updated_at
             detections = [
-                detection
-                for detection in inference_detections
-                if detection["class"] == "person"
-                and "keypoints" in detection
+                detection for detection in inference_detections
+                if detection["class"] == "person" and "keypoints" in detection
             ]
 
-            person = select_tracked_person(
-                detections,
-                self._tracked_person_bbox,
+            decision = await self.person_identity_tracker.observe(
+                sequence=inference_sequence,
+                frame_bgr=inference_frame_bgr,
+                detections=detections,
             )
+            person = decision.person
             if person is None:
                 self.stable_seeds.clear()
                 if missing_person_since is None:
                     missing_person_since = loop.time()
-                elif (
-                    loop.time() - missing_person_since
-                    >= keypoint_timeout_seconds
-                    and not self._continuous_person_reacquisition
-                ):
+                elif (loop.time() - missing_person_since
+                      >= keypoint_timeout_seconds
+                      and not self._continuous_person_reacquisition):
                     await self.stop(
                         reason_code="PERSON_LOST",
                         status="failed",
@@ -638,10 +676,6 @@ class TrackingService:
                 await asyncio.sleep(0.05)
                 continue
             missing_person_since = None
-            self._tracked_person_bbox = update_tracked_bbox(
-                self._tracked_person_bbox,
-                person,
-            )
             current_name = self.person_path[self.person_path_index]
             current_keypoint = person_keypoint(person, current_name)
 
@@ -649,11 +683,9 @@ class TrackingService:
                 if current_keypoint is None:
                     if missing_keypoint_since is None:
                         missing_keypoint_since = loop.time()
-                    elif (
-                        loop.time() - missing_keypoint_since
-                        >= keypoint_timeout_seconds
-                        and not self._continuous_person_reacquisition
-                    ):
+                    elif (loop.time() - missing_keypoint_since
+                          >= keypoint_timeout_seconds
+                          and not self._continuous_person_reacquisition):
                         await self.stop(
                             reason_code="PERSON_KEYPOINT_TIMEOUT",
                             status="failed",
@@ -682,13 +714,14 @@ class TrackingService:
 
                     else:
                         if predicted_target is not None:
-                            target_x,target_y = predicted_target
+                            target_x, target_y = predicted_target
                         else:
                             await asyncio.sleep(0.05)
                             continue
 
                 else:
-                    if (abs(target_x - 0.5) < self.stable_threshold and abs(target_y - 0.5) < self.stable_threshold):
+                    if (abs(target_x - 0.5) < self.stable_threshold
+                            and abs(target_y - 0.5) < self.stable_threshold):
                         predicted_target = predict_next_keypoint(
                             person,
                             self.person_path,
@@ -708,77 +741,73 @@ class TrackingService:
                 else:
                     alpha = self.PERSON_TARGET_SMOOTHING_ALPHA
                     filtered_target = (
-                        filtered_target[0] + alpha * (
-                            target_x - filtered_target[0]
-                        ),
-                        filtered_target[1] + alpha * (
-                            target_y - filtered_target[1]
-                        ),
+                        filtered_target[0] + alpha *
+                        (target_x - filtered_target[0]),
+                        filtered_target[1] + alpha *
+                        (target_y - filtered_target[1]),
                     )
                 target_x, target_y = filtered_target
 
-            target_centered = (
-                abs(target_x - 0.5) < self.stable_threshold
-                and abs(target_y - 0.5) < self.stable_threshold
-            )
+            target_centered = (abs(target_x - 0.5) < self.stable_threshold
+                               and abs(target_y - 0.5) < self.stable_threshold)
 
-            delta_pan_angle,delta_tilt_angle = self.target_to_angles(target_x,target_y)
+            delta_pan_angle, delta_tilt_angle = self.target_to_angles(
+                target_x, target_y)
 
             command_created_at = time.monotonic()
             captured_at = inference_timing.get("source_captured_at")
             inference_started_at = inference_timing.get("inference_started_at")
-            inference_completed_at = inference_timing.get("inference_completed_at")
+            inference_completed_at = inference_timing.get(
+                "inference_completed_at")
             tracking_timing = {"sent_at_unix_ns": time.time_ns()}
             if all(
-                isinstance(value, (int, float))
-                for value in (
-                    captured_at,
-                    inference_started_at,
-                    inference_completed_at,
-                )
-            ):
+                    isinstance(value, (int, float)) for value in (
+                        captured_at,
+                        inference_started_at,
+                        inference_completed_at,
+                    )):
                 tracking_timing.update({
-                    "capture_to_send_ms": max(
-                        0.0, (command_created_at - captured_at) * 1000.0
-                    ),
-                    "capture_wait_ms": max(
-                        0.0, (inference_started_at - captured_at) * 1000.0
-                    ),
-                    "inference_ms": max(
+                    "capture_to_send_ms":
+                    max(0.0, (command_created_at - captured_at) * 1000.0),
+                    "capture_wait_ms":
+                    max(0.0, (inference_started_at - captured_at) * 1000.0),
+                    "inference_ms":
+                    max(
                         0.0,
-                        (inference_completed_at - inference_started_at) * 1000.0,
+                        (inference_completed_at - inference_started_at) *
+                        1000.0,
                     ),
-                    "post_inference_ms": max(
+                    "post_inference_ms":
+                    max(
                         0.0,
                         (command_created_at - inference_completed_at) * 1000.0,
                     ),
                 })
 
             if visual_override is not None or not target_centered:
-                tracking_sequence = (
-                    f"hand:{visual_override_updated_at}"
-                    if visual_override is not None
-                    else f"pose:{inference_sequence}"
-                )
+                tracking_sequence = (f"hand:{visual_override_updated_at}"
+                                     if visual_override is not None else
+                                     f"pose:{inference_sequence}")
                 await self.zmq_pub_socket.send_json({
-                    "delta_pan_angle": delta_pan_angle,
-                    "delta_tilt_angle": delta_tilt_angle,
-                    "tracking_sequence": tracking_sequence,
-                    "tracking_timing": tracking_timing,
+                    "delta_pan_angle":
+                    delta_pan_angle,
+                    "delta_tilt_angle":
+                    delta_tilt_angle,
+                    "tracking_sequence":
+                    tracking_sequence,
+                    "tracking_timing":
+                    tracking_timing,
                 })
 
-            final_keypoint = self.person_path_index == len(self.person_path) - 1
+            final_keypoint = self.person_path_index == len(
+                self.person_path) - 1
             # A hand seed only requires the palm target to be centered. For
             # regular person targets, the pose-mask intersection verifies
             # that the off-center ToF beam is still hitting them.
-            seed_target = (
-                "hand"
-                if visual_override is not None and target_centered
-                else self.target
-                if visual_override is None
-                and final_keypoint
-                else None
-            )
+            seed_target = ("hand"
+                           if visual_override is not None and target_centered
+                           else self.target if visual_override is None
+                           and final_keypoint else None)
             if seed_target != last_seed_target:
                 last_seed_update_at = None
                 last_seed_target = seed_target
@@ -786,20 +815,15 @@ class TrackingService:
             if seed_target is not None:
                 now = loop.time()
                 seed_update_interval = 1.0 / self.PERSON_SEED_UPDATE_HZ
-                if (
-                    last_seed_update_at is None
-                    or now - last_seed_update_at >= seed_update_interval
-                ):
-                    seed = (
-                        self.stable_seeds.update(
-                            robot_state.get("camera"),
-                            target="hand",
-                            session_id=self.action_id,
-                        )
-                        if visual_override is not None
-                        else self._update_person_seed(person, seed_target)
-                    )
-                    if seed is not None:
+                if (last_seed_update_at is None
+                        or now - last_seed_update_at >= seed_update_interval):
+                    seed = (self.stable_seeds.update(
+                        robot_state.get("camera"),
+                        target="hand",
+                        session_id=self.action_id,
+                    ) if visual_override is not None else
+                            self._update_person_seed(person, seed_target))
+                    if seed is not None and decision.allow_lidar_seed:
                         if visual_override is None:
                             self._remember_stable_target()
                         await self._publish_lidar_seed(seed)
@@ -824,14 +848,10 @@ class TrackingService:
 
         tracking_task = self._tracking_task
         was_person_tracking = self.target in HUMAN_TRACKABLE_PARTS
-        preserve_person_tracker = (
-            was_person_tracking
-            and status == "failed"
-            and self._continuous_person_reacquisition
-        )
-        effective_reset_camera = (
-            reset_camera is not False and not preserve_person_tracker
-        )
+        preserve_person_tracker = (was_person_tracking and status == "failed"
+                                   and self._continuous_person_reacquisition)
+        effective_reset_camera = (reset_camera is not False
+                                  and not preserve_person_tracker)
 
         await self.send_robot_command({
             "command": "stop_tracking",
@@ -845,11 +865,9 @@ class TrackingService:
             reason_code=reason_code,
         )
 
-        if (
-            tracking_task is not None
-            and tracking_task is not asyncio.current_task()
-            and not tracking_task.done()
-        ):
+        if (tracking_task is not None
+                and tracking_task is not asyncio.current_task()
+                and not tracking_task.done()):
             tracking_task.cancel()
             await asyncio.gather(tracking_task, return_exceptions=True)
 
@@ -894,6 +912,8 @@ class TrackingService:
         self.target = None
         self._tracking_task = None
         self._tracked_person_bbox = None
+        if self.person_identity_tracker is not None:
+            self.person_identity_tracker.reset()
 
         if completion_future is not None and not completion_future.done():
             completion_future.set_result(result)
@@ -907,8 +927,10 @@ class TrackingService:
         tan_half_fov_h = math.tan(math.radians(HORIZONTAL_FOV_DEG / 2.0))
         tan_half_fov_v = math.tan(math.radians(VERTICAL_FOV_DEG / 2.0))
 
-        pan_angle = math.degrees(math.atan((center_x_error * 2.0) * tan_half_fov_h))
-        tilt_angle = math.degrees(math.atan((center_y_error * 2.0) * tan_half_fov_v))
+        pan_angle = math.degrees(
+            math.atan((center_x_error * 2.0) * tan_half_fov_h))
+        tilt_angle = math.degrees(
+            math.atan((center_y_error * 2.0) * tan_half_fov_v))
 
         delta_pan = -pan_angle
         delta_tilt = tilt_angle

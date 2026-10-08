@@ -17,6 +17,7 @@ class HandGestureInterface:
     STATUS_MAX_AGE_SECONDS = 1.0
     IDLE_WELCOME_CONFIRM_FRAMES = 10
     TRACKING_STOP_CONFIRM_FRAMES = 5
+    TRACKING_ENROLL_CONFIRM_FRAMES = 5
     MOVEMENT_STOP_CONFIRM_FRAMES = 10
     MODIFIER_CONFIRM_FRAMES = 3
     COMMAND_CONFIRM_FRAMES = 2
@@ -46,8 +47,14 @@ class HandGestureInterface:
             self.TRACKING_STOP_CONFIRM_FRAMES,
             miss_tolerance=self.MISS_TOLERANCE,
         )
+        self._tracking_ok = FrameConfirmation(
+            "ok",
+            self.TRACKING_ENROLL_CONFIRM_FRAMES,
+            miss_tolerance=self.MISS_TOLERANCE,
+        )
         self._tracking_direction_confirmations = {
-            name: FrameConfirmation(
+            name:
+            FrameConfirmation(
                 name,
                 self.COMMAND_CONFIRM_FRAMES,
                 miss_tolerance=self.MISS_TOLERANCE,
@@ -60,7 +67,8 @@ class HandGestureInterface:
             miss_tolerance=self.MISS_TOLERANCE,
         )
         self._modifier_confirmations = {
-            name: FrameConfirmation(
+            name:
+            FrameConfirmation(
                 name,
                 self.MODIFIER_CONFIRM_FRAMES,
                 miss_tolerance=self.MISS_TOLERANCE,
@@ -68,7 +76,8 @@ class HandGestureInterface:
             for name in ("welcome", "push")
         }
         self._command_confirmations = {
-            name: FrameConfirmation(
+            name:
+            FrameConfirmation(
                 name,
                 self.COMMAND_CONFIRM_FRAMES,
                 miss_tolerance=self.MISS_TOLERANCE,
@@ -102,11 +111,8 @@ class HandGestureInterface:
         status = self._latest_status
         if not isinstance(status, dict):
             return None
-        max_age = (
-            self.STATUS_MAX_AGE_SECONDS
-            if max_age_seconds is None
-            else float(max_age_seconds)
-        )
+        max_age = (self.STATUS_MAX_AGE_SECONDS
+                   if max_age_seconds is None else float(max_age_seconds))
         if time.monotonic() - float(status.get("updated_at") or 0.0) > max_age:
             return None
         return dict(status)
@@ -119,6 +125,7 @@ class HandGestureInterface:
         for confirmation in self._command_confirmations.values():
             confirmation.reset()
         self._tracking_thumb_up.reset()
+        self._tracking_ok.reset()
         for confirmation in self._tracking_direction_confirmations.values():
             confirmation.reset()
 
@@ -140,7 +147,8 @@ class HandGestureInterface:
             frame_source = None
 
         if frame_source is None:
-            sequence, detections, frame_bgr, _ = yolo.detection_snapshot_with_frame()
+            sequence, detections, frame_bgr, _ = yolo.detection_snapshot_with_frame(
+            )
             frame_source = "yolo"
 
         frame_sequence = (frame_source, sequence)
@@ -149,11 +157,8 @@ class HandGestureInterface:
         self._last_frame_sequence = frame_sequence
 
         person = max(
-            (
-                item
-                for item in detections
-                if item.get("class") == "person" and item.get("keypoints")
-            ),
+            (item for item in detections
+             if item.get("class") == "person" and item.get("keypoints")),
             key=lambda item: float(item.get("confidence") or 0.0),
             default=None,
         )
@@ -162,23 +167,20 @@ class HandGestureInterface:
             debug_path = None
             now = time.monotonic()
             debug_due = self._debug_image_interval > 0.0 and (
-                self._last_debug_image_at is None
-                or now - self._last_debug_image_at >= self._debug_image_interval
-            )
+                self._last_debug_image_at is None or
+                now - self._last_debug_image_at >= self._debug_image_interval)
             if debug_due:
                 self._last_debug_image_at = now
                 debug_path = str(
-                    Path("results/action_results") / "hand_landmarks_latest.jpg"
-                )
+                    Path("results/action_results") /
+                    "hand_landmarks_latest.jpg")
             hand = await self.hand_landmarks.detect_right_hand(
-                frame_bgr, person, debug_path=debug_path
-            )
+                frame_bgr, person, debug_path=debug_path)
             self._inference_sequence += 1
 
         pose = HandGestureClassifier.classify(hand)
-        context = await self._observe_gesture(
-            pose["gesture"], pose["palm_center"], detections
-        )
+        context = await self._observe_gesture(pose["gesture"],
+                                              pose["palm_center"], detections)
         self._latest_status = {
             "updated_at": time.monotonic(),
             "sequence": sequence,
@@ -203,23 +205,20 @@ class HandGestureInterface:
             try:
                 person_confidence = float(person.get("confidence") or 0.0)
                 wrist = (person.get("keypoints") or {})["right_wrist"]
-                wrist_confidence = float(
-                    (person.get("keypoint_confidences") or {}).get(
-                        "right_wrist",
-                        wrist.get("confidence") or 0.0,
-                    )
-                )
+                wrist_confidence = float((person.get("keypoint_confidences")
+                                          or {}).get(
+                                              "right_wrist",
+                                              wrist.get("confidence") or 0.0,
+                                          ))
                 distance = math.hypot(
                     float(palm_center[0]) - float(wrist["normalized_x"]),
                     float(palm_center[1]) - float(wrist["normalized_y"]),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-            if (
-                person_confidence < cls.WELCOME_PERSON_MIN_CONFIDENCE
-                or wrist_confidence < cls.WELCOME_WRIST_MIN_CONFIDENCE
-                or distance > cls.WELCOME_PALM_WRIST_MAX_DISTANCE
-            ):
+            if (person_confidence < cls.WELCOME_PERSON_MIN_CONFIDENCE
+                    or wrist_confidence < cls.WELCOME_WRIST_MIN_CONFIDENCE
+                    or distance > cls.WELCOME_PALM_WRIST_MAX_DISTANCE):
                 continue
             candidates.append((distance, -person_confidence, person))
         if not candidates:
@@ -227,9 +226,9 @@ class HandGestureInterface:
         return min(candidates, key=lambda item: item[:2])[2]
 
     async def _observe_gesture(self, gesture, palm_center, detections=None):
-        context = await self._dispatch(
-            "observe_gesture", gesture=gesture, palm_center=palm_center
-        )
+        context = await self._dispatch("observe_gesture",
+                                       gesture=gesture,
+                                       palm_center=palm_center)
         tracking_person = bool(context.get("tracking_person"))
         if context.get("movement_active"):
             self._reset_sequence()
@@ -256,9 +255,13 @@ class HandGestureInterface:
             return context
 
         if self._tracking_thumb_up.observe(gesture):
-            await self._dispatch(
-                "stop_watching_target", reason="HAND_THUMB_UP"
-            )
+            await self._dispatch("stop_watching_target",
+                                 reason="HAND_THUMB_UP")
+            self._reset_all()
+            return context
+
+        if self._tracking_ok.observe(gesture):
+            await self._dispatch("enroll_person")
             self._reset_all()
             return context
 
@@ -267,8 +270,7 @@ class HandGestureInterface:
             "thumb_right": "move_to_person_right",
         }
         for name, confirmation in (
-            self._tracking_direction_confirmations.items()
-        ):
+                self._tracking_direction_confirmations.items()):
             if confirmation.observe(gesture):
                 await self._dispatch(
                     "explicit_navigation",
@@ -338,7 +340,9 @@ class HandGestureInterface:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    print(f"[HAND INTERFACE ERROR] {type(error).__name__}: {error}")
+                    print(
+                        f"[HAND INTERFACE ERROR] {type(error).__name__}: {error}"
+                    )
                 elapsed = time.monotonic() - started_at
                 await asyncio.sleep(max(0.01, interval - elapsed))
         finally:

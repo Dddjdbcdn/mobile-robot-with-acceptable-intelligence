@@ -1,8 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler
-from launch.event_handlers import OnProcessStart
+from launch.actions import ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler, TimerAction
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_xml.launch_description_sources import XMLLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -25,6 +25,8 @@ def generate_launch_description():
                 '--dev', '/dev/serial/by-id/usb-STMicroelectronics_STM32_STLink_066BFF485270535067113035-if02',
                 '--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
     )
 
     stm32_reset = ExecuteProcess(
@@ -32,10 +34,13 @@ def generate_launch_description():
         output='screen',
     )
 
-    delayed_stm32_reset = RegisterEventHandler(
-        event_handler=OnProcessStart(
-            target_action=micro_ros_agent,
-            on_start=[stm32_reset],
+    start_agent_after_serial_setup = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=setup_serial,
+            on_exit=[
+                micro_ros_agent,
+                TimerAction(period=2.0, actions=[stm32_reset]),
+            ],
         )
     )
 
@@ -53,9 +58,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        start_agent_after_serial_setup,
         setup_serial,
-        micro_ros_agent,
-        delayed_stm32_reset,
         lidar_node,
         depth_camera_node,
     ])
