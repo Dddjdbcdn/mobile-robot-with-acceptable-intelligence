@@ -36,6 +36,7 @@ setup(
             'ring_bridge.py = robot.store.ring_bridge:main',
             'test_servo.py = robot.control.camera_servo:main',
             'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
+            'reset_node.py = robot.reset_node:main',
             'system_watchdog.py = robot.watchdog.system_watchdog:main',
             'velocity_clamper.py = robot.control.velocity_clamper:main',
             'cliff_detector.py = robot.control.cliff_detector:main',

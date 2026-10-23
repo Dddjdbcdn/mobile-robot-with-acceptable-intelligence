@@ -36,6 +36,7 @@ BUILD_DIR = build
 C_SOURCES =  \
 Core/Src/main.c \
 Core/Src/Controller/microros_app.c \
+Core/Src/Controller/microros_diagnostics.c \
 Core/Src/Controller/imu.c \
 Core/Src/Controller/motor.c \
 Core/Src/Controller/range.c \

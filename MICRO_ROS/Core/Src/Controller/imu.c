@@ -1,5 +1,4 @@
 #include "imu.h"
-#include "microros_app.h"
 #include "main.h"
 #include "cmsis_os.h"
 #include <math.h>
@@ -27,6 +26,7 @@ extern void I2C1_Clear_Busy_Flag(void);
 // The expected WHO_AM_I value for MPU6050 is typically 0x68
 #define MPU6050_WHO_AM_I_VAL     0x68
 #define MPU_I2C_TIMEOUT          20  // Reduced from 100ms to 20ms
+#define MPU_MAX_READ_ERRORS       3
 
 // Variables
 int16_t Accel_X_RAW = 0, Accel_Y_RAW = 0, Accel_Z_RAW = 0;
@@ -46,6 +46,9 @@ uint32_t prev_tick = 0;
 bool mpu_calibration_done = false;
 bool mpu_init_status = false;
 volatile uint32_t imu_last_read_ms = 0;
+volatile uint32_t imu_read_error_count = 0;
+volatile uint32_t imu_reconnect_count = 0;
+volatile uint8_t imu_consecutive_read_errors = 0;
 
 // Functions
 bool MPU6050_Init(I2C_HandleTypeDef *hi2c) {
@@ -55,6 +58,7 @@ bool MPU6050_Init(I2C_HandleTypeDef *hi2c) {
 
     mpu_init_status = false;
     imu_last_read_ms = 0;
+    imu_consecutive_read_errors = 0;
 
     HAL_StatusTypeDef status;
     status = HAL_I2C_Mem_Read(hi2c, MPU6050_I2C_ADDR, MPU6050_WHO_AM_I, I2C_MEMADD_SIZE_8BIT, &check, 1, MPU_I2C_TIMEOUT);
@@ -251,11 +255,17 @@ bool Read_IMU(void) {
         bool read_ok = MPU6050_Read_All(&hi2c1);
 
         if (!read_ok) {
-          mpu_init_status = false;
-          debug_print("[ERROR] IMU I2C Read Failed! Bus offline.");
+          imu_read_error_count++;
+          if (imu_consecutive_read_errors < UINT8_MAX) {
+              imu_consecutive_read_errors++;
+          }
+          if (imu_consecutive_read_errors >= MPU_MAX_READ_ERRORS) {
+              mpu_init_status = false;
+          }
           return false;
         }
         else {
+            imu_consecutive_read_errors = 0;
             imu_last_read_ms = HAL_GetTick();
             return true;
         }
@@ -263,7 +273,7 @@ bool Read_IMU(void) {
   else {
     if (HAL_GetTick() - last_reconnect_attempt >= RECONNECT_INTERVAL) {
       last_reconnect_attempt = HAL_GetTick();
-      debug_print("[WARN] Attempting IMU I2C bus recovery...");
+      imu_reconnect_count++;
 
       HAL_I2C_DeInit(&hi2c1);
       I2C1_Clear_Busy_Flag();
@@ -274,11 +284,6 @@ bool Read_IMU(void) {
       
       mpu_init_status = MPU6050_Init(&hi2c1);
       
-      if (mpu_init_status) {
-          debug_print("[SUCCESS] IMU Reconnected!");
-      } else {
-          debug_print("[FAILED] IMU Reconnect failed, retrying in 2s...");
-      }
     }
     return false;
   }

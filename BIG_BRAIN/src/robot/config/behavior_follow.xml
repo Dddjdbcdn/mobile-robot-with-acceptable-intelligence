@@ -1,24 +1,50 @@
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <PipelineSequence name="NavigateWithReplanning">
-      <ControllerSelector
-        selected_controller="{selected_controller}"
-        default_controller="FollowPath" topic_name="controller_selector"/>
       <PlannerSelector
         selected_planner="{selected_planner}"
         default_planner="GridBased" topic_name="planner_selector"/>
       <RateController hz="2.0">
-        <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
-          <ComputePathToPose goal="{updated_goal}" path="{follow_path}"
-            planner_id="{selected_planner}"
-            error_code_id="{compute_path_error_code}"
-          />
-        </GoalUpdater>
+        <RecoveryNode number_of_retries="3" name="ComputeFollowPath">
+          <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
+            <ComputePathToPose goal="{updated_goal}" path="{follow_path}"
+              planner_id="{selected_planner}"
+              error_code_id="{compute_path_error_code}"
+            />
+          </GoalUpdater>
+          <Fallback name="RecoverComputeFollowPath">
+            <Sequence name="WaitForPlannerTf-Follow">
+              <AreErrorCodesPresent error_code="{compute_path_error_code}"
+                error_codes_to_check="202"/>
+              <Wait wait_duration="0.25"/>
+            </Sequence>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Follow"
+                service_name="global_costmap/clear_entirely_global_costmap"/>
+              <Wait wait_duration="0.25"/>
+            </Sequence>
+          </Fallback>
+        </RecoveryNode>
       </RateController>
       <KeepRunningUntilFailure>
-        <FollowPath path="{follow_path}" controller_id="{selected_controller}"
-          goal_checker_id="general_goal_checker"
-          error_code_id="{follow_path_error_code}"/>
+        <RecoveryNode number_of_retries="3" name="FollowPersonPath">
+          <FollowPath path="{follow_path}" controller_id="FollowPath"
+            goal_checker_id="approach_goal_checker"
+            error_code_id="{follow_path_error_code}"/>
+          <Fallback name="RecoverFollowPersonPath">
+            <Sequence name="WaitForControllerTf-Follow">
+              <AreErrorCodesPresent error_code="{follow_path_error_code}"
+                error_codes_to_check="102"/>
+              <Wait wait_duration="0.25"/>
+            </Sequence>
+            <Sequence>
+              <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-Follow"
+                service_name="local_costmap/clear_entirely_local_costmap"/>
+            </Sequence>
+          </Fallback>
+        </RecoveryNode>
       </KeepRunningUntilFailure>
     </PipelineSequence>
   </BehaviorTree>

@@ -91,7 +91,7 @@ class FindTargetExecutor:
         self._search_started_at = 0.0
         self._approach_standoff_m: float | None = None
         self.approach_target = True
-        self._continuous_person_reacquisition = False
+        self.initial_person: dict | None = None
 
     async def start(
         self,
@@ -100,8 +100,8 @@ class FindTargetExecutor:
         target_kind="object",
         approach_standoff_m=None,
         approach=True,
-        continuous_person_reacquisition=False,
         action_type=None,
+        initial_person=None,
     ) -> ActionResult:
         """Find a target, optionally stopping after stable visual acquisition."""
         target = str(target or "").strip()
@@ -131,8 +131,8 @@ class FindTargetExecutor:
         self.action_type = action_type
         self.target_kind = normalized_kind
         self.approach_target = bool(approach)
-        self._continuous_person_reacquisition = bool(
-            continuous_person_reacquisition
+        self.initial_person = (
+            initial_person if isinstance(initial_person, dict) else None
         )
         self._completed_steps = []
         self._approach_result_data = {}
@@ -187,24 +187,28 @@ class FindTargetExecutor:
     async def _run(self) -> None:
         """Run the selected bounded search goal to its terminal result."""
         try:
-            person = robot_state.get("person") or {}
-            robot_pose = robot_state.get("pose") or {}
-            if (
-                self.target_kind == "person"
-                and self._person_pose_is_fresh(person)
-                and self._person_bearing_exceeds_face_threshold(
-                    person, robot_pose
-                )
-            ):
-                facing = await self.navigation_action.start_local(
-                    "face_person", self._step_id("face_known_person")
-                )
-                facing = await self._terminal_result(
-                    self.navigation_action, facing
-                )
-                if facing.status == "succeeded":
-                    self._completed_steps.append("faced_known_person")
-            result = await self._search_environment()
+            result = None
+            if self.target_kind == "person":
+                result = await self._try_fast_person_tracking()
+            if result is None:
+                person = robot_state.get("person") or {}
+                robot_pose = robot_state.get("pose") or {}
+                if (
+                    self.target_kind == "person"
+                    and self._person_pose_is_fresh(person)
+                    and self._person_bearing_exceeds_face_threshold(
+                        person, robot_pose
+                    )
+                ):
+                    facing = await self.navigation_action.start_local(
+                        "face_person", self._step_id("face_known_person")
+                    )
+                    facing = await self._terminal_result(
+                        self.navigation_action, facing
+                    )
+                    if facing.status == "succeeded":
+                        self._completed_steps.append("faced_known_person")
+                result = await self._search_environment()
             if result.status != "succeeded":
                 raise GoalStepFailed(
                     "find",
@@ -253,14 +257,37 @@ class FindTargetExecutor:
             completion["data"] = result.data
         self._complete(**completion)
 
-    async def _track(self,allow_grounding_dino=True,step="track") -> ActionResult:
+    async def _try_fast_person_tracking(self) -> ActionResult | None:
+        """Reuse or acquire a visible person before moving the camera."""
+        tracked = await self._track(
+            allow_grounding_dino=False,
+            step="direct_person",
+            initial_person=self.initial_person,
+        )
+        if tracked.status != "succeeded":
+            if tracked.reason_code == "PERSON_DETECTION_FAILED":
+                return None
+            return tracked
+
+        self._completed_steps.append(
+            "person_tracking_reused"
+            if (tracked.data or {}).get("reused_tracking")
+            else "person_tracked_in_current_view"
+        )
+        if self.approach_target:
+            return await self._track_approach_and_reacquire(0)
+        return tracked
+
+    async def _track(
+        self, allow_grounding_dino=True, step="track", initial_person=None
+    ) -> ActionResult:
         tracking_options = {
             "target": self.target,
             "action_id": self._step_id(step),
             "allow_grounding_dino": allow_grounding_dino,
         }
-        if self._continuous_person_reacquisition:
-            tracking_options["continuous_person_reacquisition"] = True
+        if initial_person is not None:
+            tracking_options["initial_person"] = initial_person
         result = await self.track_action.start_tracking(**tracking_options)
         if result.status == "running":
             return ActionResult(
@@ -306,7 +333,9 @@ class FindTargetExecutor:
             cls.KNOWN_PERSON_FACE_THRESHOLD_DEG
         )
 
-    async def _acquire_target_without_approach(self, attempt):
+    async def _acquire_target_without_approach(
+        self, attempt, initial_person=None
+    ):
         """Start tracking and leave ongoing alignment/reacquisition to it."""
         suffix = "" if attempt == 0 else f"_{attempt}"
         person_target = self.target_kind == "person"
@@ -317,6 +346,7 @@ class FindTargetExecutor:
         tracked = await self._track(
             allow_grounding_dino=True,
             step=f"acquire_{target_label}{suffix}",
+            initial_person=initial_person,
         )
         if tracked.status != "succeeded":
             return tracked
@@ -330,9 +360,13 @@ class FindTargetExecutor:
             data={"tracking_active": True, **dict(tracked.data or {})},
         )
 
-    async def _acquire_person_without_approach(self, attempt):
+    async def _acquire_person_without_approach(
+        self, attempt, initial_person=None
+    ):
         """Compatibility wrapper for existing internal callers and tests."""
-        return await self._acquire_target_without_approach(attempt)
+        return await self._acquire_target_without_approach(
+            attempt, initial_person=initial_person
+        )
 
     async def _approach(self, step="approach") -> ActionResult:
         tracking_session_id = self.track_action.action_id
@@ -364,7 +398,7 @@ class FindTargetExecutor:
         return result
 
     async def _track_approach_and_reacquire(
-        self, attempt: int
+        self, attempt: int, initial_person=None
     ) -> ActionResult:
 
         suffix = "" if attempt == 0 else f"_{attempt}"
@@ -375,6 +409,7 @@ class FindTargetExecutor:
         track_result = await self._track(
             allow_grounding_dino=True,
             step=f"track{suffix}",
+            initial_person=initial_person,
         )
         if track_result.status != "succeeded":
             return track_result
@@ -404,6 +439,7 @@ class FindTargetExecutor:
         track_result = await self._track(
             allow_grounding_dino=True,
             step=f"post_approach_track_{attempt}",
+            initial_person=(search_result.data or {}).get("person_detection"),
         )
         if track_result.status != "succeeded":
             return track_result
@@ -487,6 +523,9 @@ class FindTargetExecutor:
                 (observation or {}).get("candidate_type") or ""
             )
             found = pending_result.status == "succeeded"
+            person_detection = (pending_result.data or {}).get(
+                "person_detection"
+            )
             if (
                 not found
                 and pending_result.reason_code
@@ -516,7 +555,8 @@ class FindTargetExecutor:
                 ):
                     if self.target_kind == "person":
                         verified = await self._acquire_person_without_approach(
-                            candidate_attempt
+                            candidate_attempt,
+                            initial_person=person_detection,
                         )
                     else:
                         verified = await self._acquire_target_without_approach(
@@ -524,7 +564,8 @@ class FindTargetExecutor:
                         )
                 else:
                     verified = await self._track_approach_and_reacquire(
-                        candidate_attempt
+                        candidate_attempt,
+                        initial_person=person_detection,
                     )
                 if verified.status == "succeeded":
                     return verified
@@ -657,6 +698,7 @@ class FindTargetExecutor:
                     "place" if self.target_kind == "place"
                     else "specific"
                 ),
+                person_search=self.target_kind == "person",
             )
             search_result = await self._terminal_result(
                 self.search_action, search_result

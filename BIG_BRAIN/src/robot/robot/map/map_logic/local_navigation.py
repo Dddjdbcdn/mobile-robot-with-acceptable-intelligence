@@ -154,7 +154,7 @@ class LocalNavigationMixin:
         """Return the nearest reachable cell center on a ray from the person."""
         step = max(grid.resolution / 2.0, 1e-6)
         max_distance = max(
-            step, float(self.cfg.person_navigation_max_distance_m)
+            0.0, float(self.cfg.person_navigation_max_radius_m)
         )
         origin_cell = tuple(
             int(value) for value in grid.cells(person_x, person_y)
@@ -175,10 +175,15 @@ class LocalNavigationMixin:
                 ):
                     cell_x, cell_y = grid.world(col, row)
                     cell_x, cell_y = float(cell_x), float(cell_y)
+                    person_distance = math.hypot(
+                        cell_x - person_x, cell_y - person_y
+                    )
+                    if person_distance > max_distance + 1e-9:
+                        break
                     return (
                         cell_x,
                         cell_y,
-                        math.hypot(cell_x - person_x, cell_y - person_y),
+                        person_distance,
                     )
             distance += step
         return None

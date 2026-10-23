@@ -93,7 +93,9 @@ class Stm32SensorBridge(Node):
             
         # Create header
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()
+        header.stamp = (
+            self.get_clock().now() - Duration(seconds=0.05) # Avoid tf jitter in rviz2. Not true MCU acquisition time
+        ).to_msg()
         header.frame_id = 'tof_link'
         
         # Generate and publish PointCloud2 message
@@ -147,6 +149,9 @@ class Stm32SensorBridge(Node):
         range_msg.min_range = 0.05
         range_msg.max_range = 0.3
 
+        if not math.isfinite(distance):
+            return
+
         if distance < 0.0 or distance > range_msg.max_range:
             range_msg.range = range_msg.max_range
         else:
@@ -163,7 +168,7 @@ class Stm32SensorBridge(Node):
         range_msg.min_range = 0.01    
         range_msg.max_range = 12.0
         
-        if distance <= 0.0 or distance > range_msg.max_range:
+        if distance <= 0.0 or distance > range_msg.max_range or not math.isfinite(distance):
             range_msg.range = range_msg.max_range
         else:
             range_msg.range = float(distance)

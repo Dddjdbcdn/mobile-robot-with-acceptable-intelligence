@@ -1,282 +1,71 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+import copy
 import json
-import math
 import threading
 import time
 
 import numpy as np
-from builtin_interfaces.msg import Duration as DurationMsg
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import PoseStamped
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
+import tf2_geometry_msgs
+from rclpy.executors import MultiThreadedExecutor
 from tf2_ros import Buffer, TransformException, TransformListener
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import MarkerArray
 import zmq
 
-
-@dataclass
-class Cluster:
-    points: np.ndarray
-    center: np.ndarray
-    width: float
-
-
-@dataclass
-class Detection:
-    position: np.ndarray
-    kind: str
-
-
-@dataclass(frozen=True)
-class DetectionModel:
-    """How much one kind of lidar detection should influence the track."""
-
-    reliability: float
-    selection_penalty_m: float
-
-
-# A pair of legs is the strongest observation. A single leg is less reliable,
-# and a partial cluster may include a nearby chair or wall. Reliability scales
-# both motion-filter gains; the penalty only breaks close association ties.
-DETECTION_MODELS = {
-    "pair": DetectionModel(reliability=1.00, selection_penalty_m=0.00),
-    "single": DetectionModel(reliability=0.58, selection_penalty_m=0.08),
-    "partial": DetectionModel(reliability=0.36, selection_penalty_m=0.16),
-}
-
-# Adjacent laser beams naturally spread apart with range. This multiplier
-# prevents that beam spacing from splitting one physical surface.
-BEAM_SPACING_ALLOWANCE = 1.5
-
-
-@dataclass(frozen=True)
-class TrackerSettings:
-    """Runtime tuning, loaded once from ROS parameters at startup."""
-
-    # Lidar clustering and human geometry (metres).
-    cluster_break_distance: float = 0.10
-    min_cluster_points: int = 3
-    single_leg_width: float = 0.35
-    min_leg_pair_distance: float = 0.10
-    leg_pair_distance: float = 0.75
-    partial_cluster_radius: float = 0.30
-
-    # Search and confirmation.
-    initial_search_radius: float = 0.60
-    tracking_search_radius: float = 0.35
-    initialization_match_radius: float = 0.30
-    confirmation_scans: int = 3
-    seed_association_weight: float = 0.50
-    recovery_search_growth: float = 0.45
-    recovery_search_limit: float = 0.45
-
-    # Validated visual-seed correction.
-    seed_max_age_seconds: float = 0.75
-    seed_correction_radius: float = 0.70
-    seed_correction_gain: float = 0.12
-    seed_override_count: int = 3
-
-    # Lidar motion filter. A gain of 0 ignores the new measurement; 1 snaps
-    # directly to it. Detection reliability scales both gains.
-    lidar_position_gain: float = 0.55
-    lidar_velocity_gain: float = 0.12
-    max_person_speed: float = 2.50
-    max_prediction_seconds: float = 0.30
-    coast_velocity_retention: float = 0.95
-
-    # State timing.
-    coast_seconds: float = 0.75
-    lost_seconds: float = 1.75
-    initialization_timeout_seconds: float = 2.0
-
-    @classmethod
-    def from_node(cls, node: Node) -> TrackerSettings:
-        defaults = cls()
-        for item in fields(defaults):
-            node.declare_parameter(item.name, getattr(defaults, item.name))
-        return cls(**{
-            item.name: node.get_parameter(item.name).value
-            for item in fields(defaults)
-        })
-
-
-@dataclass
-class PersonTrack:
-    position: np.ndarray
-    velocity: np.ndarray
-    stamp_seconds: float
-    last_hit_at: float
-    max_prediction_seconds: float = 0.30
-    state: str = "tracking"
-
-    def predict(self, stamp_seconds: float) -> tuple[np.ndarray, float]:
-        dt = stamp_seconds - self.stamp_seconds
-        if not math.isfinite(dt) or dt <= 0.0:
-            dt = 0.1
-        dt = min(dt, self.max_prediction_seconds)
-        return self.position + self.velocity * dt, dt
-
-    def update(
-        self,
-        measurement: np.ndarray,
-        stamp_seconds: float,
-        position_gain: float,
-        velocity_gain: float,
-        max_speed: float,
-    ) -> None:
-        predicted, dt = self.predict(stamp_seconds)
-        error = measurement - predicted
-        self.position = predicted + position_gain * error
-        self.velocity = self.velocity + (velocity_gain / dt) * error
-
-        speed = float(np.linalg.norm(self.velocity))
-        if speed > max_speed:
-            self.velocity *= max_speed / speed
-
-        self.stamp_seconds = stamp_seconds
-        self.last_hit_at = time.monotonic()
-        self.state = "tracking"
-
-
-def cluster_scan(
-    scan: LaserScan,
-    base_break_distance: float,
-    min_points: int,
-) -> list[np.ndarray]:
-    """Split consecutive valid laser beams into Cartesian point clusters."""
-    clusters: list[np.ndarray] = []
-    current: list[tuple[float, float]] = []
-    previous = None
-    angle = float(scan.angle_min)
-
-    def finish_cluster() -> None:
-        nonlocal current
-        if len(current) >= min_points:
-            clusters.append(np.asarray(current, dtype=float))
-        current = []
-
-    for distance in scan.ranges:
-        valid = (
-            math.isfinite(distance)
-            and float(scan.range_min) <= distance <= float(scan.range_max)
-        )
-        if not valid:
-            finish_cluster()
-            previous = None
-            angle += float(scan.angle_increment)
-            continue
-
-        point = np.array(
-            [distance * math.cos(angle), distance * math.sin(angle)],
-            dtype=float,
-        )
-        if previous is not None:
-            adaptive_break = (
-                base_break_distance
-                + BEAM_SPACING_ALLOWANCE
-                * distance
-                * abs(float(scan.angle_increment))
-            )
-            if float(np.linalg.norm(point - previous)) > adaptive_break:
-                finish_cluster()
-
-        current.append((float(point[0]), float(point[1])))
-        previous = point
-        angle += float(scan.angle_increment)
-
-    finish_cluster()
-    return clusters
-
-
-def transform_points(points: np.ndarray, transform) -> np.ndarray:
-    translation = transform.transform.translation
-    rotation = transform.transform.rotation
-    yaw = math.atan2(
-        2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
-        1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z),
-    )
-    cosine = math.cos(yaw)
-    sine = math.sin(yaw)
-    matrix = np.array([[cosine, -sine], [sine, cosine]])
-    offset = np.array([translation.x, translation.y])
-    return points @ matrix.T + offset
-
-
-def describe_clusters(point_groups: list[np.ndarray]) -> list[Cluster]:
-    clusters = []
-    for points in point_groups:
-        center = np.median(points, axis=0)
-        width = float(np.linalg.norm(points[-1] - points[0]))
-        clusters.append(Cluster(points=points, center=center, width=width))
-    return clusters
-
-
-def person_detections(
-    clusters: list[Cluster],
-    reference: np.ndarray,
-    search_radius: float,
-    single_leg_width: float,
-    min_pair_distance: float,
-    pair_distance: float,
-    partial_radius: float,
-    min_points: int,
-) -> list[Detection]:
-    """Build person-center candidates near a seed or predicted track."""
-    nearby = [
-        cluster
-        for cluster in clusters
-        if np.linalg.norm(cluster.center - reference)
-        <= search_radius + cluster.width * 0.5
-    ]
-
-    detections: list[Detection] = []
-    leg_clusters = [c for c in nearby if c.width <= single_leg_width]
-
-    for cluster in leg_clusters:
-        detections.append(Detection(cluster.center.copy(), "single"))
-
-    for index, first in enumerate(leg_clusters):
-        for second in leg_clusters[index + 1:]:
-            separation = float(np.linalg.norm(first.center - second.center))
-            if min_pair_distance <= separation <= pair_distance:
-                midpoint = (first.center + second.center) * 0.5
-                if np.linalg.norm(midpoint - reference) <= search_radius:
-                    detections.append(Detection(midpoint, "pair"))
-
-    # A person beside an obstacle can be part of one wide cluster. Only use
-    # the local portion around the predicted person instead of its centroid.
-    for cluster in nearby:
-        if cluster.width <= single_leg_width:
-            continue
-        distances = np.linalg.norm(cluster.points - reference, axis=1)
-        local_points = cluster.points[distances <= partial_radius]
-        if len(local_points) >= min_points:
-            detections.append(
-                Detection(np.median(local_points, axis=0), "partial")
-            )
-
-    return detections
+from robot.person_pose.lidar_clusters import (
+    Cluster,
+    clusters_from_scan,
+    filter_scan_around_person,
+    transform_points,
+)
+from robot.person_pose.person_tracker_state import (
+    PersonTrackerState,
+    TrackerSettings,
+)
+from robot.person_pose.person_tracker_renderer import PersonTrackerRenderer
+from robot.person_pose.yolo_correction import YoloCorrection, YoloSettings
 
 
 class PersonLidarTracker(Node):
+    """Fuse lidar clusters, ToF seeds, and YOLO motion into a person pose."""
+
+    TF_HISTORY_MARGIN_SECONDS = 0.01
+
     def __init__(self):
         super().__init__("person_lidar_tracker")
-
         self.declare_parameter("scan_topic", "/scan")
+        self.declare_parameter("filtered_scan_topic", "/scan_filtered")
         self.declare_parameter("tracking_frame", "odom")
         self.declare_parameter("base_frame", "base_footprint")
         self.declare_parameter("tof_endpoint", "tcp://*:5560")
-        self.settings = TrackerSettings.from_node(self)
+        self.declare_parameter("camera_fov_marker_range", 3.0)
 
+        self.settings = TrackerSettings.from_node(self)
         self.tracking_frame = str(self.get_parameter("tracking_frame").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
+        self.state = PersonTrackerState(self.settings)
+        self.renderer = PersonTrackerRenderer(
+            self.tracking_frame,
+            float(self.get_parameter("camera_fov_marker_range").value),
+        )
+        self.yolo = YoloCorrection(
+            YoloSettings.from_node(self),
+            self.base_frame,
+        )
+        self.latest_tof_seed = None
+        self.processed_tof_seed = None
+        self.processed_tof_seed_key = None
+        self.tof_position = None
+        self.tof_position_at = None
+        self.last_filtered_beam_count = 0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -285,11 +74,19 @@ class PersonLidarTracker(Node):
             depth=5,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
+        scan_topic = str(self.get_parameter("scan_topic").value)
+        filtered_topic = str(
+            self.get_parameter("filtered_scan_topic").value
+        )
+        if filtered_topic == scan_topic:
+            raise ValueError(
+                "filtered_scan_topic must differ from the raw scan_topic"
+            )
         self.create_subscription(
-            LaserScan,
-            str(self.get_parameter("scan_topic").value),
-            self.scan_callback,
-            scan_qos,
+            LaserScan, scan_topic, self.scan_callback, scan_qos
+        )
+        self.filtered_scan_publisher = self.create_publisher(
+            LaserScan, filtered_topic, scan_qos
         )
         self.pose_publisher = self.create_publisher(
             PoseStamped, "/person_pose", 10
@@ -297,28 +94,15 @@ class PersonLidarTracker(Node):
         self.marker_publisher = self.create_publisher(
             MarkerArray, "/person_tracker/markers", 10
         )
+        self.person_marker_publisher = self.create_publisher(
+            MarkerArray, "/person_tracker/person_marker", 10
+        )
         self.status_publisher = self.create_publisher(
             String, "/person_tracker/status", 10
         )
-        self.track: PersonTrack | None = None
-        self.pending_position: np.ndarray | None = None
-        self.pending_hits = 0
-        self.latest_seed = None
-        self.seed_lock = threading.Lock()
-        self.last_seed_position: np.ndarray | None = None
-        self.last_seed_at: float | None = None
-        self.last_seed_accepted_at: float | None = None
-        self.seed_mismatch_hits = 0
-        self.handoff_position: np.ndarray | None = None
-        self.handoff_velocity = np.zeros(2, dtype=float)
-        self.handoff_stamp_seconds: float | None = None
-        self.handoff_hits = 0
-        self.handoff_started_at: float | None = None
-        self.acquisition_state = "disabled"
-        self.acquisition_started_at: float | None = None
-        self.last_detections: list[Detection] = []
-        self.enabled = False
-
+        self.create_subscription(
+            Empty, "/big_brain/reset", self.reset_callback, 10
+        )
         self.zmq_running = True
         self.zmq_context = zmq.Context()
         self.zmq_socket = self.zmq_context.socket(zmq.SUB)
@@ -328,18 +112,33 @@ class PersonLidarTracker(Node):
         endpoint = str(self.get_parameter("tof_endpoint").value)
         self.zmq_socket.bind(endpoint)
         self.zmq_thread = threading.Thread(
-            target=self._receive_tof_seeds,
-            name="person-tof-seeds",
+            target=self._receive_observations,
+            name="person-observations",
             daemon=True,
         )
         self.zmq_thread.start()
-
         self.get_logger().info(
             f"Person lidar tracker idle in {self.tracking_frame}; "
             f"waiting for a ToF seed on {endpoint}"
         )
 
-    def _receive_tof_seeds(self) -> None:
+    def reset(self) -> None:
+        """Clear all state belonging to the current person track."""
+        self.state.reset()
+        self.yolo.reset()
+        self.latest_tof_seed = None
+        self.processed_tof_seed = None
+        self.processed_tof_seed_key = None
+        self.tof_position = None
+        self.tof_position_at = None
+        self.last_filtered_beam_count = 0
+        self._publish_disabled(self.get_clock().now().to_msg())
+
+    def reset_callback(self, _message: Empty) -> None:
+        self.reset()
+        self.get_logger().info("Person tracker reset")
+
+    def _receive_observations(self) -> None:
         while self.zmq_running:
             try:
                 message = self.zmq_socket.recv_json()
@@ -347,49 +146,22 @@ class PersonLidarTracker(Node):
                 continue
             except zmq.ZMQError:
                 return
+            if message.get("type") == "person_tof_position":
+                self.latest_tof_seed = message
+            else:
+                self.yolo.accept(message)
 
-            if message.get("type") != "person_tof_position":
-                continue
-            try:
-                seed = {
-                    "x": float(message["x"]),
-                    "y": float(message["y"]),
-                    "frame_id": str(message.get("frame_id") or self.base_frame),
-                }
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            with self.seed_lock:
-                self.latest_seed = seed
-
-    def _activate_from_pending_seed(self) -> None:
-        """Enable processing once, when the first visual seed is available."""
-        if self.enabled:
-            return
-        with self.seed_lock:
-            has_seed = self.latest_seed is not None
-        if not has_seed:
-            return
-
-        self.enabled = True
-        self.acquisition_state = "waiting"
-        self.get_logger().info(
-            "Received first ToF seed; lidar person tracking enabled"
-        )
-
-    def _take_seed(self):
-        with self.seed_lock:
-            seed = self.latest_seed
-            self.latest_seed = None
-        return seed
-
-    def _lookup_transform(self, source_frame: str, stamp) -> object | None:
+    def _lookup_transform(
+        self,
+        source_frame: str,
+        stamp,
+    ):
         try:
             return self.tf_buffer.lookup_transform(
                 self.tracking_frame,
                 source_frame,
                 Time.from_msg(stamp),
-                timeout=Duration(seconds=0.05),
+                timeout=Duration(seconds=0.1),
             )
         except TransformException as error:
             self.get_logger().warning(
@@ -399,516 +171,296 @@ class PersonLidarTracker(Node):
             )
             return None
 
-    def _seed_in_tracking_frame(self, seed, stamp) -> np.ndarray | None:
-        transform = self._lookup_transform(seed["frame_id"], stamp)
-        if transform is None:
-            return None
-        point = np.array([[seed["x"], seed["y"]]], dtype=float)
-        return transform_points(point, transform)[0]
-
-    @staticmethod
-    def _stamp_seconds(stamp) -> float:
-        return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+    def _lookup_transform_at_monotonic(
+        self,
+        source_frame: str,
+        captured_at: float,
+    ):
+        age = max(0.0, time.monotonic() - captured_at)
+        stamp = (
+            self.get_clock().now()
+            - Duration(seconds=age + self.TF_HISTORY_MARGIN_SECONDS)
+        ).to_msg()
+        return self._lookup_transform(source_frame, stamp)
 
     def scan_callback(self, scan: LaserScan) -> None:
-        self._activate_from_pending_seed()
-        if not self.enabled:
+        seed = self.latest_tof_seed
+        seed_key = None
+        seed_is_fresh = False
+        if seed is not None:
+            try:
+                captured_at = float(seed["captured_at_monotonic"])
+                seed_key = (
+                    str(seed["session_id"]),
+                    str(seed["target"]),
+                    captured_at,
+                )
+                seed_is_fresh = (
+                    time.monotonic() - captured_at
+                    <= self.settings.seed_max_age_seconds
+                )
+            except (KeyError, TypeError, ValueError):
+                seed_key = None
+
+        seed_is_new = (
+            seed_key is not None
+            and seed_key != self.processed_tof_seed_key
+        )
+        if seed_is_new and not seed_is_fresh:
+            self.processed_tof_seed = seed
+            self.processed_tof_seed_key = seed_key
+            seed_is_new = False
+
+        if (
+            self.state.acquisition_state == "disabled"
+            and seed_is_new
+        ):
+            self.state.activate()
+            self.get_logger().info(
+                "Received first ToF seed; lidar person tracking enabled"
+            )
+        if self.state.acquisition_state == "disabled":
+            self._publish_filtered_scan(scan)
             self._publish_disabled(scan.header.stamp)
             return
 
-        transform = self._lookup_transform(scan.header.frame_id, scan.header.stamp)
-        if transform is None:
+        scan_transform = self._lookup_transform(
+            scan.header.frame_id, scan.header.stamp
+        )
+        if scan_transform is None:
+            self._publish_filtered_scan(scan)
             return
 
-        point_groups = cluster_scan(
+        clusters = clusters_from_scan(
             scan,
+            scan_transform,
             self.settings.cluster_break_distance,
             self.settings.min_cluster_points,
         )
-        transformed_groups = [
-            transform_points(points, transform) for points in point_groups
-        ]
-        clusters = describe_clusters(transformed_groups)
-        stamp_seconds = self._stamp_seconds(scan.header.stamp)
-
-        seed = self._take_seed()
-        if seed is not None:
-            seed_position = self._seed_in_tracking_frame(seed, scan.header.stamp)
-            if seed_position is not None:
-                self._accept_trusted_seed(seed_position)
-
-        handoff_completed = self._update_seed_handoff(
-            clusters, stamp_seconds
+        stamp_seconds = (
+            float(scan.header.stamp.sec)
+            + float(scan.header.stamp.nanosec) / 1_000_000_000.0
         )
-        if self.track is None or self.track.state == "lost":
-            self._try_initialization(clusters, stamp_seconds)
-        elif not handoff_completed:
-            self._update_track(clusters, stamp_seconds)
+        visual_context = self.yolo.context(
+            self._lookup_transform_at_monotonic
+        )
+        visual_constraint = (
+            visual_context.constraint if visual_context is not None else None
+        )
+        camera_view = (
+            visual_context.camera_view if visual_context is not None else None
+        )
 
-        self._publish(scan.header.stamp, clusters)
+        tof_position = None
+        if seed_is_new:
+            seed_transform = self._lookup_transform_at_monotonic(
+                seed["frame_id"], captured_at
+            )
+            if seed_transform is not None:
+                seed_position = transform_points(
+                    np.array([[seed["x"], seed["y"]]], dtype=float),
+                    seed_transform,
+                )[0]
+                acceptance = self.state.accept_tof(
+                    seed_position,
+                    captured_at,
+                )
+                if acceptance != "deferred":
+                    self.processed_tof_seed = seed
+                    self.processed_tof_seed_key = seed_key
+                    self.tof_position = seed_position
+                    self.tof_position_at = captured_at
+                    tof_position = seed_position
+
+        events = self.state.update(
+            clusters,
+            stamp_seconds,
+            tof_position,
+            visual_context,
+        )
+        if "initialized" in events:
+            self.get_logger().info("Initialized person pose from ToF seed")
+        if "leg_acquired" in events:
+            self.get_logger().info("Acquired clean lidar leg support")
+        if "visual_recovery_started" in events:
+            self.get_logger().warning(
+                "Visual evidence rejected the current lidar identity"
+            )
+        if "visual_found" in events:
+            self.get_logger().info(
+                "YOLO target found; centering robot during validation"
+            )
+        if "visual_centered" in events:
+            self.get_logger().info(
+                "YOLO target centered; holding still for visual validation"
+            )
+        if "visual_validated" in events:
+            self.get_logger().info(
+                "YOLO target validated; waiting for fresh ToF seed"
+            )
+        if "visual_recovery_failed" in events:
+            self.get_logger().error("Visual person recovery timed out")
+
+        seed_marker_position = (
+            self.tof_position
+            if self.tof_position_at is not None
+            and time.monotonic() - self.tof_position_at
+            <= self.settings.seed_max_age_seconds
+            else None
+        )
+        self._publish_filtered_scan(scan, scan_transform)
+        self._publish_tracking(
+            scan.header.stamp,
+            clusters,
+            seed_marker_position,
+            visual_context,
+        )
+
+    def _publish_filtered_scan(self, scan: LaserScan, transform=None) -> None:
+        if (
+            transform is not None
+            and self.state.track is not None
+            and self.state.published_state == "tracking"
+        ):
+            filtered, count = filter_scan_around_person(
+                scan,
+                transform,
+                self.state.track.position,
+                self.settings.person_filter_radius,
+            )
+        else:
+            filtered, count = copy.deepcopy(scan), 0
+        self.last_filtered_beam_count = count
+        self.filtered_scan_publisher.publish(filtered)
 
     def _publish_disabled(self, stamp) -> None:
-        status_message = String()
-        status_message.data = json.dumps(
-            {"state": "disabled"},
-            separators=(",", ":"),
-        )
-        self.status_publisher.publish(status_message)
+        self.status_publisher.publish(String(data='{"state":"disabled"}'))
+        self.marker_publisher.publish(self.renderer.clear(stamp))
+        self.person_marker_publisher.publish(self.renderer.clear(stamp))
 
-        markers = MarkerArray()
-        clear = Marker()
-        clear.header.frame_id = self.tracking_frame
-        clear.header.stamp = stamp
-        clear.action = Marker.DELETEALL
-        markers.markers.append(clear)
-        self.marker_publisher.publish(markers)
-
-    @staticmethod
-    def _best_detection(
-        detections: list[Detection],
-        reference: np.ndarray,
-        trusted_seed: np.ndarray | None = None,
-        seed_weight: float = 0.0,
-    ) -> Detection | None:
-        if not detections:
-            return None
-        return min(
-            detections,
-            key=lambda detection: (
-                float(np.linalg.norm(detection.position - reference))
-                + DETECTION_MODELS[detection.kind].selection_penalty_m
-                + (
-                    seed_weight
-                    * float(
-                        np.linalg.norm(detection.position - trusted_seed)
-                    )
-                    if trusted_seed is not None else 0.0
-                )
-            ),
-        )
-
-    def _fresh_trusted_seed(self) -> np.ndarray | None:
-        if self.last_seed_position is None or self.last_seed_at is None:
-            return None
-        if (
-            time.monotonic() - self.last_seed_at
-            > self.settings.seed_max_age_seconds
-        ):
-            return None
-        return self.last_seed_position
-
-    def _begin_reacquisition(self, seed_position: np.ndarray) -> None:
-        self._clear_seed_handoff()
-        self.track = None
-        self.pending_position = None
-        self.pending_hits = 0
-        self.last_detections = []
-        self.last_seed_position = seed_position.copy()
-        self.last_seed_at = time.monotonic()
-        self.seed_mismatch_hits = 0
-        self.acquisition_state = "reacquiring"
-        self.acquisition_started_at = time.monotonic()
-        self.get_logger().info(
-            "Trusted ToF seed invalidated the lidar association; reacquiring"
-        )
-
-    def _clear_seed_handoff(self) -> None:
-        self.handoff_position = None
-        self.handoff_velocity = np.zeros(2, dtype=float)
-        self.handoff_stamp_seconds = None
-        self.handoff_hits = 0
-        self.handoff_started_at = None
-
-    def _begin_seed_handoff(self) -> None:
-        if self.handoff_started_at is not None:
-            return
-        self.handoff_started_at = time.monotonic()
-        self.handoff_position = None
-        self.handoff_velocity = np.zeros(2, dtype=float)
-        self.handoff_stamp_seconds = None
-        self.handoff_hits = 0
-        self.get_logger().info(
-            "Trusted ToF seed disagrees with the active track; "
-            "confirming a replacement while retaining the current track"
-        )
-
-    def _accept_trusted_seed(self, seed_position: np.ndarray) -> None:
-        self.last_seed_position = seed_position.copy()
-        self.last_seed_at = time.monotonic()
-        self.last_seed_accepted_at = self.last_seed_at
-
-        if self.track is None:
-            if self.acquisition_state == "waiting":
-                self.acquisition_state = "initializing"
-                self.acquisition_started_at = time.monotonic()
-            return
-        if self.track.state == "lost":
-            self._begin_reacquisition(seed_position)
-            return
-
-        distance = float(np.linalg.norm(seed_position - self.track.position))
-        if distance <= self.settings.seed_correction_radius:
-            self.seed_mismatch_hits = 0
-            self._clear_seed_handoff()
-            self.track.position += self.settings.seed_correction_gain * (
-                seed_position - self.track.position
-            )
-            return
-
-        self.seed_mismatch_hits += 1
-        if self.seed_mismatch_hits >= self.settings.seed_override_count:
-            self._begin_seed_handoff()
-
-    def _update_seed_handoff(
-        self, clusters: list[Cluster], stamp_seconds: float
-    ) -> bool:
-        """Confirm a seed-associated replacement without dropping the track."""
-        if self.handoff_started_at is None or self.track is None:
-            return False
-
-        trusted_seed = self._fresh_trusted_seed()
-        if trusted_seed is None:
-            if time.monotonic() - self.handoff_started_at > (
-                self.settings.initialization_timeout_seconds
-            ):
-                self.seed_mismatch_hits = 0
-                self._clear_seed_handoff()
-            return False
-
-        detections = person_detections(
-            clusters,
-            trusted_seed,
-            self.settings.initial_search_radius,
-            self.settings.single_leg_width,
-            self.settings.min_leg_pair_distance,
-            self.settings.leg_pair_distance,
-            self.settings.partial_cluster_radius,
-            self.settings.min_cluster_points,
-        )
-        selected = self._best_detection(detections, trusted_seed)
-        if selected is None:
-            self.handoff_position = None
-            self.handoff_velocity = np.zeros(2, dtype=float)
-            self.handoff_stamp_seconds = None
-            self.handoff_hits = 0
-            return False
-
-        if (
-            self.handoff_position is None
-            or np.linalg.norm(selected.position - self.handoff_position)
-            > self.settings.initialization_match_radius
-        ):
-            self.handoff_position = selected.position.copy()
-            self.handoff_velocity = np.zeros(2, dtype=float)
-            self.handoff_stamp_seconds = stamp_seconds
-            self.handoff_hits = 1
-            return False
-
-        dt = stamp_seconds - float(self.handoff_stamp_seconds)
-        if math.isfinite(dt) and dt > 0.0:
-            measured_velocity = (
-                selected.position - self.handoff_position
-            ) / dt
-            self.handoff_velocity += 0.25 * (
-                measured_velocity - self.handoff_velocity
-            )
-            speed = float(np.linalg.norm(self.handoff_velocity))
-            if speed > self.settings.max_person_speed:
-                self.handoff_velocity *= self.settings.max_person_speed / speed
-
-        self.handoff_position = selected.position.copy()
-        self.handoff_stamp_seconds = stamp_seconds
-        self.handoff_hits += 1
-        if self.handoff_hits < self.settings.confirmation_scans:
-            return False
-
-        self.track = PersonTrack(
-            position=self.handoff_position.copy(),
-            velocity=self.handoff_velocity.copy(),
-            stamp_seconds=stamp_seconds,
-            last_hit_at=time.monotonic(),
-            max_prediction_seconds=self.settings.max_prediction_seconds,
-        )
-        self.seed_mismatch_hits = 0
-        self.acquisition_state = "tracking"
-        self.acquisition_started_at = None
-        self._clear_seed_handoff()
-        self.get_logger().info("Confirmed handoff to seed-associated lidar track")
-        return True
-
-    def _try_initialization(
-        self, clusters: list[Cluster], stamp_seconds: float
+    def _publish_tracking(
+        self,
+        stamp,
+        clusters: list[Cluster],
+        tof_position,
+        visual_context,
     ) -> None:
-        trusted_seed = self._fresh_trusted_seed()
-        if trusted_seed is None:
-            self.last_detections = []
-            self.pending_position = None
-            self.pending_hits = 0
-            self._check_acquisition_timeout()
-            return
-
-        detections = person_detections(
-            clusters,
-            trusted_seed,
-            self.settings.initial_search_radius,
-            self.settings.single_leg_width,
-            self.settings.min_leg_pair_distance,
-            self.settings.leg_pair_distance,
-            self.settings.partial_cluster_radius,
-            self.settings.min_cluster_points,
+        camera_view = (
+            visual_context.camera_view if visual_context is not None else None
         )
-        self.last_detections = detections
-        selected = self._best_detection(detections, trusted_seed)
-        if selected is None:
-            self.pending_position = None
-            self.pending_hits = 0
-            self._check_acquisition_timeout()
-            return
-
-        if self.acquisition_state == "lost":
-            self.acquisition_state = "reacquiring"
-            self.acquisition_started_at = time.monotonic()
-
-        if (
-            self.pending_position is None
-            or np.linalg.norm(selected.position - self.pending_position)
-            > self.settings.initialization_match_radius
-        ):
-            self.pending_position = selected.position.copy()
-            self.pending_hits = 1
-            return
-
-        self.pending_position = (
-            self.pending_position * self.pending_hits + selected.position
-        ) / (self.pending_hits + 1)
-        self.pending_hits += 1
-        if self.pending_hits < self.settings.confirmation_scans:
-            self._check_acquisition_timeout()
-            return
-
-        self.track = PersonTrack(
-            position=self.pending_position.copy(),
-            velocity=np.zeros(2),
-            stamp_seconds=stamp_seconds,
-            last_hit_at=time.monotonic(),
-            max_prediction_seconds=self.settings.max_prediction_seconds,
+        visual_constraint = (
+            visual_context.constraint if visual_context is not None else None
         )
-        self.pending_position = None
-        self.pending_hits = 0
-        self.seed_mismatch_hits = 0
-        self.acquisition_state = "tracking"
-        self.acquisition_started_at = None
-        self.get_logger().info("Initialized lidar person track")
-
-    def _check_acquisition_timeout(self) -> None:
-        if self.acquisition_started_at is None:
-            return
-        if time.monotonic() - self.acquisition_started_at <= (
-            self.settings.initialization_timeout_seconds
-        ):
-            return
-        self.acquisition_state = "lost"
-        self.acquisition_started_at = None
-        self.pending_position = None
-        self.pending_hits = 0
-
-    def _update_track(
-        self, clusters: list[Cluster], stamp_seconds: float
-    ) -> None:
-        predicted, _ = self.track.predict(stamp_seconds)
-        missed_for = time.monotonic() - self.track.last_hit_at
-        search_radius = self.settings.tracking_search_radius + min(
-            self.settings.recovery_search_limit,
-            missed_for * self.settings.recovery_search_growth,
-        )
-
-        detections = person_detections(
-            clusters,
-            predicted,
-            search_radius,
-            self.settings.single_leg_width,
-            self.settings.min_leg_pair_distance,
-            self.settings.leg_pair_distance,
-            self.settings.partial_cluster_radius,
-            self.settings.min_cluster_points,
-        )
-        self.last_detections = detections
-        trusted_seed = self._fresh_trusted_seed()
-        if self.seed_mismatch_hits > 0:
-            # A conflicting seed is evaluated by the parallel handoff guard;
-            # it must not pull the still-valid active association sideways.
-            trusted_seed = None
-        selected = self._best_detection(
-            detections,
-            predicted,
-            trusted_seed=trusted_seed,
-            seed_weight=self.settings.seed_association_weight,
-        )
-
-        if selected is not None:
-            reliability = DETECTION_MODELS[selected.kind].reliability
-            self.track.update(
-                selected.position,
-                stamp_seconds,
-                self.settings.lidar_position_gain * reliability,
-                self.settings.lidar_velocity_gain * reliability,
-                self.settings.max_person_speed,
-            )
-            return
-
-        self.track.position = predicted
-        self.track.velocity *= self.settings.coast_velocity_retention
-        self.track.stamp_seconds = stamp_seconds
-
-        if missed_for <= self.settings.coast_seconds:
-            self.track.state = "coasting"
-        elif missed_for <= self.settings.lost_seconds:
-            self.track.state = "recovering"
-        else:
-            if self.track.state != "lost":
-                self.get_logger().info(
-                    "Lidar person track lost; waiting for a new stable ToF seed"
-                )
-            self.track.state = "lost"
-            self.acquisition_state = "lost"
-            self.acquisition_started_at = None
-
-    def _publish(self, stamp, clusters: list[Cluster]) -> None:
-        if self.track is not None and self.track.state != "lost":
+        if self.state.track is not None and self.state.published_state in {
+            "seeded",
+            "tracking",
+            "recovering",
+        }:
             pose = PoseStamped()
             pose.header.frame_id = self.tracking_frame
             pose.header.stamp = stamp
-            pose.pose.position.x = float(self.track.position[0])
-            pose.pose.position.y = float(self.track.position[1])
-            speed = float(np.linalg.norm(self.track.velocity))
-            if speed > 0.05:
-                yaw = math.atan2(self.track.velocity[1], self.track.velocity[0])
-                pose.pose.orientation.z = math.sin(yaw * 0.5)
-                pose.pose.orientation.w = math.cos(yaw * 0.5)
+            pose.pose.position.x = float(self.state.track.position[0])
+            pose.pose.position.y = float(self.state.track.position[1])
+            pose.pose.orientation.w = 1.0
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    "map", self.tracking_frame, Time()
+                )
+                pose_map = tf2_geometry_msgs.do_transform_pose_stamped(
+                    pose, transform
+                )
+            except TransformException as error:
+                self.get_logger().warning(
+                    f"Cannot publish /person_pose in map: {error}",
+                    throttle_duration_sec=2.0,
+                )
             else:
-                pose.pose.orientation.w = 1.0
-            self.pose_publisher.publish(pose)
+                pose_map.header.stamp = self.get_clock().now().to_msg()
+                self.pose_publisher.publish(pose_map)
 
-        published_state = (
-            self.track.state
-            if self.track is not None and self.track.state != "lost"
-            else self.acquisition_state
+        observation = (
+            visual_context.observation if visual_context is not None else None
         )
         status = {
-            "state": published_state,
+            "state": self.state.published_state,
             "seed_accepted_age_seconds": (
-                max(0.0, time.monotonic() - self.last_seed_accepted_at)
-                if self.last_seed_accepted_at is not None else None
+                time.monotonic() - self.tof_position_at
+                if self.tof_position_at is not None else None
             ),
-            "candidate_count": len(self.last_detections),
-            "initialization_hits": self.pending_hits,
-            "seed_mismatch_hits": self.seed_mismatch_hits,
-            "handoff_hits": self.handoff_hits,
+            "candidate_count": len(self.state.last_detections),
+            "cluster_count": len(clusters),
+            "leg_cluster_count": len(self.state.leg_clusters),
+            "clear_leg_cluster_count": sum(
+                id(cluster) in self.state.clear_cluster_ids
+                for cluster in self.state.leg_clusters
+            ),
+            "anchor_owned_leg_cluster_count": sum(
+                id(cluster) in self.state.stationary_cluster_ids
+                for cluster in self.state.leg_clusters
+            ),
+            "near_anchor_leg_cluster_count": sum(
+                id(cluster) in self.state.near_anchor_cluster_ids
+                for cluster in self.state.leg_clusters
+            ),
+            "selected_leg_cluster_count": len(
+                self.state.selected_clusters
+            ),
+            "stationary_anchor_count": len(
+                self.state.anchor_map.anchors
+            ),
+            "confirmed_stationary_anchor_count": sum(
+                anchor.observations
+                >= self.settings.stationary_confirm_scans
+                for anchor in self.state.anchor_map.anchors
+            ),
+            "frozen_stationary_anchor_count": sum(
+                anchor.frozen for anchor in self.state.anchor_map.anchors
+            ),
+            "seed_mismatch_hits": self.state.seed_mismatch_hits,
+            "filtered_beam_count": self.last_filtered_beam_count,
+            "target_observation_kind": (
+                self.state.track.observation_kind
+                if self.state.track is not None else None
+            ),
+            "search_radius": self.state.active_search_radius,
+            "search_center": (
+                self.state.active_search_center.tolist()
+                if self.state.active_search_center is not None else None
+            ),
+            "search_fallback_center": (
+                self.state.active_fallback_center.tolist()
+                if self.state.active_fallback_center is not None else None
+            ),
+            "search_phase": self.state.search_phase,
+            "search_expanded": self.state.search_expanded,
+            "camera_view_active": observation is not None,
+            "visual_bearing_active": (
+                observation is not None and observation.person_visible
+            ),
+            "visual_search_direction": self.state.visual_search_direction,
+            "last_visual_base_bearing_rad": (
+                self.state.last_visual_base_bearing_rad
+            ),
+            "last_visual_camera_bearing_rad": (
+                self.state.last_visual_camera_bearing_rad
+            ),
         }
-        status_message = String()
-        status_message.data = json.dumps(status, separators=(",", ":"))
-        self.status_publisher.publish(status_message)
-        self.marker_publisher.publish(self._markers(stamp, clusters))
-
-    def _markers(self, stamp, clusters: list[Cluster]) -> MarkerArray:
-        markers = MarkerArray()
-        clear = Marker()
-        clear.action = Marker.DELETEALL
-        markers.markers.append(clear)
-
-        lifetime = DurationMsg(sec=0, nanosec=300_000_000)
-
-        centers = Marker()
-        centers.header.frame_id = self.tracking_frame
-        centers.header.stamp = stamp
-        centers.ns = "lidar_clusters"
-        centers.id = 0
-        centers.type = Marker.SPHERE_LIST
-        centers.action = Marker.ADD
-        centers.scale.x = centers.scale.y = centers.scale.z = 0.05
-        centers.color.r = centers.color.g = centers.color.b = 0.65
-        centers.color.a = 0.65
-        centers.lifetime = lifetime
-        centers.points = [
-            Point(x=float(c.center[0]), y=float(c.center[1]), z=0.08)
-            for c in clusters
-        ]
-        markers.markers.append(centers)
-
-        candidates = Marker()
-        candidates.header = centers.header
-        candidates.ns = "person_candidates"
-        candidates.id = 1
-        candidates.type = Marker.SPHERE_LIST
-        candidates.action = Marker.ADD
-        candidates.scale.x = candidates.scale.y = candidates.scale.z = 0.10
-        candidates.color.b = 1.0
-        candidates.color.g = 0.8
-        candidates.color.a = 0.9
-        candidates.lifetime = lifetime
-        candidates.points = [
-            Point(x=float(d.position[0]), y=float(d.position[1]), z=0.12)
-            for d in self.last_detections
-        ]
-        markers.markers.append(candidates)
-
-        trusted_seed = self._fresh_trusted_seed()
-        if trusted_seed is not None:
-            seed = Marker()
-            seed.header = centers.header
-            seed.ns = "tof_seed"
-            seed.id = 2
-            seed.type = Marker.SPHERE
-            seed.action = Marker.ADD
-            seed.pose.position.x = float(trusted_seed[0])
-            seed.pose.position.y = float(trusted_seed[1])
-            seed.pose.position.z = 0.18
-            seed.pose.orientation.w = 1.0
-            seed.scale.x = seed.scale.y = seed.scale.z = 0.16
-            seed.color.r = seed.color.g = 1.0
-            seed.color.a = 0.95
-            markers.markers.append(seed)
-
-        if self.track is not None:
-            tracked = Marker()
-            tracked.header = centers.header
-            tracked.ns = "tracked_person"
-            tracked.id = 3
-            tracked.type = Marker.CYLINDER
-            tracked.action = Marker.ADD
-            tracked.pose.position.x = float(self.track.position[0])
-            tracked.pose.position.y = float(self.track.position[1])
-            tracked.pose.position.z = 0.5
-            tracked.pose.orientation.w = 1.0
-            tracked.scale.x = tracked.scale.y = 0.30
-            tracked.scale.z = 1.0
-            if self.track.state == "tracking":
-                tracked.color.g = 1.0
-            elif self.track.state in {"coasting", "recovering"}:
-                tracked.color.r = 1.0
-                tracked.color.g = 0.55
-            else:
-                tracked.color.r = 1.0
-            tracked.color.a = 0.75
-            markers.markers.append(tracked)
-
-            label = Marker()
-            label.header = centers.header
-            label.ns = "tracked_person_label"
-            label.id = 4
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
-            label.pose.position.x = float(self.track.position[0])
-            label.pose.position.y = float(self.track.position[1])
-            label.pose.position.z = 1.2
-            label.pose.orientation.w = 1.0
-            label.scale.z = 0.18
-            label.color.r = label.color.g = label.color.b = 1.0
-            label.color.a = 1.0
-            label.text = f"person: {self.track.state}"
-            markers.markers.append(label)
-
-        return markers
+        self.status_publisher.publish(
+            String(data=json.dumps(status, separators=(",", ":")))
+        )
+        self.marker_publisher.publish(
+            self.renderer.markers(
+                stamp,
+                clusters,
+                self.state,
+                tof_position,
+                camera_view,
+                visual_constraint,
+            )
+        )
+        self.person_marker_publisher.publish(
+            self.renderer.person_markers(stamp, self.state)
+        )
 
     def destroy_node(self):
         self.zmq_running = False
@@ -921,11 +473,14 @@ class PersonLidarTracker(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PersonLidarTracker()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

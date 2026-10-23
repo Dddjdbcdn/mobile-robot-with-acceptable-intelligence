@@ -32,9 +32,8 @@ from services.vision.groundingdino_service import GroundingDINOService
 from services.vision.csrt_tracker import CSRTTrackingManager
 from services.vision.hand_landmark_service import HandLandmarkService
 from services.vision.person_reid_service import PersonReIDService
+from services.vision.person_tracking_service import PersonTrackingService
 from services.vision.yolo_service import YoloService
-
-from actions.tracking.person_identity_tracker import PersonIdentityTracker
 
 from cognition.manager.cognition_manager import CognitionManager
 from cognition.sequence.follow_person_executor import FollowPersonExecutor
@@ -69,7 +68,6 @@ TOOLS_PATHS = [
     SMALL_BRAIN_ROOT / "tools" / "action_tools.json",
     SMALL_BRAIN_ROOT / "tools" / "stop_tools.json",
 ]
-
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     print("Error: OPENAI_API_KEY environment variable is not set.")
@@ -336,6 +334,7 @@ def build_system_prompt(identity, memory, tool_routing=None):
 async def main():
     print("\n🤖 DJ STARTING TO CONNECT")
     cognitive_manager = None
+    person_tracking = None
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
@@ -390,18 +389,6 @@ async def main():
     )
     yolo = YoloService(camera=camera)
     hand_landmarks = HandLandmarkService(camera)
-    person_reid = PersonReIDService(
-        device=os.environ.get("PERSON_REID_DEVICE", "GPU"),
-        cache_dir=SMALL_BRAIN_ROOT / "__pycache__" / ".ov_cache_reid",
-    )
-    person_identity_tracker = PersonIdentityTracker(
-        person_reid,
-        profile_path=SMALL_BRAIN_ROOT / "results" / "person_reid" /
-        "follow_target" / "profile.json",
-        artifact_directory=SMALL_BRAIN_ROOT / "results" / "person_reid" /
-        "follow_target" / "images",
-    )
-
     grounding_dino.start_background()
     yolo.start_background()
 
@@ -431,6 +418,15 @@ async def main():
 
             response_manager = ResponseManager(ws=ws, app=app)
 
+            person_reid = PersonReIDService(
+                device=os.environ.get("PERSON_REID_DEVICE", "GPU"),
+                cache_dir=SMALL_BRAIN_ROOT / "__pycache__" / ".ov_cache_reid",
+            )
+            person_tracking = PersonTrackingService(
+                yolo,
+                person_reid,
+            )
+
             track_action = TrackingService(
                 csrt_tracker=csrt_tracker,
                 grounding_dino=grounding_dino,
@@ -438,7 +434,7 @@ async def main():
                 camera=camera,
                 zmq_pub_socket=zmq_pub_socket,
                 person_tracker_pub_socket=person_tracker_pub_socket,
-                person_identity_tracker=person_identity_tracker,
+                person_tracking_service=person_tracking,
                 send_robot_command=send_robot_command,
             )
             move_camera_action = MoveCameraAction(
@@ -446,11 +442,13 @@ async def main():
                 send_robot_command=send_robot_command,
                 tracking=track_action,
             )
+            track_action.set_move_camera_action(move_camera_action)
             search_action = SearchAction(
                 ws=ws,
                 send_robot_command=send_robot_command,
                 camera=camera,
                 move_camera_action=move_camera_action,
+                yolo=yolo,
             )
             navigation_action = NavigationAction(send_robot_command)
             see_action = SeeAction(
@@ -549,13 +547,17 @@ async def main():
                     yolo,
                     track_action,
                     hand_gesture_interface,
-                ), hand_gesture_interface.run(yolo), wait_for_dino(),
+                    person_tracking,
+                ), person_tracking.run(), hand_gesture_interface.run(yolo),
+                wait_for_dino(),
                 wait_for_yolo())
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed by server.")
     except Exception as e:
         print(f"Error: {e}")
     finally:
+        if person_tracking is not None:
+            await person_tracking.close()
         if cognitive_manager is not None:
             await cognitive_manager.shutdown()
         print("\nCleaning up audio hardware...")

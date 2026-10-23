@@ -148,7 +148,10 @@ def decision_instruction(result):
         return (
             "Report the navigation reason briefly. Do not substitute blind motion. "
             "Retry only if new sensor evidence or user guidance materially changes "
-            "the situation."
+            "the situation. If the user explicitly asks to try again, immediately "
+            "call the same navigation action again. Before that new tool result, do "
+            "not claim or imply that the environment was rechecked, became safe, or "
+            "otherwise changed."
         )
     if isinstance(result, ActionResult) and result.action_type == "find_target":
         if result.status != "succeeded":

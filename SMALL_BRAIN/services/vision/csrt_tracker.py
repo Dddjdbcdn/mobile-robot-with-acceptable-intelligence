@@ -65,7 +65,7 @@ def create_csrttracker():
 
     # Optimization and loss detection
     params.admm_iterations = 3
-    params.psr_threshold = 0.05
+    params.psr_threshold = 0.08
 
     # Segmentation
     params.histogram_bins = 16

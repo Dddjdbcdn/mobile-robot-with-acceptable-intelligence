@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from pathlib import Path
 import time
 
@@ -16,16 +15,14 @@ class HandGestureInterface:
     MONITOR_HZ = 15.0
     STATUS_MAX_AGE_SECONDS = 1.0
     IDLE_WELCOME_CONFIRM_FRAMES = 10
-    TRACKING_STOP_CONFIRM_FRAMES = 5
-    TRACKING_ENROLL_CONFIRM_FRAMES = 5
-    MOVEMENT_STOP_CONFIRM_FRAMES = 10
+    TRACKING_STOP_CONFIRM_FRAMES = 10
+    TRACKING_DIRECTION_CONFIRM_FRAMES = 5
+    MOVEMENT_STOP_CONFIRM_FRAMES = 5
     MODIFIER_CONFIRM_FRAMES = 3
-    COMMAND_CONFIRM_FRAMES = 2
+    COMMAND_CONFIRM_FRAMES = 3
     COMMAND_TIMEOUT_FRAMES = 45
     MISS_TOLERANCE = 3
     WELCOME_PERSON_MIN_CONFIDENCE = 0.50
-    WELCOME_WRIST_MIN_CONFIDENCE = 0.50
-    WELCOME_PALM_WRIST_MAX_DISTANCE = 0.18
 
     def __init__(self, hand_landmarks):
         self.hand_landmarks = hand_landmarks
@@ -47,16 +44,11 @@ class HandGestureInterface:
             self.TRACKING_STOP_CONFIRM_FRAMES,
             miss_tolerance=self.MISS_TOLERANCE,
         )
-        self._tracking_ok = FrameConfirmation(
-            "ok",
-            self.TRACKING_ENROLL_CONFIRM_FRAMES,
-            miss_tolerance=self.MISS_TOLERANCE,
-        )
         self._tracking_direction_confirmations = {
             name:
             FrameConfirmation(
                 name,
-                self.COMMAND_CONFIRM_FRAMES,
+                self.TRACKING_DIRECTION_CONFIRM_FRAMES,
                 miss_tolerance=self.MISS_TOLERANCE,
             )
             for name in ("thumb_left", "thumb_right")
@@ -117,15 +109,17 @@ class HandGestureInterface:
             return None
         return dict(status)
 
-    def _reset_sequence(self):
+    def _reset_command_sequence(self):
         self._armed_gesture = None
         self._armed_frames_remaining = 0
         for confirmation in self._modifier_confirmations.values():
             confirmation.reset()
         for confirmation in self._command_confirmations.values():
             confirmation.reset()
+
+    def _reset_sequence(self):
+        self._reset_command_sequence()
         self._tracking_thumb_up.reset()
-        self._tracking_ok.reset()
         for confirmation in self._tracking_direction_confirmations.values():
             confirmation.reset()
 
@@ -204,26 +198,22 @@ class HandGestureInterface:
                 continue
             try:
                 person_confidence = float(person.get("confidence") or 0.0)
-                wrist = (person.get("keypoints") or {})["right_wrist"]
-                wrist_confidence = float((person.get("keypoint_confidences")
-                                          or {}).get(
-                                              "right_wrist",
-                                              wrist.get("confidence") or 0.0,
-                                          ))
-                distance = math.hypot(
-                    float(palm_center[0]) - float(wrist["normalized_x"]),
-                    float(palm_center[1]) - float(wrist["normalized_y"]),
-                )
+                bbox = person["bbox"]
+                palm_x = float(palm_center[0])
+                palm_y = float(palm_center[1])
+                x1 = float(bbox["normalized_x1"])
+                y1 = float(bbox["normalized_y1"])
+                x2 = float(bbox["normalized_x2"])
+                y2 = float(bbox["normalized_y2"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if (person_confidence < cls.WELCOME_PERSON_MIN_CONFIDENCE
-                    or wrist_confidence < cls.WELCOME_WRIST_MIN_CONFIDENCE
-                    or distance > cls.WELCOME_PALM_WRIST_MAX_DISTANCE):
+            if (person_confidence < cls.WELCOME_PERSON_MIN_CONFIDENCE or
+                    not (x1 <= palm_x <= x2 and y1 <= palm_y <= y2)):
                 continue
-            candidates.append((distance, -person_confidence, person))
+            candidates.append((person_confidence, person))
         if not candidates:
             return None
-        return min(candidates, key=lambda item: item[:2])[2]
+        return max(candidates, key=lambda item: item[0])[1]
 
     async def _observe_gesture(self, gesture, palm_center, detections=None):
         context = await self._dispatch("observe_gesture",
@@ -231,9 +221,18 @@ class HandGestureInterface:
                                        palm_center=palm_center)
         tracking_person = bool(context.get("tracking_person"))
         if context.get("movement_active"):
-            self._reset_sequence()
-            if self._movement_push.observe(gesture):
-                await self._dispatch("stop_movement", reason="HAND_PUSH")
+            if context.get("mode") == "following":
+                self._reset_command_sequence()
+                # During follow, push is a continuous hand-position override
+                # that asks the base to restore its normal standoff.
+                self._movement_push.reset()
+                if self._tracking_thumb_up.observe(gesture):
+                    await self._dispatch("stop_follow", reason="HAND_THUMB_UP")
+                    self._reset_all()
+            else:
+                self._reset_sequence()
+                if self._movement_push.observe(gesture):
+                    await self._dispatch("stop_movement", reason="HAND_PUSH")
             return context
 
         self._movement_push.reset()
@@ -257,11 +256,6 @@ class HandGestureInterface:
         if self._tracking_thumb_up.observe(gesture):
             await self._dispatch("stop_watching_target",
                                  reason="HAND_THUMB_UP")
-            self._reset_all()
-            return context
-
-        if self._tracking_ok.observe(gesture):
-            await self._dispatch("enroll_person")
             self._reset_all()
             return context
 

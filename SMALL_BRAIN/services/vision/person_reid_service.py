@@ -25,9 +25,9 @@ DEFAULT_MODEL_PATH = (
 class PersonReIDService:
     """Extract normalized appearance embeddings from BGR person crops.
 
-    The service deliberately knows nothing about track IDs, enrollment views,
-    or match thresholds. Those policies live in
-    ``actions.tracking.person_embeddings``.
+    The service deliberately knows nothing about track IDs or association
+    policy. Scene-local identity and appearance memory live in
+    ``services.vision.person_tracking_service``.
 
     ``inference_callable`` is primarily a lightweight test/benchmark seam. It
     receives the preprocessed NCHW tensor and must return one embedding.

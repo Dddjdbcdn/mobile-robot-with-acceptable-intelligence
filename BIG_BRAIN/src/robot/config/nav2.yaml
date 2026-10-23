@@ -9,7 +9,7 @@ bt_navigator:
     action_server_result_timeout: 900.0
     goal_updater_topic: /goal_update
     navigators: ["navigate_to_pose", "navigate_through_poses"]
-    default_nav_to_pose_bt_xml: $(find-pkg-share robot)/config/behavior_dj.xml
+    default_nav_to_pose_bt_xml: $(find-pkg-share robot)/config/behavior_navigate.xml
     navigate_to_pose:
       plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
       enable_groot_monitoring: true
@@ -35,7 +35,7 @@ controller_server:
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugins: ["progress_checker"]
-    goal_checker_plugins: ["general_goal_checker"]
+    goal_checker_plugins: ["general_goal_checker", "approach_goal_checker"]
     controller_plugins: ["FollowPath"]
     use_realtime_priority: false
     enable_stamped_cmd_vel: true
@@ -49,32 +49,37 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.30
+    approach_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.10
-      yaw_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.25
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
-      time_steps: 56
+      time_steps: 30
       model_dt: 0.1
       batch_size: 1000
       ax_max: 2.0
       ax_min: -2.0
-      ay_max: 2.0
-      ay_min: -2.0
-      az_max: 2.5
+      ay_max: 0.0
+      ay_min: -0.0
+      az_max: 3.0
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
       vx_max: 0.5
-      vx_min: -0.35
+      vx_min: -0.2
       vy_max: 0.5
-      wz_max: 1.9
+      wz_max: 2.5
       iteration_count: 1
       prune_distance: 1.7
-      transform_tolerance: 0.1
+      transform_tolerance: 0.5
       temperature: 0.3
       gamma: 0.015
       motion_model: "DiffDrive"
-      visualize: true
+      visualize: false
       regenerate_noises: true
       TrajectoryVisualizer:
         trajectory_step: 5
@@ -117,7 +122,7 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 10.0
+        cost_weight: 8.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 10
         threshold_to_consider: 0.4
@@ -137,7 +142,6 @@ controller_server:
         threshold_to_consider: 0.5
         max_angle_to_furthest: 0.5
         mode: 0
-
   
 local_costmap:
   local_costmap:
@@ -146,6 +150,7 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_footprint
+      transform_tolerance: 0.5
       rolling_window: true
       width: 3
       height: 3
@@ -186,7 +191,7 @@ local_costmap:
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
         enabled: true
-        voxel_decay: 15.0
+        voxel_decay: 2.0
         decay_model: 0
         voxel_size: 0.05
         track_unknown_space: true
@@ -196,7 +201,7 @@ local_costmap:
         combination_method: 1
         origin_z: 0.0
         publish_voxel_map: true
-        transform_tolerance: 0.2
+        transform_tolerance: 0.5
         mapping_mode: false
         map_save_duration: 60.0
         observation_sources: "depth_mark depth_clear"
@@ -231,9 +236,6 @@ local_costmap:
         enabled: True
         topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
-      # Independent mark-only storage prevents scan/depth clearing rays from
-      # removing cliff cells. Detector points are shifted 0.10 m toward the
-      # robot for safety. The layer is cleared only by resetting this costmap.
       cliff_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -256,16 +258,15 @@ global_costmap:
       always_send_full_costmap: True
       update_frequency: 1.0
       publish_frequency: 1.0
-      global_frame: odom
-      rolling_window: true
-      width: 10
-      height: 10
+      global_frame: map
+      rolling_window: false
       robot_base_frame: base_footprint
+      transform_tolerance: 0.5
       footprint: "[ [0.12, 0.12], [0.12, -0.12], [-0.12, -0.12], [-0.12, 0.12] ]"
       footprint_padding: 0.05
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["range_layer","obstacle_layer","stvl_layer","cliff_layer","inflation_layer"]
+      plugins: ["static_layer","range_layer","obstacle_layer","stvl_layer","cliff_layer","inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -294,7 +295,7 @@ global_costmap:
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
         enabled: true
-        voxel_decay: 35.0
+        voxel_decay: 3.0
         decay_model: 0
         voxel_size: 0.05
         track_unknown_space: true
@@ -304,7 +305,7 @@ global_costmap:
         combination_method: 1
         origin_z: 0.0
         publish_voxel_map: true
-        transform_tolerance: 0.2
+        transform_tolerance: 0.5
         mapping_mode: false
         map_save_duration: 60.0
         observation_sources: "depth_mark depth_clear"
@@ -323,19 +324,6 @@ global_costmap:
           voxel_min_points: 0
           clear_after_reading: true
           model_type: 0
-
-        # ros2 topic hz /camera/depth/points
-        # ros2 topic hz /local_costmap/voxel_grid
-        # ros2 topic hz /local_costmap/costmap
-        # ros2 topic echo /local_costmap/voxel_grid --once --field width
-        # ros2 lifecycle get /controller_server
-        # ros2 topic info /camera/depth/points --verbose
-        # ros2 service call /global_costmap/depth_mark/toggle_enabled std_srvs/srv/SetBool "{data: false}"
-        # ros2 service call /global_costmap/depth_clear/toggle_enabled std_srvs/srv/SetBool "{data: false}"
-        # ros2 service call /global_costmap/depth_mark/toggle_enabled std_srvs/srv/SetBool "{data: true}"
-        # ros2 service call /global_costmap/depth_clear/toggle_enabled std_srvs/srv/SetBool "{data: true}"
-        # ros2 service call /global_costmap/clear_entirely_global_costmap nav2_msgs/srv/ClearEntireCostmap "{}"
-
         depth_clear:
           data_type: PointCloud2
           topic: /camera/depth/points
@@ -349,8 +337,10 @@ global_costmap:
           model_type: 0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
-        enabled: True
+        enabled: False
+        map_topic: /map
         map_subscribe_transient_local: true
+        subscribe_to_updates: false
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: True
@@ -361,9 +351,6 @@ global_costmap:
         enabled: True
         topics: ["/range/left","/range/right"]
         clear_on_max_reading: true
-      # Independent mark-only storage prevents scan/depth clearing rays from
-      # removing cliff cells. Detector points are shifted 0.10 m toward the
-      # robot for safety. The layer is cleared only by resetting this costmap.
       cliff_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -419,46 +406,12 @@ behavior_server:
     local_frame: odom
     global_frame: map
     robot_base_frame: base_footprint
-    transform_tolerance: 0.1
+    transform_tolerance: 0.5
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    min_rotational_vel: 0.3
+    rotational_acc_lim: 1.5
     enable_stamped_cmd_vel: true
-
-waypoint_follower:
-  ros__parameters:
-    loop_rate: 20
-    stop_on_failure: false
-    action_server_result_timeout: 900.0
-    waypoint_task_executor_plugin: "wait_at_waypoint"
-    wait_at_waypoint:
-      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
-      enabled: True
-      waypoint_pause_duration: 200
-
-route_server:
-  ros__parameters:
-    # The graph_filepath does not need to be specified since it going to be set by defaults in launch.
-    # If you'd rather set it in the yaml, remove the default "graph" value in the launch file(s).
-    # file & provide full path to map below. If graph config or launch default is provided, it is used
-    # graph_filepath: $(find-pkg-share nav2_route)/graphs/aws_graph.geojson
-    boundary_radius_to_achieve_node: 1.0
-    radius_to_achieve_node: 2.0
-    smooth_corners: true
-    operations: ["AdjustSpeedLimit", "ReroutingService", "CollisionMonitor"]
-    ReroutingService:
-      plugin: "nav2_route::ReroutingService"
-    AdjustSpeedLimit:
-      plugin: "nav2_route::AdjustSpeedLimit"
-    CollisionMonitor:
-      plugin: "nav2_route::CollisionMonitor"
-      max_collision_dist: 3.0
-    edge_cost_functions: ["DistanceScorer", "CostmapScorer"]
-    DistanceScorer:
-      plugin: "nav2_route::DistanceScorer"
-    CostmapScorer:
-      plugin: "nav2_route::CostmapScorer"
 
 velocity_smoother:
   ros__parameters:
@@ -485,7 +438,7 @@ collision_monitor:
     state_topic: "collision_monitor_state"
     transform_tolerance: 0.5
     source_timeout: 5.0
-    base_shift_correction: True
+    base_shift_correction: False
     stop_pub_timeout: 2.0
     polygons: ["VelocityPolygonStop"]
     VelocityPolygonStop:
@@ -493,7 +446,7 @@ collision_monitor:
       action_type: "stop"
       min_points: 6
       visualize: True
-      enabled: True
+      enabled: False
       polygon_pub_topic: "velocity_polygon_stop"
       velocity_polygons: ["rotation", "translation_forward", "translation_backward", "stopped"]
       holonomic: false
@@ -546,20 +499,21 @@ docking_server:
     undock_linear_tolerance: 0.05
     undock_angular_tolerance: 0.1
     max_retries: 3
-    base_frame: "base_footprint"
+    base_frame: "base_link"
     fixed_frame: "odom"
-    dock_backwards: false
     dock_prestaging_tolerance: 0.5
+    introspection_mode: "disabled"
 
     # Types of docks
-    dock_plugins: ['simple_charging_dock']
+    dock_plugins: ["simple_charging_dock"]
     simple_charging_dock:
-      plugin: 'opennav_docking::SimpleChargingDock'
+      plugin: "opennav_docking::SimpleChargingDock"
       docking_threshold: 0.05
       staging_x_offset: -0.7
       use_external_detection_pose: true
       use_battery_status: false # true
       use_stall_detection: false # true
+      dock_direction: "forward"
 
       external_detection_timeout: 1.0
       external_detection_translation_x: -0.18
@@ -585,21 +539,7 @@ docking_server:
       use_collision_detection: true
       costmap_topic: "local_costmap/costmap_raw"
       footprint_topic: "local_costmap/published_footprint"
-      transform_tolerance: 0.1
+      transform_tolerance: 0.5
       projection_time: 5.0
       simulation_step: 0.1
       dock_collision_threshold: 0.3
-
-loopback_simulator:
-  ros__parameters:
-    base_frame_id: "base_footprint"
-    odom_frame_id: "odom"
-    map_frame_id: "map"
-    scan_frame_id: "base_scan"  # tb4_loopback_simulator.launch.py remaps to 'rplidar_link'
-    update_duration: 0.02
-    scan_range_min: 0.05
-    scan_range_max: 30.0
-    scan_angle_min: -3.1415
-    scan_angle_max: 3.1415
-    scan_angle_increment: 0.02617
-    scan_use_inf: true

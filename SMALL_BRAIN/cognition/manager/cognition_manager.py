@@ -187,10 +187,12 @@ class CognitionManager:
 
     async def handle_hand_command(self, command, data):
         if command == "observe_gesture":
+            gesture = data.get("gesture")
+            following = self.follow_person_executor.active
             if self.action_state.person_tracking:
-                seed = self.track_action.stable_seeds.get(
-                    target="hand", session_id=self.track_action.action_id)
-                if data.get("gesture") in {"welcome", "push"}:
+                seed = None
+                hand_gesture = gesture in {"welcome", "push"}
+                if hand_gesture:
                     palm_center = data.get("palm_center")
                     if palm_center is not None:
                         self.track_action.set_visual_target_override(
@@ -199,8 +201,22 @@ class CognitionManager:
                         target="hand", session_id=self.track_action.action_id)
                     if isinstance(latest_seed, dict):
                         seed = latest_seed
+                elif following:
+                    # A follow override is valid only while welcome or push is
+                    # observed. Resume lidar following immediately otherwise.
+                    self.track_action.clear_visual_target_override()
+                    await self.follow_person_executor.clear_hand_target_override()
+                    self._hand_location = None
                 if isinstance(seed, dict):
                     self._hand_location = dict(seed)
+                    if following:
+                        await self.follow_person_executor.update_hand_target_override(
+                            seed, gesture=gesture)
+            elif following and gesture not in {"welcome", "push"}:
+                # Camera tracking can briefly restart during continuous
+                # following; do not leave an old hand goal active meanwhile.
+                await self.follow_person_executor.clear_hand_target_override()
+                self._hand_location = None
 
             approach_started_at = self._hand_approach_started_at
             if (self.navigation_action.active
@@ -213,9 +229,6 @@ class CognitionManager:
                     and self.navigation_action.mode == "approach"):
                 self._hand_approach_started_at = None
             return self.action_state.gesture_context
-
-        if command == "enroll_person":
-            return await self.track_action.enroll_tracked_person()
 
         arguments = dict(data)
         if command == "approach_target":
@@ -260,19 +273,27 @@ class CognitionManager:
         while self._running:
             event = await self.events.get()
 
-            if isinstance(event, ToolRequest):
-                await self.handle_tool_request(event)
-            elif isinstance(event, ActionExecuted):
-                await self.handle_action_executed(event)
-            elif isinstance(event, ActionLifecycleFinished):
-                await self.handle_lifecycle_finished(event)
-            elif isinstance(event, WorldState):
-                payload = self._pending_world_state or event.payload
-                self._pending_world_state = None
-                self._world_state_queued = False
-                await self._handle_world_state(payload)
-            elif isinstance(event, Shutdown):
-                self._running = False
+            try:
+                if isinstance(event, ToolRequest):
+                    await self.handle_tool_request(event)
+                elif isinstance(event, ActionExecuted):
+                    await self.handle_action_executed(event)
+                elif isinstance(event, ActionLifecycleFinished):
+                    await self.handle_lifecycle_finished(event)
+                elif isinstance(event, WorldState):
+                    payload = self._pending_world_state or event.payload
+                    self._pending_world_state = None
+                    self._world_state_queued = False
+                    await self._handle_world_state(payload)
+                elif isinstance(event, Shutdown):
+                    self._running = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(
+                    f"[Cognition event error: {type(event).__name__}] "
+                    f"{type(error).__name__}: {error}"
+                )
 
     async def handle_tool_request(self, request):
         if request.function_name in self.OOB_TOOLS:
@@ -366,24 +387,13 @@ class CognitionManager:
             return result
 
         if name == "watch_target":
-            direct_tracking = await self.track_action.start_tracking(
-                target=args.get("target"),
-                action_id=request.action_id,
-                allow_grounding_dino=False,
-                continuous_person_reacquisition=(
-                    args.get("target_kind") == "person"),
-                initial_person=args.get("initial_person"),
-            )
-            if direct_tracking.status == "running":
-                return self._watch_started_result(direct_tracking)
             return await self.find_target_executor.start(
                 target=args.get("target"),
                 action_id=request.action_id,
                 target_kind=args.get("target_kind"),
                 approach=False,
-                continuous_person_reacquisition=(
-                    args.get("target_kind") == "person"),
                 action_type="watch_target",
+                initial_person=args.get("initial_person"),
             )
 
         if name == "find_target":
@@ -431,7 +441,6 @@ class CognitionManager:
                 action_id=f"{action_id}:acquire-person",
                 target_kind="person",
                 approach=False,
-                continuous_person_reacquisition=True,
                 action_type="explicit_navigation",
             )
             if acquired.status == "running":
@@ -505,24 +514,6 @@ class CognitionManager:
         ):
             if action.active:
                 await action.stop(reason)
-
-    @staticmethod
-    def _watch_started_result(result):
-        """Report acquisition as complete while shared tracking keeps running."""
-        if not isinstance(result, ActionResult):
-            return result
-        data = dict(result.data or {})
-        data["watch_source"] = "direct_tracker"
-        return ActionResult(
-            action_id=result.action_id,
-            action_type="watch_target",
-            status="succeeded",
-            target=result.target,
-            outcome="watching_target",
-            reason_code=result.reason_code,
-            retryable=result.retryable,
-            data=data,
-        )
 
     async def execute_stop(self, request):
         if request.function_name == "stop_movement":
@@ -659,7 +650,10 @@ class CognitionManager:
                 request.arguments,
                 request.response_metadata,
             )
-        asyncio.create_task(assessment, name=request.function_name)
+        self.search_action.create_assessment_task(
+            assessment,
+            name=request.function_name,
+        )
 
     async def handle_action_executed(self, event):
         if event.request is not self.current_action:
@@ -868,7 +862,6 @@ class CognitionManager:
                 action_id=action_id,
                 target_kind="person",
                 approach=False,
-                continuous_person_reacquisition=True,
             )
             if result.status == "running":
                 result = await asyncio.shield(

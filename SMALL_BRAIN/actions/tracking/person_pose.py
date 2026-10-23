@@ -90,15 +90,6 @@ def person_keypoint(person, name):
             "normalized_x": (shoulder_x + hip_x) * 0.5,
             "normalized_y": (shoulder_y + hip_y) * 0.5,
         }
-
-    bbox = person.get("bbox") or {}
-    center_x = bbox.get("normalized_center_x")
-    center_y = bbox.get("normalized_center_y")
-    if isinstance(center_x, (int, float)) and isinstance(center_y, (int, float)):
-        return {
-            "normalized_x": float(center_x),
-            "normalized_y": float(center_y),
-        }
     return None
 
 

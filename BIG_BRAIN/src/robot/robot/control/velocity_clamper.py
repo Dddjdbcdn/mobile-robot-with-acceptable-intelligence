@@ -61,7 +61,7 @@ class VelocityClamper(Node):
     def __init__(self) -> None:
         super().__init__('velocity_clamper')
 
-        self.publisher = self.create_publisher(TwistStamped, 'cmd_vel_conditioned', 10)
+        self.publisher = self.create_publisher(TwistStamped, 'diff_drive_controller/cmd_vel', 10)
         self.subscription = self.create_subscription(TwistStamped, 'cmd_vel_smoothed', self.command_callback, 10)
 
     def command_callback(self, message: TwistStamped) -> None:

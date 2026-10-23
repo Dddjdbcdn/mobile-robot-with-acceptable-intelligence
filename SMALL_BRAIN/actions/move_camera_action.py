@@ -95,6 +95,7 @@ class MoveCameraAction:
         target=None,
         current_pan=None,
         current_tilt=None,
+        stop_tracking=True,
     ):
         if self._lock.locked():
             return ActionResult(
@@ -141,7 +142,11 @@ class MoveCameraAction:
                     data=result_data,
                 )
 
-            if self.tracking is not None and self.tracking.active:
+            if (
+                stop_tracking
+                and self.tracking is not None
+                and self.tracking.active
+            ):
                 await self.tracking.stop(
                     reason_code="EXPLICIT_CAMERA_MOVEMENT",
                     status="cancelled",
@@ -211,3 +216,25 @@ class MoveCameraAction:
                     retryable=True,
                     data={"error": f"{type(error).__name__}: {error}"},
                 )
+
+    async def reset_pan(self, *, action_id, stop_tracking=True):
+        """Center camera pan while preserving the current tilt angle."""
+        camera_state = robot_state.get("camera") or {}
+        state_initialized = float(camera_state.get("timestamp") or 0.0) > 0.0
+        current_pan = (
+            camera_state.get("pan_angle", PAN_POSITION_ANGLE["center"])
+            if state_initialized else PAN_POSITION_ANGLE["center"]
+        )
+        current_tilt = (
+            camera_state.get("tilt_angle", TILT_POSITION_ANGLE["center"])
+            if state_initialized else TILT_POSITION_ANGLE["center"]
+        )
+        return await self.move_to_angles(
+            PAN_POSITION_ANGLE["center"],
+            current_tilt,
+            action_id=action_id,
+            target="center_pan",
+            current_pan=current_pan,
+            current_tilt=current_tilt,
+            stop_tracking=stop_tracking,
+        )

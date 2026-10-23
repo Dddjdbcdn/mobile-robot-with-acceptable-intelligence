@@ -3,39 +3,44 @@ import unittest
 from cognition.hand.interface import HandGestureInterface
 
 
-def person(wrist_x, confidence=0.8, wrist_confidence=0.8):
+def person(x1=0.25, y1=0.2, x2=0.75, y2=0.9, confidence=0.8):
     return {
         "class": "person",
         "confidence": confidence,
-        "bbox": {},
-        "keypoints": {
-            "right_wrist": {
-                "normalized_x": wrist_x,
-                "normalized_y": 0.5,
-                "confidence": wrist_confidence,
-            },
-        },
-        "keypoint_confidences": {
-            "right_wrist": wrist_confidence,
+        "bbox": {
+            "normalized_x1": x1,
+            "normalized_y1": y1,
+            "normalized_x2": x2,
+            "normalized_y2": y2,
         },
     }
 
 
 class WelcomePersonBindingTests(unittest.TestCase):
 
-    def test_selects_box_whose_wrist_is_closest_to_confirmed_palm(self):
-        high_confidence_duplicate = person(0.62, confidence=0.95)
-        palm_aligned = person(0.51, confidence=0.70)
+    def test_selects_visible_person_box_containing_confirmed_palm(self):
+        outside = person(0.55, 0.2, 0.9, 0.9, confidence=0.95)
+        containing = person(0.2, 0.2, 0.6, 0.9, confidence=0.70)
 
         selected = HandGestureInterface._welcome_person_candidate(
-            [high_confidence_duplicate, palm_aligned],
+            [outside, containing],
             (0.50, 0.50),
         )
 
-        self.assertIs(selected, palm_aligned)
+        self.assertIs(selected, containing)
+
+    def test_does_not_require_wrist_keypoint(self):
+        visible_person = person()
+
+        selected = HandGestureInterface._welcome_person_candidate(
+            [visible_person],
+            (0.50, 0.50),
+        )
+
+        self.assertIs(selected, visible_person)
 
     def test_rejects_low_confidence_person(self):
-        low_confidence = person(0.50, confidence=0.40)
+        low_confidence = person(confidence=0.40)
 
         selected = HandGestureInterface._welcome_person_candidate(
             [low_confidence],
@@ -49,7 +54,7 @@ class WelcomePersonDispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_welcome_passes_exact_person_to_tracking(self):
         interface = HandGestureInterface(hand_landmarks=None)
-        target = person(0.50)
+        target = person()
         calls = []
 
         async def dispatch(command, data):
@@ -70,23 +75,48 @@ class WelcomePersonDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(watch_calls), 1)
         self.assertIs(watch_calls[0][1]["initial_person"], target)
 
-    async def test_confirmed_ok_requests_person_enrollment_while_tracking(
-            self):
+    async def test_push_does_not_stop_an_active_follow(self):
         interface = HandGestureInterface(hand_landmarks=None)
         calls = []
 
         async def dispatch(command, data):
             calls.append((command, data))
             if command == "observe_gesture":
-                return {"tracking_person": True, "movement_active": False}
+                return {
+                    "tracking_person": True,
+                    "movement_active": True,
+                    "mode": "following",
+                }
             return True
 
         interface.set_dispatcher(dispatch)
-        for _ in range(interface.TRACKING_ENROLL_CONFIRM_FRAMES):
-            await interface._observe_gesture("ok", (0.50, 0.50), [])
+        for _ in range(interface.MOVEMENT_STOP_CONFIRM_FRAMES + 1):
+            await interface._observe_gesture("push", (0.50, 0.50), [])
 
-        enroll_calls = [item for item in calls if item[0] == "enroll_person"]
-        self.assertEqual(len(enroll_calls), 1)
+        stop_calls = [item for item in calls if item[0] == "stop_movement"]
+        self.assertEqual(stop_calls, [])
+
+    async def test_confirmed_thumb_up_stops_an_active_follow(self):
+        interface = HandGestureInterface(hand_landmarks=None)
+        calls = []
+
+        async def dispatch(command, data):
+            calls.append((command, data))
+            if command == "observe_gesture":
+                return {
+                    "tracking_person": True,
+                    "movement_active": True,
+                    "mode": "following",
+                }
+            return True
+
+        interface.set_dispatcher(dispatch)
+        for _ in range(interface.TRACKING_STOP_CONFIRM_FRAMES):
+            await interface._observe_gesture("thumb_up", (0.50, 0.50), [])
+
+        stop_calls = [item for item in calls if item[0] == "stop_follow"]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(stop_calls[0][1]["reason"], "HAND_THUMB_UP")
 
 
 if __name__ == "__main__":

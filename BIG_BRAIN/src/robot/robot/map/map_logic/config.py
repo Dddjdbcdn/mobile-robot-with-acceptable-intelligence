@@ -13,7 +13,7 @@ class LogicConfig:
     # ToF approach ray
     approach_ray_radius_m: float = 0.15
     approach_obstacle_min_cells: int = 3
-    approach_obstacle_standoff_m: float = 0.25
+    approach_obstacle_standoff_m: float = 0.5
     approach_cost_threshold: int = 253
 
     # Local navigation
@@ -21,7 +21,7 @@ class LogicConfig:
     nudge_distance_m: float = 0.5
     candidate_min_separation_m: float = 0.30
     local_person_pose_max_age_seconds: float = 1.0
-    person_navigation_max_distance_m: float = 0.50
+    person_navigation_max_radius_m: float = 0.5
     person_navigation_angle_step_deg: float = 5.0
 
     # Frontiers

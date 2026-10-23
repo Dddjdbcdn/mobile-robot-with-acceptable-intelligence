@@ -33,6 +33,13 @@
   <xacro:property name="camera_z_offset" value="0.028"/> <!-- Camera upper to Base upper -->
   <xacro:property name="camera_x_offset" value="0.023"/> <!-- Camera front to Base front -->
 
+  <!-- RGB Camera -->
+  <xacro:property name="rgb_camera_length" value="0.01"/>
+  <xacro:property name="rgb_camera_width" value="0.036"/>
+  <xacro:property name="rgb_camera_height" value="0.036"/>
+  <xacro:property name="rgb_camera_z_offset" value="0.05"/> <!-- Camera center to Base upper -->
+  <xacro:property name="rgb_camera_x_offset" value="0.01"/> <!-- Camera center to Base front -->
+
   <!-- TOF -->
   <xacro:property name="tof_length" value="0.003"/>
   <xacro:property name="tof_width" value="0.015"/>

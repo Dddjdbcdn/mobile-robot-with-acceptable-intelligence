@@ -1,42 +1,67 @@
-<root BTCPP_format="4" main_tree_to_execute="MainTree">
-  <BehaviorTree ID="MainTree">
+<root BTCPP_format="4" main_tree_to_execute="NavigateToPoseWReplanningAndRecovery">
+  <BehaviorTree ID="NavigateToPoseWReplanningAndRecovery">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
-        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        
+        <ProgressCheckerSelector
+          selected_progress_checker="{selected_progress_checker}"
+          default_progress_checker="progress_checker" topic_name="progress_checker_selector"/>
+        <GoalCheckerSelector
+          selected_goal_checker="{selected_goal_checker}"
+          default_goal_checker="general_goal_checker" topic_name="goal_checker_selector"/>
+        <ControllerSelector
+          selected_controller="{selected_controller}"
+          default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector
+          selected_planner="{selected_planner}"
+          default_planner="GridBased" topic_name="planner_selector"/>
         <RateController hz="1.0">
-          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+          <RecoveryNode number_of_retries="3" name="ComputePathToPose">
             <Fallback name="FallbackComputePathToPose">
               <ReactiveSequence name="CheckIfNewPathNeeded">
+                <Inverter>
+                  <PathExpiringTimer seconds="5.0" path="{path}"/>
+                </Inverter>
                 <Inverter>
                   <GlobalUpdatedGoal/>
                 </Inverter>
                 <IsPathValid path="{path}"/>
               </ReactiveSequence>
-              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}"
+                error_code_id="{compute_path_error_code}"/>
             </Fallback>
-            <Sequence>
-              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
-              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-            </Sequence>
+            <Fallback name="RecoverComputePathToPose">
+              <Sequence name="WaitForPlannerTf-Navigate">
+                <AreErrorCodesPresent error_code="{compute_path_error_code}"
+                  error_codes_to_check="202"/>
+                <Wait wait_duration="0.25"/>
+              </Sequence>
+              <Sequence>
+                <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+                <ClearEntireCostmap name="ClearGlobalCostmap-Context"
+                  service_name="global_costmap/clear_entirely_global_costmap"/>
+              </Sequence>
+            </Fallback>
           </RecoveryNode>
         </RateController>
-
-        <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath 
-            path="{path}" 
-            controller_id="{selected_controller}"
-            goal_checker_id="general_goal_checker"
-            error_code_id="{follow_path_error_code}" />
-          <Sequence>
-            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
-          </Sequence>
+        <RecoveryNode number_of_retries="3" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}"
+            goal_checker_id="{selected_goal_checker}"
+            progress_checker_id="{selected_progress_checker}"
+            error_code_id="{follow_path_error_code}"/>
+          <Fallback name="RecoverFollowPath">
+            <Sequence name="WaitForControllerTf-Navigate">
+              <AreErrorCodesPresent error_code="{follow_path_error_code}"
+                error_codes_to_check="102"/>
+              <Wait wait_duration="0.25"/>
+            </Sequence>
+            <Sequence>
+              <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-Context"
+                service_name="local_costmap/clear_entirely_local_costmap"/>
+            </Sequence>
+          </Fallback>
         </RecoveryNode>
-
       </PipelineSequence>
-
       <Sequence>
         <Fallback>
           <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
@@ -45,12 +70,14 @@
         <ReactiveFallback name="RecoveryFallback">
           <GoalUpdated/>
           <RoundRobin name="RecoveryActions">
-            <Sequence name="BackupRecovery">
-              <ClearEntireCostmap name="ClearLocalBeforeBackup" service_name="local_costmap/clear_entirely_local_costmap"/>
-              <BlindBackUp backup_dist="0.1" backup_speed="0.15"/>
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree"
+                service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree"
+                service_name="global_costmap/clear_entirely_global_costmap"/>
             </Sequence>
-            <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
-            <Wait wait_duration="5.0"/>
+            <BackUp backup_dist="0.30" backup_speed="0.15"
+              error_code_id="{backup_error_code}"/>
           </RoundRobin>
         </ReactiveFallback>
       </Sequence>

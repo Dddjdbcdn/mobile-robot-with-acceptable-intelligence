@@ -1,9 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <limits>
 #include <string>
-#include <vector>
 
 #include "behaviortree_cpp/action_node.h"
 #include "rclcpp/rclcpp.hpp"
@@ -53,7 +51,8 @@ public:
 
       if (failure_count >= patience) {
 
-        geometry_msgs::msg::PoseStamped new_goal = chooseGoalBySampling(goal,robot_pose,0.1,1.0,0.1,M_PI/4);
+        geometry_msgs::msg::PoseStamped new_goal = chooseGoalTowardRobot(
+          goal, robot_pose, 0.1);
         setOutput("goal", new_goal); 
         goal_pub->publish(new_goal);
 
@@ -76,14 +75,6 @@ private:
     bool success{false};
     double cost{0.0};
   };
-  struct Candidate
-  {
-    geometry_msgs::msg::PoseStamped world_pose;
-    double radius;
-    double angle;
-    bool is_valid{true};
-  };
-
   rclcpp::Node::SharedPtr node;
   rclcpp::Client<nav2_msgs::srv::GetCost>::SharedPtr global_cost_client;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub;
@@ -117,94 +108,50 @@ private:
     return result;
   }
 
-  std::vector<Candidate> generateCandidates(
-  const geometry_msgs::msg::PoseStamped & robot_pose,const geometry_msgs::msg::PoseStamped & goal,
-  const double min_radius,const double max_radius,const double radius_step, const double angle_range)
-  {
-    const double angle_step = M_PI/12;
-
-    std::vector<Candidate> candidates;
-
-    const double goal_to_robot_heading = std::atan2(
-      robot_pose.pose.position.y - goal.pose.position.y,
-      robot_pose.pose.position.x - goal.pose.position.x);
-
-    for (double r = min_radius; r <= max_radius + 1e-6; r += radius_step) {
-      for (double a = -angle_range; a <= angle_range + 1e-6; a += angle_step)
-      {
-        Candidate candidate;
-      
-        candidate.radius = r;
-        candidate.angle = a;
-
-        const double angle = goal_to_robot_heading + a;
-
-        candidate.world_pose.pose.position.x = goal.pose.position.x + r * std::cos(angle);
-        candidate.world_pose.pose.position.y = goal.pose.position.y + r * std::sin(angle);
-
-        const double candidate_yaw = std::atan2(
-          goal.pose.position.y - candidate.world_pose.pose.position.y,
-          goal.pose.position.x - candidate.world_pose.pose.position.x);
-
-        tf2::Quaternion q;
-        q.setRPY(0.0, 0.0, candidate_yaw);
-        q.normalize();
-
-        candidate.world_pose.pose.orientation = tf2::toMsg(q);
-        candidate.world_pose.header = goal.header;
-        candidate.world_pose.header.stamp = node->now();
-
-        auto candidate_cost = sampleCost(global_cost_client,candidate.world_pose,true);
-        if (!candidate_cost.success || candidate_cost.cost >= 253.0) candidate.is_valid = false;
-
-        candidates.push_back(candidate);
-      }
-    }
-
-    return candidates;
-  }
-
-  geometry_msgs::msg::PoseStamped chooseGoalBySampling(
-    const geometry_msgs::msg::PoseStamped & goal_,
+  geometry_msgs::msg::PoseStamped chooseGoalTowardRobot(
+    const geometry_msgs::msg::PoseStamped & goal,
     const geometry_msgs::msg::PoseStamped & robot_pose,
-    const double min_radius,const double max_radius,const double radius_step,const double angle_range)
+    const double distance_step)
   {
-    Candidate best_candidate;
-    double shortest_distance =std::numeric_limits<double>::infinity();
-    bool found = false;
+    const double dx = robot_pose.pose.position.x - goal.pose.position.x;
+    const double dy = robot_pose.pose.position.y - goal.pose.position.y;
+    const double robot_distance_to_goal = std::hypot(dx, dy);
+    if (robot_distance_to_goal <= 1e-6 || distance_step <= 0.0) {
+      return robot_pose;
+    }
 
-    double robot_distance_to_goal = std::hypot(
-      robot_pose.pose.position.x - goal_.pose.position.x,
-      robot_pose.pose.position.y - goal_.pose.position.y);
-  
-    const auto candidates = generateCandidates(robot_pose, goal_,min_radius,max_radius,radius_step,angle_range);
+    const double goal_to_robot_heading = std::atan2(dy, dx);
+    for (double offset = distance_step;
+      offset <= robot_distance_to_goal + 1e-6;
+      offset += distance_step)
+    {
+      const double sampled_offset = std::min(offset, robot_distance_to_goal);
+      geometry_msgs::msg::PoseStamped candidate;
+      candidate.header = goal.header;
+      candidate.header.stamp = node->now();
+      candidate.pose.position.x =
+        goal.pose.position.x + sampled_offset * std::cos(goal_to_robot_heading);
+      candidate.pose.position.y =
+        goal.pose.position.y + sampled_offset * std::sin(goal_to_robot_heading);
 
-    for (const auto & candidate : candidates) {
+      const double candidate_yaw = std::atan2(
+        goal.pose.position.y - candidate.pose.position.y,
+        goal.pose.position.x - candidate.pose.position.x);
+      tf2::Quaternion q;
+      q.setRPY(0.0, 0.0, candidate_yaw);
+      q.normalize();
+      candidate.pose.orientation = tf2::toMsg(q);
 
-      if (!candidate.is_valid) continue;
-      if (candidate.radius > robot_distance_to_goal) continue;
-    
-      if (candidate.radius < shortest_distance || 
-        (candidate.radius == shortest_distance && fabs(candidate.angle) < fabs(best_candidate.angle))) {
-        shortest_distance = candidate.radius;
-        best_candidate = candidate;
-        if (!found) found = true;
+      const auto candidate_cost = sampleCost(global_cost_client, candidate, true);
+      if (candidate_cost.success && candidate_cost.cost < 253.0) {
+        return candidate;
       }
     }
 
-    if (!found) {
-      if (max_radius >= robot_distance_to_goal - 1e-6) {
-        RCLCPP_WARN(node->get_logger(),"[DJGoalValidator]: 🥊 No valid replacement goal found between original goal and robot");
-        return robot_pose;
-      }
-
-      RCLCPP_WARN(node->get_logger(), "[DJGoalValidator]: 🥊 No valid new goal within radius %f! Widening the search", max_radius);
-      const double next_max_radius = std::min(max_radius * 2.0, robot_distance_to_goal);
-
-      return chooseGoalBySampling(goal_,robot_pose,max_radius,next_max_radius,radius_step,angle_range);
-    }
-
-    return best_candidate.world_pose;
+    RCLCPP_WARN(
+      node->get_logger(),
+      "[DJGoalValidator]: 🥊 No valid replacement goal found between original goal and robot");
+    return robot_pose;
   }
 };
 }

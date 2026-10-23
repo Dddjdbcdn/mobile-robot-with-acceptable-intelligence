@@ -36,7 +36,7 @@ class CameraServo:
         self.command_lock = threading.Lock()
         self._latency_window_started = time.monotonic()
         self._latency_samples = []
-        self.Kp = 0.15
+        self.Kp = 0.30
         self.deadband_degrees = 0.5
         self.max_step_degrees = 4.0
 
@@ -69,6 +69,19 @@ class CameraServo:
                 "pan_error": self.last_visual_pan_error,
                 "observed_at": self.last_visual_at,
             }
+
+    def clear_tracking_observation(self):
+        """Require a new visual observation before tracking can resume."""
+        with self.command_lock:
+            self.delta_pan_angle = 0.0
+            self.delta_tilt_angle = 0.0
+            self.tracking_sequence = None
+            self.tracking_timing = None
+            self.tracking_received_at = None
+            self.tracking_received_unix_ns = None
+            self.last_visual_pan_error = 0.0
+            self.last_visual_at = None
+            self.last_applied_tracking_sequence = None
 
     @staticmethod
     def _latency_percentile(values, fraction):

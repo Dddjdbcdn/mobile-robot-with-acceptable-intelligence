@@ -1,5 +1,4 @@
 #include "motor.h"
-#include "microros_app.h"
 #include "main.h"
 #include "tim.h"
 #include <stdint.h>
@@ -69,7 +68,7 @@ float previous_error_R = 0.0;
 #define SERVO_MAX_TILT_ANGLE      120.0f
 
 // Tune this single value to change pan/tilt slew speed.
-#define SERVO_SPEED_DEG_PER_SEC    120.0f
+#define SERVO_SPEED_DEG_PER_SEC    360.0f
 
 volatile float servo_pan_angle = 95.0f;
 volatile float servo_tilt_angle = 90.0f;

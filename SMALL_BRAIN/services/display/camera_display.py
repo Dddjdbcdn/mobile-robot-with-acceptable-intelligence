@@ -345,13 +345,63 @@ def _draw_pose_body_mask(frame, projected, bbox):
     cv2.addWeighted(overlay, 0.22, frame, 0.78, 0.0, dst=frame)
 
 
-def draw_yolo_overlay(frame, yolo, track_action):
-    detections = yolo.detections
+def _detection_box_iou(first, second):
+    """Return pixel-box IoU for display-only track annotation matching."""
+    try:
+        first_box = first["bbox"]
+        second_box = second["bbox"]
+        first_values = tuple(float(first_box[key]) for key in (
+            "x1", "y1", "x2", "y2"))
+        second_values = tuple(float(second_box[key]) for key in (
+            "x1", "y1", "x2", "y2"))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    left = max(first_values[0], second_values[0])
+    top = max(first_values[1], second_values[1])
+    right = min(first_values[2], second_values[2])
+    bottom = min(first_values[3], second_values[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = max(0.0, first_values[2] - first_values[0]) * max(
+        0.0, first_values[3] - first_values[1])
+    second_area = max(0.0, second_values[2] - second_values[0]) * max(
+        0.0, second_values[3] - second_values[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _raw_detection_tracks(detections, person_tracks):
+    """Keep every raw YOLO box and attach IDs only to matching tracks."""
+    detection_tracks = [[detection, None] for detection in detections]
+    available = set(range(len(detection_tracks)))
+    for track in person_tracks or ():
+        if (track.state != "confirmed" or not track.visible
+                or track.person is None):
+            continue
+        candidates = [
+            (_detection_box_iou(track.person, detection_tracks[index][0]),
+             index)
+            for index in available
+            if detection_tracks[index][0].get("class") == "person"
+        ]
+        if not candidates:
+            continue
+        overlap, index = max(candidates)
+        if overlap <= 0.0:
+            continue
+        detection_tracks[index][1] = track
+        available.remove(index)
+    return [(detection, track) for detection, track in detection_tracks]
+
+
+def draw_yolo_overlay(frame, yolo, track_action, person_tracks=None):
+    detection_tracks = _raw_detection_tracks(
+        yolo.detections,
+        person_tracks,
+    )
+    detections = [detection for detection, _ in detection_tracks]
 
     if not detections:
         return frame
-
-    expected_person = track_action.expected_person_detection(detections)
 
     frame_h, frame_w = frame.shape[:2]
 
@@ -359,7 +409,8 @@ def draw_yolo_overlay(frame, yolo, track_action):
     scale_x = frame_w / 640.0
     scale_y = frame_h / 360.0
 
-    box_color = (255, 0, 0)          # blue
+    tracked_box_color = (255, 0, 0)  # blue
+    other_person_box_color = (0, 0, 255)  # red
     skeleton_color = (0, 255, 255)  # yellow
     point_color = (0, 255, 0)       # green
 
@@ -386,7 +437,7 @@ def draw_yolo_overlay(frame, yolo, track_action):
         ("right_knee", "right_ankle"),
     ]
 
-    for detection in detections:
+    for detection, person_track in detection_tracks:
         bbox = detection.get("bbox")
 
         if not bbox:
@@ -394,6 +445,18 @@ def draw_yolo_overlay(frame, yolo, track_action):
 
         class_name = detection.get("class", "unknown")
         confidence = detection.get("confidence", 0.0)
+        tracked_person_id = getattr(track_action, "tracked_person_id", None)
+        is_tracked_person = (
+            class_name == "person"
+            and person_track is not None
+            and tracked_person_id is not None
+            and person_track.track_id == tracked_person_id
+        )
+        box_color = (
+            tracked_box_color
+            if is_tracked_person
+            else other_person_box_color
+        )
 
         # ------------------------------------------------
         # Bounding box
@@ -425,42 +488,101 @@ def draw_yolo_overlay(frame, yolo, track_action):
         # Label
         # ------------------------------------------------
         label = f"{class_name.upper()} {confidence:.2f}"
+        keypoints = detection.get("keypoints") or {}
+        if class_name == "person":
+            has_shoulder = any(name in keypoints for name in (
+                "left_shoulder", "right_shoulder"))
+            has_hip = any(name in keypoints for name in (
+                "left_hip", "right_hip"))
+            label += (
+                f" | KP:{len(keypoints)} "
+                f"S:{int(has_shoulder)} H:{int(has_hip)}"
+            )
+        if person_track is not None:
+            match = person_track.appearance_match_source
+            if person_track.reid_similarity is not None:
+                match += f":{person_track.reid_similarity:.2f}"
+            label += (
+                f" | ID {person_track.track_id} "
+                f"{match} A:{person_track.appearance_samples}"
+            )
+        label_lines = [(label, 0.55, 2)]
+        if (person_track is not None
+                and person_track.association_cost is not None):
+            appearance = (
+                "--"
+                if person_track.appearance_cost is None
+                else f"{person_track.appearance_cost:.2f}"
+            )
+            pose = (
+                "--"
+                if person_track.pose_cost is None
+                else (
+                    f"{person_track.pose_cost:.2f}"
+                    f"{'*' if person_track.pose_cost_is_fallback else ''}"
+                )
+            )
+            cost_label = (
+                f"C{person_track.association_cost:.2f} "
+                f"G{person_track.geometry_cost:.2f} "
+                f"A{appearance} P{pose}"
+            )
+            label_lines.append((cost_label, 0.64, 2))
 
-        (text_w, text_h), _ = cv2.getTextSize(
-            label,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            2,
+        line_metrics = [
+            (*cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale,
+                thickness,
+            ), text, scale, thickness)
+            for text, scale, thickness in label_lines
+        ]
+        padding_x = 5
+        padding_y = 4
+        line_gap = 2
+        panel_width = min(
+            frame_w,
+            max(size[0] for size, _, _, _, _ in line_metrics)
+            + 2 * padding_x,
         )
-
-        label_y = max(y1, text_h + 10)
+        panel_height = (
+            2 * padding_y
+            + sum(size[1] + baseline
+                  for size, baseline, _, _, _ in line_metrics)
+            + line_gap * (len(line_metrics) - 1)
+        )
+        label_y = max(y1, panel_height)
+        label_x = max(0, min(x1, frame_w - panel_width))
+        panel_top = label_y - panel_height
 
         cv2.rectangle(
             frame,
-            (x1, label_y - text_h - 10),
-            (x1 + text_w + 10, label_y),
+            (label_x, panel_top),
+            (label_x + panel_width, label_y),
             box_color,
             -1,
         )
-
-        cv2.putText(
-            frame,
-            label,
-            (x1 + 5, label_y - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        text_y = panel_top + padding_y
+        for size, baseline, text, scale, thickness in line_metrics:
+            text_y += size[1]
+            cv2.putText(
+                frame,
+                text,
+                (label_x + padding_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+            text_y += baseline + line_gap
 
         # ------------------------------------------------
-        # Only persons can have pose skeletons
+        # Every raw person keeps its pose skeleton visible during acquisition.
         # ------------------------------------------------
-        if class_name != "person" or detection is not expected_person:
+        if class_name != "person":
             continue
-
-        keypoints = detection.get("keypoints")
 
         if not keypoints:
             continue
@@ -487,11 +609,12 @@ def draw_yolo_overlay(frame, yolo, track_action):
 
             projected[name] = (px, py)
 
-        _draw_pose_body_mask(
-            frame,
-            projected,
-            (x1, y1, x2, y2),
-        )
+        if is_tracked_person:
+            _draw_pose_body_mask(
+                frame,
+                projected,
+                (x1, y1, x2, y2),
+            )
 
         # ------------------------------------------------
         # Skeleton connections
@@ -599,7 +722,12 @@ def draw_hand_landmark_overlay(frame, hand_interface):
     return frame
 
 
-def draw_tracking_status_overlay(frame, track_action, hand_interface):
+def draw_tracking_status_overlay(
+    frame,
+    track_action,
+    hand_interface,
+    person_tracks=(),
+):
     """Draw the high-value tracking signals as a readable HUD."""
     hand_status = hand_interface.gesture_status() or {}
     seed_target = (
@@ -675,9 +803,18 @@ def draw_tracking_status_overlay(frame, track_action, hand_interface):
         if action_state == "IDLE"
         else (0, 210, 255)
     )
+    visible_tracks = sum(track.visible for track in person_tracks)
+    lost_tracks = sum(not track.visible for track in person_tracks)
+    person_memory_value = (
+        f"{visible_tracks} VISIBLE  |  {lost_tracks} MEMORY"
+    )
+    person_memory_color = (
+        (70, 240, 70) if visible_tracks else (170, 170, 170)
+    )
 
     rows = [
         ("ACTION", action_value, action_color),
+        ("PERSON IDS", person_memory_value, person_memory_color),
         ("TOF SEED", seed_value, seed_color),
         ("LIDAR SEED", lidar_seed_value, lidar_seed_color),
         ("LIDAR POSE", lidar_pose_value, lidar_pose_color),
@@ -686,7 +823,7 @@ def draw_tracking_status_overlay(frame, track_action, hand_interface):
     width = frame.shape[1]
     scale = max(0.62, min(1.05, width / 1280.0))
     row_height = int(round(43 * scale))
-    panel_width = min(width - 24, int(round(610 * scale)))
+    panel_width = min(width - 24, int(round(760 * scale)))
     panel_height = row_height * len(rows) + int(round(18 * scale))
     x1, y1 = 12, 12
 
@@ -770,8 +907,58 @@ def draw_pipeline_fps_overlay(
     return frame
 
 
+def draw_debug_board_toggle(frame, enabled):
+    """Draw the small always-visible control for the optional debug boards."""
+    label = f"DEBUG {'ON' if enabled else 'OFF'}  [D]"
+    scale = max(0.48, min(0.68, frame.shape[1] / 1900.0))
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+    )
+    padding_x = 10
+    padding_y = 7
+    margin = 12
+    right = frame.shape[1] - margin
+    bottom = frame.shape[0] - margin
+    left = max(0, right - text_width - padding_x * 2)
+    top = max(0, bottom - text_height - baseline - padding_y * 2)
+    color = (70, 240, 70) if enabled else (170, 170, 170)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (left, top), (right, bottom), (5, 5, 5), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+    cv2.rectangle(frame, (left, top), (right, bottom), color, 1, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        label,
+        (left + padding_x, bottom - padding_y - baseline),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+    return left, top, right, bottom
+
+
+def debug_board_toggle_clicked(event, x, y, bounds):
+    """Return whether an OpenCV mouse event activates the debug control."""
+    if event != cv2.EVENT_LBUTTONUP or bounds is None:
+        return False
+    left, top, right, bottom = bounds
+    return left <= x <= right and top <= y <= bottom
+
+
 async def display_camera_loop(
-    camera, csrt_tracker, yolo, track_action, hand_interface
+    camera,
+    csrt_tracker,
+    yolo,
+    track_action,
+    hand_interface,
+    person_tracking_service=None,
 ):
     """Render the complete camera debug view."""
     window_name = "Robot Vision"
@@ -783,6 +970,18 @@ async def display_camera_loop(
     yolo_rate = SequenceFps()
     hand_rate = SequenceFps()
     cpu_usage = CpuUsage()
+    person_tracks = ()
+    debug_control = {
+        "visible": True,
+        "button_bounds": None,
+    }
+
+    def handle_mouse(event, x, y, _flags, _parameter):
+        if debug_board_toggle_clicked(
+                event, x, y, debug_control["button_bounds"]):
+            debug_control["visible"] = not debug_control["visible"]
+
+    cv2.setMouseCallback(window_name, handle_mouse)
 
     while True:
         try:
@@ -795,13 +994,20 @@ async def display_camera_loop(
             hand_fps = hand_rate.observe(
                 hand_status.get("inference_sequence"), now
             )
+
+            if person_tracking_service is not None:
+                _, person_tracks = person_tracking_service.tracking_snapshot()
             display_frame = cv2.flip(snapshot.full_bgr.copy(), 1)
             display_frame = draw_tof_overlay(display_frame)
 
             tracking_update = csrt_tracker.tracking_update
-            if yolo.detections:
+            if yolo.detections or person_tracks:
                 display_frame = draw_yolo_overlay(
-                    display_frame, yolo, track_action
+                    display_frame,
+                    yolo,
+                    track_action,
+                    (person_tracks
+                     if person_tracking_service is not None else None),
                 )
             if tracking_update is not None and tracking_update.success:
                 display_frame = draw_csrt_overlay(
@@ -812,18 +1018,29 @@ async def display_camera_loop(
             display_frame = draw_hand_landmark_overlay(
                 display_frame, hand_interface
             )
-            display_frame = draw_tracking_status_overlay(
-                display_frame, track_action, hand_interface
-            )
-            display_frame = draw_pipeline_fps_overlay(
+            cpu_percent = cpu_usage.sample(now)
+            if debug_control["visible"]:
+                display_frame = draw_tracking_status_overlay(
+                    display_frame,
+                    track_action,
+                    hand_interface,
+                    person_tracks,
+                )
+                display_frame = draw_pipeline_fps_overlay(
+                    display_frame,
+                    camera_fps,
+                    yolo_fps,
+                    hand_fps,
+                    cpu_percent,
+                )
+            debug_control["button_bounds"] = draw_debug_board_toggle(
                 display_frame,
-                camera_fps,
-                yolo_fps,
-                hand_fps,
-                cpu_usage.sample(now),
+                debug_control["visible"],
             )
             cv2.imshow(window_name, display_frame)
-            cv2.waitKey(1)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("d"), ord("D")):
+                debug_control["visible"] = not debug_control["visible"]
 
             now = time.monotonic()
             if (

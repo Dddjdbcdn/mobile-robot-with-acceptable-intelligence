@@ -18,7 +18,6 @@ from actions.move_camera_action import (
     PAN_POSITION_ANGLE,
     TILT_POSITION_ANGLE,
 )
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VISION_OOB_TOOLS_PATH = REPO_ROOT / "tools" / "vision_oob_tools.json"
 
@@ -53,19 +52,30 @@ SEARCH_EFFORT_ROWS = {
     "low": ("downmost",),
     "best_effort": ("center", "upmost", "downmost"),
 }
+PERSON_SEARCH_MIN_CONFIDENCE = 0.60
 
 from actions.action_result import ActionResult
 
 class SearchAction:
-    def __init__(self, ws, send_robot_command, camera, move_camera_action=None):
+    def __init__(
+        self,
+        ws,
+        send_robot_command,
+        camera,
+        move_camera_action=None,
+        yolo=None,
+    ):
         self.ws = ws
         self.send_robot_command = send_robot_command
         self.camera = camera
+        self.yolo = yolo
         self.move_camera_action = move_camera_action or MoveCameraAction(
             camera=camera,
             send_robot_command=send_robot_command,
         )
         self.search_task = None
+        self.person_monitor_task = None
+        self.assessment_tasks: set[asyncio.Task] = set()
         self.action_id = None
 
         self.completion_future = None
@@ -75,11 +85,32 @@ class SearchAction:
         self.last_coverage_frames: list[dict[str, Any]] = []
         self.last_contextual_clue: dict[str, Any] | None = None
         self.last_detection_source: str | None = None
+        self.last_person_detection: dict[str, Any] | None = None
         self.reset_state()
+
+    def create_assessment_task(self, assessment, *, name: str) -> asyncio.Task:
+        """Schedule and retain an out-of-band visual assessment."""
+        task = asyncio.create_task(assessment, name=name)
+        self.assessment_tasks.add(task)
+        task.add_done_callback(self._assessment_task_done)
+        return task
+
+    def _assessment_task_done(self, task: asyncio.Task) -> None:
+        self.assessment_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as error:
+            print(
+                f"[Search assessment error: {task.get_name()}] "
+                f"{type(error).__name__}: {error}"
+            )
 
     def reset_state(self) -> None:
         self.active = False
         self.search_task = None
+        self.person_monitor_task = None
         self.action_id = None
         self.search_id = None
         self.target = None
@@ -99,6 +130,87 @@ class SearchAction:
         self.pending_request_id = None
         self.candidate_context = None
         self.search_mode = "specific"
+        self.person_search = False
+
+    async def _monitor_yolo_person(self) -> None:
+        """Complete person search from raw YOLO without creating an ID."""
+        detection_snapshot = getattr(self.yolo, "detection_snapshot", None)
+        if not callable(detection_snapshot):
+            return
+
+        while self.active and self.person_search:
+            _, detections = detection_snapshot()
+            people = []
+            for person in detections:
+                try:
+                    confidence = float(person.get("confidence") or 0.0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if (
+                    person.get("class") == "person"
+                    and person.get("keypoints")
+                    and person.get("bbox")
+                    and confidence >= PERSON_SEARCH_MIN_CONFIDENCE
+                ):
+                    people.append(person)
+            if people:
+                person = min(
+                    people,
+                    key=lambda candidate: (
+                        abs(float(candidate["bbox"].get(
+                            "normalized_center_x", 0.5)) - 0.5),
+                        -float(candidate.get("confidence") or 0.0),
+                    ),
+                )
+                await self._complete_from_person_detection(person)
+                return
+            await asyncio.sleep(0.05)
+
+    async def _cancel_search_work(self, *, cancel_assessments: bool) -> None:
+        current_task = asyncio.current_task()
+        tasks = [self.search_task, self.person_monitor_task]
+        if cancel_assessments:
+            tasks.extend(self.assessment_tasks)
+        pending = [
+            task for task in tasks
+            if task is not None and task is not current_task and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _complete_from_person_detection(self, person) -> None:
+        if not self.active:
+            return
+        bbox = person.get("bbox") or {}
+        target_position = {
+            "x": float(bbox.get("normalized_center_x", 0.5)),
+            "y": float(bbox.get("normalized_center_y", 0.5)),
+        }
+        frame = {
+            "image_id": "yolo_person",
+            "pan_position": "current",
+            "tilt_position": "current",
+            "pan_angle": float(self.pan_angle),
+            "tilt_angle": float(self.tilt_angle),
+            "robot_pose": self._robot_pose_at_capture(),
+        }
+        self.current_candidate = {
+            "assessment": {
+                "result": "found",
+                "target_position": target_position,
+            },
+            "frame": frame,
+            "sweep_index": int(self.sweep_index),
+        }
+        self.captured_frames.append(frame)
+        self.last_detection_source = "yolo"
+        self.last_person_detection = copy.deepcopy(person)
+        self.pending_request_id = None
+        await self._cancel_search_work(cancel_assessments=True)
+        if self.active:
+            await self.complete_searching("succeeded", "found")
 
     def _assessment_tool(self, *, batch: bool):
         template = ASSESS_BATCH_SEARCH_TOOL if batch else ASSESS_FRAME_SEARCH_TOOL
@@ -391,7 +503,7 @@ class SearchAction:
         }
 
         result = args.get("result")
-        if result == "found":
+        if result == "found" and not self.person_search:
             target_position = get_valid_position(args.get("target_position"))
             if target_position is not None:
                 self.current_candidate = {
@@ -456,7 +568,7 @@ class SearchAction:
             args.get("candidate_image"), self.current_batch_frames
         )
 
-        if result == "found":
+        if result == "found" and not self.person_search:
             target_position = get_valid_position(args.get("target_position"))
             if target_position is not None and frame_validated is not None:
 
@@ -552,6 +664,7 @@ class SearchAction:
         sweep_directions=None,
         candidate_context=None,
         search_mode="specific",
+        person_search=False,
     ):
         if self.active:
             return ActionResult(
@@ -604,11 +717,13 @@ class SearchAction:
         self.last_coverage_frames = []
         self.last_contextual_clue = None
         self.last_detection_source = None
+        self.last_person_detection = None
         self.active = True
         self.action_id = action_id
         self.search_id = action_id
         self.target = normalized_target
         self.search_mode = normalized_mode
+        self.person_search = bool(person_search)
         self.effort = normalized_effort
         self.initial_view_only = initial_view_only is True
         self.candidate_context = (
@@ -637,6 +752,11 @@ class SearchAction:
         self.search_task = asyncio.create_task(
             self._start_frame_assessment()
         )
+        if self.person_search and self.yolo is not None:
+            self.person_monitor_task = asyncio.create_task(
+                self._monitor_yolo_person(),
+                name=f"search-person-monitor-{action_id}",
+            )
 
         return ActionResult(
             action_id=action_id,
@@ -657,20 +777,19 @@ class SearchAction:
     async def stop(self, reason_code="USER_REQUESTED"):
         return await self.stop_searching(reason_code)
 
-    async def stop_searching(self,reason=None):
+    async def stop_searching(self, reason=None):
         if not self.active:
             return
 
         self.pending_request_id = None
-        if self.search_task is not None and not self.search_task.done():
-            self.search_task.cancel()
-        self.search_task = None
+
+        await self._cancel_search_work(cancel_assessments=True)
 
         await self.move_camera_angles(
             PAN_POSITION_ANGLE["center"],
             TILT_POSITION_ANGLE["center"],
         )
-        await self.complete_searching(
+        return await self.complete_searching(
             status="cancelled",
             outcome="search_cancelled",
             reason_code=reason,
@@ -679,6 +798,8 @@ class SearchAction:
     async def complete_searching(self,status,outcome,reason_code=None):
         if not self.active:
             return None
+
+        await self._cancel_search_work(cancel_assessments=False)
 
         action_id = self.action_id
         target = str(self.target)
@@ -728,6 +849,7 @@ class SearchAction:
             "effort": effort,
             "initial_view_only": initial_view_only,
             "detection_source": self.last_detection_source or "vision_assessment",
+            "person_detection": copy.deepcopy(self.last_person_detection),
             "contextual_clue": clue,
         }
 

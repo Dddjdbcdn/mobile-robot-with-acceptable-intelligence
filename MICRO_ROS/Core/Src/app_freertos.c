@@ -65,6 +65,9 @@ volatile uint32_t tof_irq_period_ms = 0;
 volatile uint32_t tof_frame_count = 0;
 volatile uint32_t tof_last_frame_ms = 0;
 volatile uint8_t tof_last_read_status = 0;
+volatile uint32_t tof_start_attempt_count = 0;
+volatile uint32_t tof_read_error_count = 0;
+volatile uint8_t tof_consecutive_read_errors = 0;
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -155,6 +158,7 @@ static bool ToF_Start(void)
     uint8_t is_alive = 0;
     uint8_t status;
 
+    tof_start_attempt_count++;
     tof_alive_status = 0;
     tof_data_ready = 0;
     HAL_GPIO_WritePin(LPN_GPIO_Port, LPN_Pin, GPIO_PIN_RESET);
@@ -183,6 +187,7 @@ static bool ToF_Start(void)
     tof_last_read_status = VL53L7CX_STATUS_OK;
     tof_last_irq_ms = 0;
     tof_last_frame_ms = 0;
+    tof_consecutive_read_errors = 0;
     tof_alive_status = 1;
     return true;
 
@@ -196,7 +201,6 @@ void Hardware_Task(void *argument)
 {
     uint32_t tof_last_retry_ms;
     uint32_t tof_started_ms = 0;
-    uint8_t tof_read_errors = 0;
 
     // --- 1. SENSOR INITIALIZATION PHASE ---
     
@@ -239,11 +243,17 @@ void Hardware_Task(void *argument)
             tof_last_read_status = vl53l7cx_get_ranging_data(&Dev, &Results);
 
             if (tof_last_read_status == VL53L7CX_STATUS_OK) {
-                tof_read_errors = 0;
+                tof_consecutive_read_errors = 0;
                 tof_frame_count++;
                 tof_last_frame_ms = now;
-            } else if (++tof_read_errors >= TOF_MAX_READ_ERRORS) {
-                tof_alive_status = 0;
+            } else {
+                tof_read_error_count++;
+                if (tof_consecutive_read_errors < UINT8_MAX) {
+                    tof_consecutive_read_errors++;
+                }
+                if (tof_consecutive_read_errors >= TOF_MAX_READ_ERRORS) {
+                    tof_alive_status = 0;
+                }
             }
         }
 
@@ -261,7 +271,7 @@ void Hardware_Task(void *argument)
         if (!tof_alive_status &&
             (now - tof_last_retry_ms) >= TOF_RETRY_INTERVAL_MS) {
             tof_last_retry_ms = now;
-            tof_read_errors = 0;
+            tof_consecutive_read_errors = 0;
             if (ToF_Start())
                 tof_started_ms = HAL_GetTick();
         }

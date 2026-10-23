@@ -263,4 +263,32 @@
     <xacro:box_inertia mass="0.01" x="${range_length}" y="${range_width}" z="${range_height}"/>
   </inertial>
 </link>
+
+<!-- ==================== RGB Camera ==================== -->
+
+<joint name="rgb_camera_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="rgb_camera_link"/>
+  <origin xyz="${base_length/2 - rgb_camera_x_offset} 0 ${wheel_radius + wheel_z_offset + base_height + rgb_camera_z_offset}" rpy="0 0 0"/>
+</joint>
+
+<link name='rgb_camera_link'>
+    <visual>
+      <origin xyz="${rgb_camera_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${rgb_camera_length} ${rgb_camera_width} ${rgb_camera_height}"/>
+      </geometry>
+      <material name="green"/>
+    </visual>
+    <collision>
+      <origin xyz="${rgb_camera_length/2} 0 0" rpy="0 0 0"/>
+      <geometry><box size="${rgb_camera_length} ${rgb_camera_width} ${rgb_camera_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="${rgb_camera_length/2} 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <xacro:box_inertia mass="0.01" x="${rgb_camera_length}" y="${rgb_camera_width}" z="${rgb_camera_height}"/>
+    </inertial>
+</link>
+
 </robot>

@@ -33,6 +33,12 @@ def generate_launch_description():
         output='screen',
         arguments=['--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
     )
+    reset_node = Node(
+        package='robot',
+        executable='reset_node.py',
+        output='screen',
+        arguments=['--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
+    )
     system_watchdog = Node(
         package='robot',
         executable='system_watchdog.py',
@@ -46,4 +52,5 @@ def generate_launch_description():
         cliff_detector,
         llm_bridge,
         person_lidar_tracker,
+        reset_node,
     ])
