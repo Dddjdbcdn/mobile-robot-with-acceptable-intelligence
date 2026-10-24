@@ -36,6 +36,17 @@ static uint8_t tf_index = 0;
 static uint32_t range_last_retry_ms[3];
 static const uint8_t vl53l1x_continuous_command[3] = {0xA5, 0x45, 0xEA};
 
+static uint32_t Range_AgeMs(uint32_t now, uint32_t timestamp)
+{
+    if (timestamp == 0U) {
+        return UINT32_MAX;
+    }
+
+    uint32_t elapsed = now - timestamp;
+    /* UART interrupts may update a timestamp after the caller captured now. */
+    return elapsed > (UINT32_MAX / 2U) ? 0U : elapsed;
+}
+
 static void Restart_VL53L1X_UART(UART_HandleTypeDef *huart,
                                  VL53L1X_Receiver *receiver)
 {
@@ -71,15 +82,20 @@ void Range_UART_IT_Init(void)
 
 bool Range_IsFresh(uint8_t index, uint32_t now, uint32_t max_age_ms)
 {
-    return index < 3U && range_measurement_valid[index] != 0U &&
-           range_last_valid_ms[index] != 0U &&
-           (now - range_last_valid_ms[index]) <= max_age_ms;
+    if (index >= 3U || range_measurement_valid[index] == 0U) {
+        return false;
+    }
+
+    return Range_AgeMs(now, range_last_valid_ms[index]) <= max_age_ms;
 }
 
 bool Range_IsResponding(uint8_t index, uint32_t now, uint32_t max_age_ms)
 {
-    return index < 3U && range_last_response_ms[index] != 0U &&
-           (now - range_last_response_ms[index]) <= max_age_ms;
+    if (index >= 3U) {
+        return false;
+    }
+
+    return Range_AgeMs(now, range_last_response_ms[index]) <= max_age_ms;
 }
 
 void Range_Service(uint32_t now)

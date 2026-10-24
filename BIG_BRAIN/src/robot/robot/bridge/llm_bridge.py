@@ -7,6 +7,7 @@ import time
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Range
@@ -43,14 +44,22 @@ class LLMRosBridge(Node):
     def __init__(self):
         super().__init__('llm_ros_bridge')
         self.get_logger().info("Starting DJ-ROS Bridge (Async Mode)...")
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._stop_event = threading.Event()
 
         # ZMQ transport to and from SMALL_BRAIN.
         self.zmq_context = zmq.Context()
         self.rep_socket = self.zmq_context.socket(zmq.REP)
+        self.rep_socket.setsockopt(zmq.LINGER, 0)
+        self.rep_socket.setsockopt(zmq.RCVTIMEO, 200)
         self.rep_socket.bind("tcp://*:5555")
         self.pub_socket = self.zmq_context.socket(zmq.PUB)
+        self.pub_socket.setsockopt(zmq.LINGER, 0)
         self.pub_socket.bind("tcp://*:5556")
         self.sub_socket = self.zmq_context.socket(zmq.SUB)
+        self.sub_socket.setsockopt(zmq.LINGER, 0)
+        self.sub_socket.setsockopt(zmq.RCVTIMEO, 200)
         self.sub_socket.bind("tcp://*:5557")
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.pub_lock = threading.Lock()
@@ -109,16 +118,18 @@ class LLMRosBridge(Node):
         self.track_action_timer.cancel()
 
         # Blocking ZMQ loops run outside the ROS executor.
-        threading.Thread(
+        self.llm_thread = threading.Thread(
             target=self.listen_for_llm,
             name="llm-command-server",
             daemon=True,
-        ).start()
-        threading.Thread(
+        )
+        self.tracking_thread = threading.Thread(
             target=self.listen_for_tracking_updates,
             name="camera-tracking-listener",
             daemon=True,
-        ).start()
+        )
+        self.llm_thread.start()
+        self.tracking_thread.start()
 
     # ROS state ---------------------------------------------------------
 
@@ -323,15 +334,27 @@ class LLMRosBridge(Node):
     # Background transport and lifecycle -------------------------------
 
     def listen_for_llm(self):
-        while rclpy.ok():
+        while not self._stop_event.is_set():
             try:
                 request = self.rep_socket.recv_json()
                 self.rep_socket.send_json(self.resolve_request(request))
+            except zmq.Again:
+                continue
+            except zmq.ZMQError as error:
+                if self._stop_event.is_set():
+                    return
+                if rclpy.ok(context=self.context):
+                    self.get_logger().error(f"LLM transport failed: {error}")
+                return
             except Exception as error:
-                self.get_logger().error(f"LLM request loop failed: {error}")
+                if (
+                    not self._stop_event.is_set()
+                    and rclpy.ok(context=self.context)
+                ):
+                    self.get_logger().error(f"LLM request loop failed: {error}")
 
     def listen_for_tracking_updates(self):
-        while rclpy.ok():
+        while not self._stop_event.is_set():
             try:
                 message = self.sub_socket.recv_json()
                 if (
@@ -345,18 +368,52 @@ class LLMRosBridge(Node):
                     message.get("tracking_sequence"),
                     message.get("tracking_timing"),
                 )
+            except zmq.Again:
+                continue
+            except zmq.ZMQError as error:
+                if self._stop_event.is_set():
+                    return
+                if rclpy.ok(context=self.context):
+                    self.get_logger().error(
+                        f"Camera tracking transport failed: {error}"
+                    )
+                return
             except Exception as error:
-                self.get_logger().error(f"Camera tracking listener failed: {error}")
+                if (
+                    not self._stop_event.is_set()
+                    and rclpy.ok(context=self.context)
+                ):
+                    self.get_logger().error(
+                        f"Camera tracking listener failed: {error}"
+                    )
 
     def shutdown(self):
-        self.get_logger().info("Shutting down LLM ROS Bridge...")
-        self._set_tracking_enabled(False)
-        self.navigation.shutdown()
-        self.rep_socket.close(linger=0)
-        self.pub_socket.close(linger=0)
-        self.map_image_stream.close()
-        self.sub_socket.close(linger=0)
-        self.zmq_context.term()
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+
+        context_is_valid = rclpy.ok(context=self.context)
+        try:
+            if context_is_valid:
+                self.get_logger().info("Shutting down LLM ROS Bridge...")
+                self._set_tracking_enabled(False)
+                self.navigation.shutdown()
+        except Exception as error:
+            if rclpy.ok(context=self.context):
+                self.get_logger().warning(
+                    f"Motion cleanup during shutdown failed: {error}"
+                )
+        finally:
+            self._stop_event.set()
+            self.map_image_stream.close()
+            for thread in (self.llm_thread, self.tracking_thread):
+                if thread is not threading.current_thread():
+                    thread.join(timeout=1.0)
+            self.rep_socket.close(linger=0)
+            self.pub_socket.close(linger=0)
+            self.sub_socket.close(linger=0)
+            self.zmq_context.term()
 
 
 def main(args=None):
@@ -364,13 +421,12 @@ def main(args=None):
     node = LLMRosBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Ctrl-C received")
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.shutdown()
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

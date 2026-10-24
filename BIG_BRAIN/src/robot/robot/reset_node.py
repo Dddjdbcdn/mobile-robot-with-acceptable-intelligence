@@ -2,6 +2,7 @@
 
 import rclpy
 from nav2_msgs.srv import ClearEntireCostmap
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from slam_toolbox.srv import Reset
 from std_msgs.msg import Empty
@@ -50,12 +51,11 @@ def main(args=None):
     node = ResetNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

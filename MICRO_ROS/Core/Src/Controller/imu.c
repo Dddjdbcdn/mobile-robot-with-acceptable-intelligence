@@ -44,7 +44,7 @@ float Gx_bias = 0, Gy_bias = 0, Gz_bias = 0;
 uint32_t prev_tick = 0;
 
 bool mpu_calibration_done = false;
-bool mpu_init_status = false;
+volatile bool mpu_init_status = false;
 volatile uint32_t imu_last_read_ms = 0;
 volatile uint32_t imu_read_error_count = 0;
 volatile uint32_t imu_reconnect_count = 0;

@@ -7,11 +7,11 @@ system_watchdog:
     # group|short name|topic|message type|mode|stale seconds|min publishers|min external subscribers
     # "stream" checks data freshness. "endpoint" only checks the ROS graph.
     topic_specs:
-      - "micro|imu_raw|/stm32/imu_msg|geometry_msgs/msg/Point32|stream|1.0|1|1"
+      - "micro|imu_accel|/stm32/imu_accel|geometry_msgs/msg/Point32|stream|1.0|1|1"
+      - "micro|imu_gyro|/stm32/imu_gyro|geometry_msgs/msg/Point32|stream|1.0|1|1"
       - "micro|range_raw|/stm32/range_msg|geometry_msgs/msg/Point32|stream|1.0|1|1"
       - "micro|tof_raw|/stm32/tof_raw_data|std_msgs/msg/Int16MultiArray|stream|1.0|1|1"
       - "micro|wheel_state|/stm32/wheel_states|sensor_msgs/msg/JointState|stream|1.0|1|1"
-      - "micro|pwm|/stm32/pwm_msg|geometry_msgs/msg/Point32|stream|1.0|1|0"
       - "micro|debug|/stm32/debug_msg|std_msgs/msg/String|stream|3.0|1|0"
       - "micro|wheel_cmd|/stm32/wheel_commands|sensor_msgs/msg/JointState|endpoint|0.0|1|1"
       - "micro|servo_pan|/stm32/servo_pan|std_msgs/msg/Float32|endpoint|0.0|1|1"

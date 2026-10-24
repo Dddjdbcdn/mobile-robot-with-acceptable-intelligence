@@ -6,8 +6,11 @@
 
 extern volatile float Ax;
 extern volatile float Ay;
+extern volatile float Az;
+extern volatile float Gx;
+extern volatile float Gy;
 extern volatile float Gz;
-extern bool mpu_init_status;
+extern volatile bool mpu_init_status;
 extern bool mpu_calibration_done;
 extern volatile uint32_t imu_last_read_ms;
 extern volatile uint32_t imu_read_error_count;

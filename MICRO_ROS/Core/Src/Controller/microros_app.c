@@ -78,17 +78,16 @@ rclc_executor_t executor;
 // --- PUBLISHERS ---
 rcl_publisher_t debug_publisher;
 
-rcl_publisher_t imu_publisher;
-geometry_msgs__msg__Point32 imu_msg;
+rcl_publisher_t imu_accel_publisher;
+geometry_msgs__msg__Point32 imu_accel_msg;
+rcl_publisher_t imu_gyro_publisher;
+geometry_msgs__msg__Point32 imu_gyro_msg;
 
 rcl_publisher_t range_publisher;
 geometry_msgs__msg__Point32 range_msg;
 
 rcl_publisher_t wheel_state_publisher;
 sensor_msgs__msg__JointState wheel_state_msg;
-
-rcl_publisher_t pwm_publisher;
-geometry_msgs__msg__Point32 pwm_msg;
 
 rcl_publisher_t tof_raw_publisher;
 std_msgs__msg__Int16MultiArray tof_raw_msg;
@@ -127,17 +126,32 @@ rcl_timer_t wheel_timer;
 rcl_timer_t imu_timer;
 rcl_timer_t range_timer;
 rcl_timer_t tof_timer;
-rcl_timer_t pwm_timer;
 
 static MicroRosDiagnostics diagnostics;
 static uint32_t entity_creation_attempts = 0;
 static char last_init_failure_stage[32] = "none";
 static char last_init_failure_error[128] = "none";
 static long last_init_failure_rc = 0;
+static rcl_ret_t imu_accel_init_ret = RCL_RET_NOT_INIT;
+static rcl_ret_t imu_gyro_init_ret = RCL_RET_NOT_INIT;
 
 // ==========================================
 // CALLBACKS & FUNCTIONS
 // ==========================================
+
+static bool timestamp_is_fresh(uint32_t now, uint32_t timestamp,
+                               uint32_t max_age_ms)
+{
+    if (timestamp == 0U) {
+        return false;
+    }
+
+    uint32_t elapsed = now - timestamp;
+    if (elapsed > (UINT32_MAX / 2U)) {
+        elapsed = 0U;
+    }
+    return elapsed <= max_age_ms;
+}
 
 void servo_tilt_callback(const void * msgin)
 {
@@ -167,8 +181,11 @@ void wheel_cmd_callback(const void * msgin)
         float target_rad_s_L = (float)msg->velocity.data[0];
         float target_rad_s_R = (float)msg->velocity.data[1];
 
-        target_rpm_L = target_rad_s_L * (60.0f / (2.0f * PI));
-        target_rpm_R = target_rad_s_R * (60.0f / (2.0f * PI));
+        if (isfinite(target_rad_s_L) && isfinite(target_rad_s_R)) {
+            Motor_SetWheelTargets(
+                target_rad_s_L * (60.0f / (2.0f * PI)),
+                target_rad_s_R * (60.0f / (2.0f * PI)));
+        }
     }
 }
 
@@ -189,13 +206,18 @@ void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
     if (timer != NULL) {
       uint32_t now = HAL_GetTick();
-      bool fresh = mpu_init_status && imu_last_read_ms != 0U &&
-                   (now - imu_last_read_ms) <= IMU_STALE_TIMEOUT_MS;
-      imu_msg.x = fresh ? Ax : NAN;
-      imu_msg.y = fresh ? Ay : NAN;
-      imu_msg.z = fresh ? Gz : NAN;
-      MicroRosDiagnostics_Publish(
-          &diagnostics, PUB_IMU, &imu_publisher, &imu_msg);
+      bool fresh = mpu_init_status && timestamp_is_fresh(
+          now, imu_last_read_ms, IMU_STALE_TIMEOUT_MS);
+      imu_accel_msg.x = fresh ? Ax : NAN;
+      imu_accel_msg.y = fresh ? Ay : NAN;
+      imu_accel_msg.z = fresh ? Az : NAN;
+      imu_gyro_msg.x = fresh ? Gx : NAN;
+      imu_gyro_msg.y = fresh ? Gy : NAN;
+      imu_gyro_msg.z = fresh ? Gz : NAN;
+      MicroRosDiagnostics_PublishPair(
+          &diagnostics, PUB_IMU,
+          &imu_accel_publisher, &imu_accel_msg,
+          &imu_gyro_publisher, &imu_gyro_msg);
     }
 }
 
@@ -219,8 +241,8 @@ void tof_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
     if (timer == NULL) return;
 
     uint32_t now = HAL_GetTick();
-    bool fresh = tof_alive_status && tof_last_frame_ms != 0U &&
-                 (now - tof_last_frame_ms) <= TOF_STALE_TIMEOUT_MS;
+    bool fresh = tof_alive_status && timestamp_is_fresh(
+        now, tof_last_frame_ms, TOF_STALE_TIMEOUT_MS);
 
     vTaskSuspendAll();
 
@@ -228,10 +250,14 @@ void tof_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
     {
         uint8_t status = Results.target_status[i];
 
-        if (fresh && status == 5) {
+        if (!fresh) {
+            /* Keep stale frames distinct from sensor target-status failures. */
+            tof_raw_msg.data.data[i] = INT16_MIN;
+        } else if (status == 5U || status == 9U) {
             tof_raw_msg.data.data[i] = Results.distance_mm[i];
         } else {
-            tof_raw_msg.data.data[i] = -1; 
+            /* Preserve status 0..255 as -1..-256 without another topic. */
+            tof_raw_msg.data.data[i] = -(int16_t)(status + 1U);
         }
     }
     
@@ -239,17 +265,6 @@ void tof_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 
     MicroRosDiagnostics_Publish(
         &diagnostics, PUB_TOF, &tof_raw_publisher, &tof_raw_msg);
-}
-
-void pwm_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
-{
-    if (timer != NULL) {
-      pwm_msg.x = current_pwm_L;
-      pwm_msg.y = current_pwm_R;
-      pwm_msg.z = 0.0;
-      MicroRosDiagnostics_Publish(
-          &diagnostics, PUB_PWM, &pwm_publisher, &pwm_msg);
-    }
 }
 
 static void wire_message_memory(void)
@@ -308,10 +323,12 @@ static void reset_entity_state(void)
     executor = rclc_executor_get_zero_initialized_executor();
 
     debug_publisher = rcl_get_zero_initialized_publisher();
-    imu_publisher = rcl_get_zero_initialized_publisher();
+    imu_accel_publisher = rcl_get_zero_initialized_publisher();
+    imu_gyro_publisher = rcl_get_zero_initialized_publisher();
+    imu_accel_init_ret = RCL_RET_NOT_INIT;
+    imu_gyro_init_ret = RCL_RET_NOT_INIT;
     range_publisher = rcl_get_zero_initialized_publisher();
     wheel_state_publisher = rcl_get_zero_initialized_publisher();
-    pwm_publisher = rcl_get_zero_initialized_publisher();
     tof_raw_publisher = rcl_get_zero_initialized_publisher();
 
     wheel_cmd_subscriber = rcl_get_zero_initialized_subscription();
@@ -322,7 +339,6 @@ static void reset_entity_state(void)
     imu_timer = rcl_get_zero_initialized_timer();
     range_timer = rcl_get_zero_initialized_timer();
     tof_timer = rcl_get_zero_initialized_timer();
-    pwm_timer = rcl_get_zero_initialized_timer();
 
     MicroRosDiagnostics_Reset(&diagnostics);
 }
@@ -376,12 +392,19 @@ static bool create_microros_entities(void)
                  rclc_node_init_default(&node, "cubemx_node", "", &support),
                  "node");
 
-    INIT_OR_FAIL(diagnostics.publishers[PUB_IMU].init_ret,
+    INIT_OR_FAIL(imu_accel_init_ret,
                  rclc_publisher_init_best_effort(
-                     &imu_publisher, &node,
+                     &imu_accel_publisher, &node,
                      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32),
-                     "stm32/imu_msg"),
-                 "pub_imu");
+                     "stm32/imu_accel"),
+                 "pub_imu_accel");
+    INIT_OR_FAIL(imu_gyro_init_ret,
+                 rclc_publisher_init_best_effort(
+                     &imu_gyro_publisher, &node,
+                     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32),
+                     "stm32/imu_gyro"),
+                 "pub_imu_gyro");
+    diagnostics.publishers[PUB_IMU].init_ret = RCL_RET_OK;
     INIT_OR_FAIL(diagnostics.publishers[PUB_RANGE].init_ret,
                  rclc_publisher_init_best_effort(
                      &range_publisher, &node,
@@ -403,12 +426,6 @@ static bool create_microros_entities(void)
     diagnostics.publishers[PUB_DEBUG].timer_ret = RCL_RET_OK;
     diagnostics.publishers[PUB_DEBUG].executor_ret = RCL_RET_OK;
 
-    INIT_OR_FAIL(diagnostics.publishers[PUB_PWM].init_ret,
-                 rclc_publisher_init_best_effort(
-                     &pwm_publisher, &node,
-                     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Point32),
-                     "stm32/pwm_msg"),
-                 "pub_pwm");
     INIT_OR_FAIL(diagnostics.publishers[PUB_WHEEL].init_ret,
                  rclc_publisher_init_best_effort(
                      &wheel_state_publisher, &node,
@@ -451,13 +468,8 @@ static bool create_microros_entities(void)
                  rclc_timer_init_default2(&tof_timer, &support,
                      RCL_MS_TO_NS(100), tof_timer_callback, true),
                  "timer_tof");
-    INIT_OR_FAIL(diagnostics.publishers[PUB_PWM].timer_ret,
-                 rclc_timer_init_default2(&pwm_timer, &support,
-                     RCL_MS_TO_NS(50), pwm_timer_callback, true),
-                 "timer_pwm");
-
     INIT_OR_FAIL(diagnostics.executor_init_ret,
-                 rclc_executor_init(&executor, &support.context, 8, &allocator),
+                 rclc_executor_init(&executor, &support.context, 7, &allocator),
                  "executor");
 
     INIT_OR_FAIL(diagnostics.subscriptions[SUB_WHEEL_CMD].executor_ret,
@@ -487,10 +499,6 @@ static bool create_microros_entities(void)
     INIT_OR_FAIL(diagnostics.publishers[PUB_TOF].executor_ret,
                  rclc_executor_add_timer(&executor, &tof_timer),
                  "exec_tof");
-    INIT_OR_FAIL(diagnostics.publishers[PUB_PWM].executor_ret,
-                 rclc_executor_add_timer(&executor, &pwm_timer),
-                 "exec_pwm");
-
     MicroRosDiagnostics_SetDebugReady(&diagnostics, true);
     return true;
 }
@@ -521,7 +529,6 @@ static void destroy_microros_entities(bool agent_available)
         CLEANUP_RCL(rclc_executor_fini(&executor));
     }
 
-    if (diagnostics.publishers[PUB_PWM].timer_ret == RCL_RET_OK) CLEANUP_RCL(rcl_timer_fini(&pwm_timer));
     if (diagnostics.publishers[PUB_TOF].timer_ret == RCL_RET_OK) CLEANUP_RCL(rcl_timer_fini(&tof_timer));
     if (diagnostics.publishers[PUB_RANGE].timer_ret == RCL_RET_OK) CLEANUP_RCL(rcl_timer_fini(&range_timer));
     if (diagnostics.publishers[PUB_IMU].timer_ret == RCL_RET_OK) CLEANUP_RCL(rcl_timer_fini(&imu_timer));
@@ -537,16 +544,16 @@ static void destroy_microros_entities(bool agent_available)
 
         if (diagnostics.publishers[PUB_WHEEL].init_ret == RCL_RET_OK)
             CLEANUP_RCL(rcl_publisher_fini(&wheel_state_publisher, &node));
-        if (diagnostics.publishers[PUB_PWM].init_ret == RCL_RET_OK)
-            CLEANUP_RCL(rcl_publisher_fini(&pwm_publisher, &node));
         if (diagnostics.publishers[PUB_DEBUG].init_ret == RCL_RET_OK)
             CLEANUP_RCL(rcl_publisher_fini(&debug_publisher, &node));
         if (diagnostics.publishers[PUB_TOF].init_ret == RCL_RET_OK)
             CLEANUP_RCL(rcl_publisher_fini(&tof_raw_publisher, &node));
         if (diagnostics.publishers[PUB_RANGE].init_ret == RCL_RET_OK)
             CLEANUP_RCL(rcl_publisher_fini(&range_publisher, &node));
-        if (diagnostics.publishers[PUB_IMU].init_ret == RCL_RET_OK)
-            CLEANUP_RCL(rcl_publisher_fini(&imu_publisher, &node));
+        if (imu_gyro_init_ret == RCL_RET_OK)
+            CLEANUP_RCL(rcl_publisher_fini(&imu_gyro_publisher, &node));
+        if (imu_accel_init_ret == RCL_RET_OK)
+            CLEANUP_RCL(rcl_publisher_fini(&imu_accel_publisher, &node));
 
         CLEANUP_RCL(rcl_node_fini(&node));
     }

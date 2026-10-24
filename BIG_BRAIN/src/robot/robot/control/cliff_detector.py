@@ -6,6 +6,7 @@ from typing import Iterable, Sequence
 import rclpy
 from geometry_msgs.msg import TransformStamped
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -22,7 +23,7 @@ TOF_FIELD_OF_VIEW = math.radians(60.0)
 TOF_RAY_STEP = 2.0 * math.tan(TOF_FIELD_OF_VIEW / 2.0) / GRID_WIDTH
 OBSTACLE_OUTPUT_HEIGHT = 0.1
 CLIFF_X_STANDOFF = 0.1
-INVALID_MIN_ADJACENT_COLUMNS = 4
+INVALID_MIN_POINTS = 14
 INVALID_CONFIRMATION_FRAMES = 3
 
 
@@ -108,19 +109,6 @@ def invalid_ray_floor_intersection(
     return (scale * ray_x, scale * ray_y, scale * ray_z)
 
 
-def spatially_supported_invalid_indices(indices: set[int]) -> set[int]:
-    """Keep invalid pixels only when invalidity spans adjacent grid columns."""
-    columns = {index % GRID_WIDTH for index in indices}
-    supported_columns: set[int] = set()
-    for start in range(GRID_WIDTH - INVALID_MIN_ADJACENT_COLUMNS + 1):
-        run = set(range(start, start + INVALID_MIN_ADJACENT_COLUMNS))
-        if run.issubset(columns):
-            supported_columns.update(run)
-    return {
-        index for index in indices if index % GRID_WIDTH in supported_columns
-    }
-
-
 class CliffDetector(Node):
     def __init__(self) -> None:
         """Set up the ToF subscription, TF listener, and cliff publisher."""
@@ -155,7 +143,7 @@ class CliffDetector(Node):
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.invalid_streaks = [0] * (GRID_WIDTH * GRID_HEIGHT)
+        self.invalid_frame_streak = 0
 
     def pointcloud_callback(self, message: PointCloud2) -> None:
         expected_points = GRID_WIDTH * GRID_HEIGHT
@@ -218,33 +206,30 @@ class CliffDetector(Node):
                 )
             )
 
-        supported_invalid = spatially_supported_invalid_indices(invalid_indices)
-        for point_index in range(len(selected_points)):
-            if point_index in supported_invalid:
-                self.invalid_streaks[point_index] += 1
-            else:
-                self.invalid_streaks[point_index] = 0
+        if len(invalid_indices) >= INVALID_MIN_POINTS:
+            self.invalid_frame_streak += 1
+        else:
+            self.invalid_frame_streak = 0
 
-            if self.invalid_streaks[point_index] < INVALID_CONFIRMATION_FRAMES:
-                continue
-
-            point = selected_points[point_index]
-            obstacle = invalid_ray_floor_intersection(
-                point_index,
-                float(point[0]),
-                float(point[1]),
-                transform,
-            )
-            if obstacle is None:
-                continue
-            obstacles.append(
-                set_base_height_in_source_frame(
-                    obstacle,
-                    OBSTACLE_OUTPUT_HEIGHT,
+        if self.invalid_frame_streak >= INVALID_CONFIRMATION_FRAMES:
+            for point_index in invalid_indices:
+                point = selected_points[point_index]
+                obstacle = invalid_ray_floor_intersection(
+                    point_index,
+                    float(point[0]),
+                    float(point[1]),
                     transform,
-                    CLIFF_X_STANDOFF,
                 )
-            )
+                if obstacle is None:
+                    continue
+                obstacles.append(
+                    set_base_height_in_source_frame(
+                        obstacle,
+                        OBSTACLE_OUTPUT_HEIGHT,
+                        transform,
+                        CLIFF_X_STANDOFF,
+                    )
+                )
 
         header = Header()
         header.stamp = message.header.stamp
@@ -257,11 +242,11 @@ def main(args=None) -> None:
     node = CliffDetector()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

@@ -11,7 +11,6 @@ typedef enum {
     PUB_IMU,
     PUB_RANGE,
     PUB_TOF,
-    PUB_PWM,
     PUB_WHEEL,
     PUB_DEBUG,
     PUB_COUNT
@@ -77,6 +76,12 @@ rcl_ret_t MicroRosDiagnostics_Publish(MicroRosDiagnostics *diagnostics,
                                       PublisherDiagnosticId id,
                                       rcl_publisher_t *publisher,
                                       const void *message);
+rcl_ret_t MicroRosDiagnostics_PublishPair(MicroRosDiagnostics *diagnostics,
+                                          PublisherDiagnosticId id,
+                                          rcl_publisher_t *first_publisher,
+                                          const void *first_message,
+                                          rcl_publisher_t *second_publisher,
+                                          const void *second_message);
 void MicroRosDiagnostics_Log(MicroRosDiagnostics *diagnostics,
                              rcl_publisher_t *debug_publisher,
                              const char *format, ...);

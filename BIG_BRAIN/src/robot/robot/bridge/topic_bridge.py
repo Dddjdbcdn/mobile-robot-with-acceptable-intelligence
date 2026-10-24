@@ -1,4 +1,5 @@
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Int16MultiArray, Header, Float32
@@ -6,6 +7,7 @@ from geometry_msgs.msg import Point32
 from sensor_msgs.msg import Imu, Range, PointCloud2
 from sensor_msgs_py import point_cloud2
 import math
+import time
 from rclpy.duration import Duration
 from rclpy.time import Time
 
@@ -15,10 +17,18 @@ class Stm32SensorBridge(Node):
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         
         # --- IMU SETUP ---
-        self.imu_subscription = self.create_subscription(
-            Point32, 
-            'stm32/imu_msg', 
-            self.imu_callback, 
+        self.imu_accel = None
+        self.imu_accel_received_at = None
+        self.imu_accel_subscription = self.create_subscription(
+            Point32,
+            'stm32/imu_accel',
+            self.imu_accel_callback,
+            qos
+        )
+        self.imu_gyro_subscription = self.create_subscription(
+            Point32,
+            'stm32/imu_gyro',
+            self.imu_gyro_callback,
             qos
         )
         self.imu_publisher = self.create_publisher(Imu, '/imu', qos)
@@ -109,26 +119,42 @@ class Stm32SensorBridge(Node):
     # ==========================================
     # IMU FUNCTIONS
     # ==========================================
-    def imu_callback(self, msg):
+    def imu_accel_callback(self, msg):
+        self.imu_accel = (float(msg.x), float(msg.y), float(msg.z))
+        self.imu_accel_received_at = time.monotonic()
+
+    def imu_gyro_callback(self, msg):
+        now = time.monotonic()
+        if (
+            self.imu_accel is None
+            or self.imu_accel_received_at is None
+            or now - self.imu_accel_received_at > 0.05
+        ):
+            return
+
+        acceleration = self.imu_accel
+        self.imu_accel = None
+        self.imu_accel_received_at = None
+
         imu_msg = Imu()
-        
         imu_msg.header.stamp = self.get_clock().now().to_msg()
         imu_msg.header.frame_id = 'imu_link'
+        imu_msg.orientation.w = 1.0
+        imu_msg.orientation_covariance[0] = -1.0
 
-        imu_msg.linear_acceleration.x = float(msg.x) * 9.81
-        imu_msg.linear_acceleration.y = float(msg.y) * 9.81
-        imu_msg.linear_acceleration.z = 9.81 
-        
-        imu_msg.angular_velocity.x = 0.0
-        imu_msg.angular_velocity.y = 0.0
-        imu_msg.angular_velocity.z = float(msg.z) * 3.141592653 / 180
+        imu_msg.linear_acceleration.x = acceleration[0] * 9.80665
+        imu_msg.linear_acceleration.y = acceleration[1] * 9.80665
+        imu_msg.linear_acceleration.z = acceleration[2] * 9.80665
+        imu_msg.angular_velocity.x = math.radians(float(msg.x))
+        imu_msg.angular_velocity.y = math.radians(float(msg.y))
+        imu_msg.angular_velocity.z = math.radians(float(msg.z))
 
-        imu_msg.linear_acceleration_covariance[0] = 0.01 # Variance for Ax
-        imu_msg.linear_acceleration_covariance[4] = 0.01 # Variance for Ay
-        imu_msg.angular_velocity_covariance[8] = 0.01    # Variance for Gz (Vyaw)
-        
-        # Mark orientation as unknown
-        imu_msg.orientation_covariance[0] = -1.0 
+        imu_msg.angular_velocity_covariance[0] = 0.01
+        imu_msg.angular_velocity_covariance[4] = 0.01
+        imu_msg.angular_velocity_covariance[8] = 0.01
+        imu_msg.linear_acceleration_covariance[0] = 0.04
+        imu_msg.linear_acceleration_covariance[4] = 0.04
+        imu_msg.linear_acceleration_covariance[8] = 0.04
 
         self.imu_publisher.publish(imu_msg)
 
@@ -149,10 +175,7 @@ class Stm32SensorBridge(Node):
         range_msg.min_range = 0.05
         range_msg.max_range = 0.3
 
-        if not math.isfinite(distance):
-            return
-
-        if distance < 0.0 or distance > range_msg.max_range:
+        if distance < 0.0 or distance > range_msg.max_range or not math.isfinite(distance):
             range_msg.range = range_msg.max_range
         else:
             range_msg.range = float(distance)
@@ -178,9 +201,13 @@ class Stm32SensorBridge(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Stm32SensorBridge()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()

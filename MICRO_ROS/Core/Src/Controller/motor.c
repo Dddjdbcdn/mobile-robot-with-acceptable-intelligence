@@ -7,6 +7,7 @@
 #define MAX_PWM_VALUE           65535
 #define DELTA_TIME              10
 #define PULSES_PER_REVOLUTION   1920.0
+#define WHEEL_COMMAND_TIMEOUT_MS 500U
 #ifndef M_PI
 #define M_PI                    3.14159265358979323846f
 #endif
@@ -60,6 +61,28 @@ uint32_t current_count_R;
 uint32_t previous_count_R = 0;
 float error_integral_R = 0.0;
 float previous_error_R = 0.0;
+
+static volatile uint32_t last_wheel_command_ms = 0U;
+static volatile bool wheel_command_received = false;
+
+void Motor_SetWheelTargets(float left_rpm, float right_rpm) {
+    uint32_t now = HAL_GetTick();
+    uint32_t interrupt_state = __get_PRIMASK();
+
+    __disable_irq();
+    target_rpm_L = left_rpm;
+    target_rpm_R = right_rpm;
+    last_wheel_command_ms = now;
+    wheel_command_received = true;
+    if (interrupt_state == 0U) {
+        __enable_irq();
+    }
+}
+
+bool Motor_WheelCommandIsFresh(uint32_t now) {
+    return wheel_command_received &&
+        (uint32_t)(now - last_wheel_command_ms) < WHEEL_COMMAND_TIMEOUT_MS;
+}
 
 // Servo State
 #define SERVO_MIN_PAN_ANGLE       30.0f
@@ -147,6 +170,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     // Control Loop
     if (htim->Instance == TIM4) {
+        if (!Motor_WheelCommandIsFresh(HAL_GetTick())) {
+            target_rpm_L = 0.0f;
+            target_rpm_R = 0.0f;
+            wheel_command_received = false;
+        }
+
         // 1. Read Encoders
         current_count_L = __HAL_TIM_GET_COUNTER(&htim2);
         current_count_R = __HAL_TIM_GET_COUNTER(&htim3);
