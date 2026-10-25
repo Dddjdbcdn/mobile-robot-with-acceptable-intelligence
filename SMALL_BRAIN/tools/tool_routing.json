@@ -8,9 +8,9 @@
   ],
   "action_vocabulary": {
     "find_target": "find, search for, look for, locate, approach, move next to, or go to a named non-person object or recognizable place",
-    "see_action": "what do you see, can you see, is there, what color, inspect, check, or look in a clear camera direction and report what is visible",
+    "see_action": "what do you see, can you see, is there, what color, inspect, check, or look in a clear camera direction and report what is visible. 'Look at' commands, such as 'Look at the door' should call track action for persistent tracking",
     "explicit_navigation": "move, go, back up, nudge, turn, rotate, turn around, exit, move to the center, middle, open space, next room, numbered room, previous position, starting place, or a front/right/left position around a person when the destination is explicit",
-    "watch_target": "look at me, face me, watch me, watch the named object, keep looking, or keep your eyes on the target",
+    "watch_target": "look at me, face me, watch me, watch the named object, look at something, keep looking, or keep your eyes on the target",
     "follow_person": "follow me, come with me, walk with me, stay with me, trail me, or follow that person"
   },
   "important_distinctions": [

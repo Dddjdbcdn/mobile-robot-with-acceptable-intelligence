@@ -965,6 +965,21 @@ def tracking_panel_width(rows, frame_width, scale):
     return min(frame_width - 24, required + right_padding)
 
 
+def person_tracking_status_display(person_tracks):
+    """Format the single person identity owned by the target tracker."""
+    track = next(iter(person_tracks or ()), None)
+    if track is None:
+        return "ID --  |  0 IMAGES  |  --", (170, 170, 170)
+
+    samples = int(track.appearance_samples)
+    image_label = "IMAGE" if samples == 1 else "IMAGES"
+    update_age = track.gallery_update_age_seconds
+    updated = "--" if update_age is None else f"{float(update_age):.1f}s"
+    value = f"ID {track.track_id}  |  {samples} {image_label}  |  {updated}"
+    color = (70, 240, 70) if track.visible else (0, 210, 255)
+    return value, color
+
+
 def draw_tracking_status_overlay(
     frame,
     track_action,
@@ -1047,14 +1062,7 @@ def draw_tracking_status_overlay(
         if action_state == "IDLE"
         else (0, 210, 255)
     )
-    visible_tracks = sum(track.visible for track in person_tracks)
-    lost_tracks = sum(not track.visible for track in person_tracks)
-    person_memory_value = (
-        f"{visible_tracks} VISIBLE  |  {lost_tracks} MEMORY"
-    )
-    person_memory_color = (
-        (70, 240, 70) if visible_tracks else (170, 170, 170)
-    )
+    person_value, person_color = person_tracking_status_display(person_tracks)
 
     navigation_value, navigation_color = navigation_status_display(
         robot_state.get("navigation")
@@ -1065,7 +1073,7 @@ def draw_tracking_status_overlay(
         ("ACTION", action_value, action_color),
         ("VOICE", voice_value, voice_color),
         ("NAV2", navigation_value, navigation_color),
-        ("PERSON IDS", person_memory_value, person_memory_color),
+        ("PERSON", person_value, person_color),
         ("TOF SEED", seed_value, seed_color),
         ("LIDAR SEED", lidar_seed_value, lidar_seed_color),
         ("LIDAR POSE", lidar_pose_value, lidar_pose_color),
@@ -1340,6 +1348,17 @@ def draw_audio_controls(frame, output_muted, input_muted):
     return {"speaker": speaker, "ear": ear}
 
 
+def draw_vision_mode_control(frame, object_mode, enabled, left=12):
+    """Draw the idle-only pose/object inference switch."""
+    bottom = frame.shape[0] - 12
+    mode = "OBJECT" if object_mode else "POSE"
+    label = f"YOLO {mode} [O]" if enabled else f"YOLO {mode} LOCKED"
+    color = (
+        (0, 190, 255) if object_mode else (70, 240, 70)
+    ) if enabled else (120, 120, 120)
+    return _draw_control_button(frame, label, left, bottom, color)
+
+
 def control_button_clicked(event, x, y, bounds):
     if event != cv2.EVENT_LBUTTONUP or bounds is None:
         return False
@@ -1356,6 +1375,7 @@ async def display_camera_loop(
     person_tracking_service=None,
     audio_app=None,
     connection_status=None,
+    cognition_manager=None,
 ):
     """Render the complete camera debug view."""
     window_name = "Robot Vision"
@@ -1374,7 +1394,13 @@ async def display_camera_loop(
         "visible": True,
         "button_bounds": None,
         "audio_bounds": {},
+        "vision_bounds": None,
     }
+
+    def toggle_vision_mode():
+        if cognition_manager is None:
+            return False
+        return cognition_manager.toggle_debug_object_mode()
 
     def handle_mouse(event, x, y, _flags, _parameter):
         if debug_board_toggle_clicked(
@@ -1386,6 +1412,9 @@ async def display_camera_loop(
         elif audio_app is not None and control_button_clicked(
                 event, x, y, debug_control["audio_bounds"].get("ear")):
             audio_app.set_input_muted(not audio_app.input_muted)
+        elif control_button_clicked(
+                event, x, y, debug_control["vision_bounds"]):
+            toggle_vision_mode()
 
     cv2.setMouseCallback(window_name, handle_mouse)
 
@@ -1474,10 +1503,23 @@ async def display_camera_loop(
                     audio_app.output_muted,
                     audio_app.input_muted,
                 )
+            vision_enabled = bool(
+                cognition_manager is not None
+                and cognition_manager.debug_object_mode_available()
+            )
+            audio_ear = debug_control["audio_bounds"].get("ear")
+            vision_left = audio_ear[2] + 10 if audio_ear is not None else 12
+            debug_control["vision_bounds"] = draw_vision_mode_control(
+                display_frame,
+                yolo.object_mode,
+                vision_enabled,
+                vision_left,
+            )
             debug_control["button_bounds"] = draw_debug_board_toggle(
                 display_frame,
                 debug_control["visible"],
-                debug_control["audio_bounds"].get("speaker"),
+                debug_control["audio_bounds"].get("speaker")
+                or debug_control["vision_bounds"],
             )
             cv2.imshow(window_name, display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -1487,6 +1529,8 @@ async def display_camera_loop(
                 audio_app.set_output_muted(not audio_app.output_muted)
             elif audio_app is not None and key in (ord("e"), ord("E")):
                 audio_app.set_input_muted(not audio_app.input_muted)
+            elif key in (ord("o"), ord("O")):
+                toggle_vision_mode()
 
             now = time.monotonic()
             if (

@@ -90,10 +90,118 @@ class SearchAction:
 
     def create_assessment_task(self, assessment, *, name: str) -> asyncio.Task:
         """Schedule and retain an out-of-band visual assessment."""
-        task = asyncio.create_task(assessment, name=name)
+        task = self._create_search_task(assessment, role=name, name=name)
         self.assessment_tasks.add(task)
         task.add_done_callback(self._assessment_task_done)
         return task
+
+    def _create_search_task(
+        self,
+        work,
+        *,
+        role: str,
+        name: str,
+    ) -> asyncio.Task:
+        """Run search-owned work without allowing it to strand the action."""
+        action_id = self.action_id
+        return asyncio.create_task(
+            self._supervise_search_work(
+                work,
+                role=role,
+                action_id=action_id,
+            ),
+            name=name,
+        )
+
+    async def _supervise_search_work(
+        self,
+        work,
+        *,
+        role: str,
+        action_id: str | None,
+    ) -> None:
+        try:
+            await work
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                f"[Search task error: {role}] "
+                f"{type(error).__name__}: {error}"
+            )
+            await self._fail_search_from_task(
+                action_id=action_id,
+                role=role,
+                error=error,
+            )
+
+    async def _fail_search_from_task(
+        self,
+        *,
+        action_id: str | None,
+        role: str,
+        error: Exception,
+    ) -> None:
+        if not self.active or self.action_id != action_id:
+            return
+
+        error_text = f"{type(error).__name__}: {error}"
+        try:
+            await self.complete_searching(
+                status="failed",
+                outcome="search_error",
+                reason_code="SEARCH_EXECUTION_ERROR",
+                extra_data={"error": error_text, "failed_task": role},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as completion_error:
+            completion_error_text = (
+                f"{type(completion_error).__name__}: {completion_error}"
+            )
+            print(
+                f"[Search completion error: {role}] {completion_error_text}"
+            )
+            self._force_complete_search(
+                action_id=action_id,
+                status="failed",
+                outcome="search_error",
+                reason_code="SEARCH_EXECUTION_ERROR",
+                data={
+                    "error": error_text,
+                    "failed_task": role,
+                    "completion_error": completion_error_text,
+                },
+            )
+
+    def _force_complete_search(
+        self,
+        *,
+        action_id: str | None,
+        status: str,
+        outcome: str,
+        reason_code: str | None,
+        data: dict[str, Any] | None = None,
+    ) -> ActionResult | None:
+        """Last-resort local completion when ordinary cleanup itself fails."""
+        if not self.active or self.action_id != action_id:
+            return None
+
+        completion_future = self.completion_future
+        result = ActionResult(
+            action_id=action_id or "unassigned",
+            action_type="search_action",
+            status=status,
+            target=self.target,
+            outcome=outcome,
+            reason_code=reason_code,
+            retryable=status == "failed",
+            data=data or {},
+        )
+        self.reset_state()
+        if completion_future is not None and not completion_future.done():
+            completion_future.set_result(result)
+        return result
 
     def _assessment_task_done(self, task: asyncio.Task) -> None:
         self.assessment_tasks.discard(task)
@@ -749,12 +857,15 @@ class SearchAction:
 
         clear_images_folder()
         self.completion_future = asyncio.get_running_loop().create_future()
-        self.search_task = asyncio.create_task(
-            self._start_frame_assessment()
+        self.search_task = self._create_search_task(
+            self._start_frame_assessment(),
+            role="initial_frame_assessment",
+            name=f"search-initial-assessment-{action_id}",
         )
         if self.person_search and self.yolo is not None:
-            self.person_monitor_task = asyncio.create_task(
+            self.person_monitor_task = self._create_search_task(
                 self._monitor_yolo_person(),
+                role="person_monitor",
                 name=f"search-person-monitor-{action_id}",
             )
 
@@ -781,21 +892,54 @@ class SearchAction:
         if not self.active:
             return
 
+        action_id = self.action_id
         self.pending_request_id = None
 
         await self._cancel_search_work(cancel_assessments=True)
 
-        await self.move_camera_angles(
-            PAN_POSITION_ANGLE["center"],
-            TILT_POSITION_ANGLE["center"],
-        )
-        return await self.complete_searching(
-            status="cancelled",
-            outcome="search_cancelled",
-            reason_code=reason,
-        )
+        cleanup_data = {}
+        try:
+            await self.move_camera_angles(
+                PAN_POSITION_ANGLE["center"],
+                TILT_POSITION_ANGLE["center"],
+            )
+        except Exception as error:
+            cleanup_data["cleanup_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+            print(
+                "[Search stop cleanup error] "
+                f"{cleanup_data['cleanup_error']}"
+            )
 
-    async def complete_searching(self,status,outcome,reason_code=None):
+        try:
+            return await self.complete_searching(
+                status="cancelled",
+                outcome="search_cancelled",
+                reason_code=reason,
+                extra_data=cleanup_data,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            cleanup_data["completion_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+            return self._force_complete_search(
+                action_id=action_id,
+                status="cancelled",
+                outcome="search_cancelled",
+                reason_code=reason,
+                data=cleanup_data,
+            )
+
+    async def complete_searching(
+        self,
+        status,
+        outcome,
+        reason_code=None,
+        extra_data=None,
+    ):
         if not self.active:
             return None
 
@@ -852,6 +996,8 @@ class SearchAction:
             "person_detection": copy.deepcopy(self.last_person_detection),
             "contextual_clue": clue,
         }
+        if isinstance(extra_data, dict):
+            data.update(extra_data)
 
         action_result = ActionResult(
             action_id=action_id,

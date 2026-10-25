@@ -62,7 +62,7 @@ class FollowPersonExecutor:
         self.track_action.set_follow_person_active(True)
         self.completion_future = asyncio.get_running_loop().create_future()
         self._runner = asyncio.create_task(
-            self._run(), name=f"follow-person-{action_id}"
+            self._supervise_run(action_id), name=f"follow-person-{action_id}"
         )
         self._debug("started", target=self.target)
         return ActionResult(
@@ -70,65 +70,84 @@ class FollowPersonExecutor:
             outcome="acquiring_person",
         )
 
-    async def _run(self):
+    async def _supervise_run(self, action_id):
         try:
-            self._debug("acquisition_started")
-            acquired = await self._acquire_target()
-            if acquired.status != "succeeded":
-                self._debug(
-                    "acquisition_failed",
-                    status=acquired.status,
-                    outcome=acquired.outcome,
-                    reason_code=acquired.reason_code,
-                )
-                self._finish(
-                    "failed", "follow_failed",
-                    acquired.reason_code or "FOLLOW_ACQUISITION_FAILED",
-                    {"failed_step": "person_acquisition"},
-                )
-                return
-
-            self._debug("acquisition_succeeded", outcome=acquired.outcome)
-            self._debug("sending_follow_command")
-            feedback = await self.send_robot_command({
-                "command": "follow_action",
-                "action_id": self.action_id,
-            })
-            if not isinstance(feedback, dict) or feedback.get("status") != "accepted":
-                message = (
-                    feedback.get("message", "follow_rejected")
-                    if isinstance(feedback, dict)
-                    else "invalid_follow_feedback"
-                )
-                self._debug(
-                    "follow_command_rejected",
-                    feedback=feedback,
-                    message=message,
-                )
-                self._finish(
-                    "failed", "follow_rejected", "FOLLOW_REJECTED",
-                    {"message": message},
-                )
-                return
-
-            self._debug("follow_command_accepted", feedback=feedback)
+            await self._run()
         except asyncio.CancelledError:
             self._debug("runner_cancelled")
-            return
+            raise
         except Exception as error:
-            if self.active and not self._stop_requested:
-                self._debug(
-                    "execution_failed",
-                    error=f"{type(error).__name__}: {error}",
-                )
-                await self.send_robot_command({
-                    "command": "stop_follow_action",
-                    "action_id": self.action_id,
-                })
-                self._finish(
-                    "failed", "execution_error", "FOLLOW_EXECUTION_ERROR",
-                    {"error": f"{type(error).__name__}: {error}"},
-                )
+            if (
+                self.active
+                and self.action_id == action_id
+                and not self._stop_requested
+            ):
+                await self._fail_execution(error)
+
+    async def _run(self):
+        self._debug("acquisition_started")
+        acquired = await self._acquire_target()
+        if acquired.status != "succeeded":
+            self._debug(
+                "acquisition_failed",
+                status=acquired.status,
+                outcome=acquired.outcome,
+                reason_code=acquired.reason_code,
+            )
+            self._finish(
+                "failed", "follow_failed",
+                acquired.reason_code or "FOLLOW_ACQUISITION_FAILED",
+                {"failed_step": "person_acquisition"},
+            )
+            return
+
+        self._debug("acquisition_succeeded", outcome=acquired.outcome)
+        self._debug("sending_follow_command")
+        feedback = await self.send_robot_command({
+            "command": "follow_action",
+            "action_id": self.action_id,
+        })
+        if not isinstance(feedback, dict) or feedback.get("status") != "accepted":
+            message = (
+                feedback.get("message", "follow_rejected")
+                if isinstance(feedback, dict)
+                else "invalid_follow_feedback"
+            )
+            self._debug(
+                "follow_command_rejected",
+                feedback=feedback,
+                message=message,
+            )
+            self._finish(
+                "failed", "follow_rejected", "FOLLOW_REJECTED",
+                {"message": message},
+            )
+            return
+
+        self._debug("follow_command_accepted", feedback=feedback)
+
+    async def _request_follow_stop(self):
+        try:
+            await self.send_robot_command({
+                "command": "stop_follow_action",
+                "action_id": self.action_id,
+            })
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+            self._debug("stop_command_failed", error=error_text)
+            return error_text
+        return None
+
+    async def _fail_execution(self, error):
+        error_text = f"{type(error).__name__}: {error}"
+        self._debug("execution_failed", error=error_text)
+        cleanup_error = await self._request_follow_stop()
+        data = {"error": error_text}
+        if cleanup_error is not None:
+            data["cleanup_error"] = cleanup_error
+        self._finish(
+            "failed", "execution_error", "FOLLOW_EXECUTION_ERROR", data
+        )
 
     async def _acquire_target(self):
         acquisition_id = f"{self.action_id}:acquire-person"
@@ -178,13 +197,13 @@ class FollowPersonExecutor:
                 return False
 
             self._debug("lidar_track_lost", payload=payload)
-            await self.send_robot_command({
-                "command": "stop_follow_action",
-                "action_id": self.action_id,
-            })
+            cleanup_error = await self._request_follow_stop()
+            data = {"tracker_state": "lost"}
+            if cleanup_error is not None:
+                data["cleanup_error"] = cleanup_error
             self._finish(
                 "failed", "target_lost", "LIDAR_TRACK_LOST",
-                {"tracker_state": "lost"},
+                data,
             )
             return True
 
@@ -268,38 +287,52 @@ class FollowPersonExecutor:
         if runner is not None and runner is not asyncio.current_task():
             runner.cancel()
         acquisition_id = f"{self.action_id}:acquire-person"
+        cleanup_errors = {}
         if (
-            self.find_target_executor.active
+            self.find_target_executor is not None
+            and self.find_target_executor.active
             and self.find_target_executor.action_id == acquisition_id
         ):
-            await self.find_target_executor.stop(reason_code)
-        await self.send_robot_command({
-            "command": "stop_follow_action",
-            "action_id": self.action_id,
-        })
+            try:
+                await self.find_target_executor.stop(reason_code)
+            except Exception as error:
+                cleanup_errors["acquisition_cleanup_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+        follow_cleanup_error = await self._request_follow_stop()
+        if follow_cleanup_error is not None:
+            cleanup_errors["cleanup_error"] = follow_cleanup_error
         self._hand_target_override_active = False
-        result = self._finish("cancelled", "stopped", reason_code)
+        result = self._finish(
+            "cancelled", "stopped", reason_code, cleanup_errors
+        )
         if runner is not None and runner is not asyncio.current_task():
             await asyncio.gather(runner, return_exceptions=True)
         return result
 
     def _finish(self, status, outcome, reason_code=None, data=None):
+        result_data = dict(data or {})
         self._debug(
             "finished",
             status=status,
             outcome=outcome,
             reason_code=reason_code,
-            data=data or {},
-        )
-        if self.track_action is not None:
-            self.track_action.set_follow_person_active(False)
-        result = ActionResult(
-            self.action_id or "unassigned", "follow_person", status,
-            target=self.target, outcome=outcome, reason_code=reason_code,
-            retryable=status == "failed", data=data or {},
+            data=result_data,
         )
         self.active = False
         self._hand_target_override_active = False
+        if self.track_action is not None:
+            try:
+                self.track_action.set_follow_person_active(False)
+            except Exception as error:
+                result_data["tracking_cleanup_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+        result = ActionResult(
+            self.action_id or "unassigned", "follow_person", status,
+            target=self.target, outcome=outcome, reason_code=reason_code,
+            retryable=status == "failed", data=result_data,
+        )
         future = self.completion_future
         if future is not None and not future.done():
             future.set_result(result)

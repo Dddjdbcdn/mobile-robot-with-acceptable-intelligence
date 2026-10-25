@@ -14,6 +14,7 @@ from actions.tracking.person_pose import (
 from actions.tracking.stable_seed import StableTargetSeedTracker
 from actions.tracking.target_catalog import (
     HUMAN_TRACKABLE_PARTS,
+    YOLO_OBJECT_CLASSES,
     normalize_human_target,
     normalize_object_target,
 )
@@ -29,6 +30,7 @@ class TrackingService:
     OBJECT_FAILURE_GRACE_FRAMES = 3
     OBJECT_REACQUIRE_ATTEMPTS = 3
     OBJECT_REACQUIRE_DELAY_SECONDS = 0.25
+    YOLO_OBJECT_DETECTION_TIMEOUT_SECONDS = 1.0
     TARGET_SEED_SAMPLES = StableTargetSeedTracker.SAMPLE_COUNT
     PERSON_POINT_MAX_AGE_SECONDS = StableTargetSeedTracker.INPUT_MAX_AGE_SECONDS
     PERSON_SEED_UPDATE_HZ = 5.0
@@ -207,7 +209,10 @@ class TrackingService:
 
         jpeg_bytes = None
         snapshot = None
-        if allow_grounding_dino:
+        if (
+            allow_grounding_dino
+            and normalized_target not in YOLO_OBJECT_CLASSES
+        ):
             jpeg_bytes = await asyncio.to_thread(
                 self.camera.jpeg_bytes_snapshot,
                 70,
@@ -260,7 +265,10 @@ class TrackingService:
 
         self.active = True
         self.completion_future = asyncio.get_running_loop().create_future()
-        self._tracking_task = asyncio.create_task(self._object_tracking_loop())
+        self._tracking_task = self._create_tracking_task(
+            self._object_tracking_loop,
+            kind="object",
+        )
 
         return ActionResult(
             action_id=self.action_id,
@@ -286,6 +294,11 @@ class TrackingService:
         tracking_bbox = None
         detection_source = None
         detection_confidence = None
+
+        if target in YOLO_OBJECT_CLASSES:
+            yolo_detection = await self._detect_yolo_object(target)
+            if yolo_detection is not None:
+                return yolo_detection
 
         if allow_grounding_dino:
             if jpeg_bytes is None:
@@ -327,6 +340,66 @@ class TrackingService:
         )
 
         return detection_source, detection_confidence
+
+    async def _detect_yolo_object(self, target):
+        """Initialize CSRT from one fresh object-mode inference."""
+        async with self.yolo.object_detection_mode():
+            sequence, _ = self.yolo.detection_snapshot()
+            if not await self.yolo.wait_for_inference_after(
+                sequence,
+                timeout=self.YOLO_OBJECT_DETECTION_TIMEOUT_SECONDS,
+            ):
+                return None
+
+            (
+                current_sequence,
+                detections,
+                frame,
+                timing,
+            ) = self.yolo.detection_snapshot_with_tracking_frame()
+            if current_sequence <= sequence or frame is None:
+                return None
+
+            matches = [
+                detection for detection in detections
+                if detection.get("class") == target
+                and detection.get("bbox")
+            ]
+            if not matches:
+                return None
+
+            selected = max(
+                matches,
+                key=lambda item: float(item.get("confidence") or 0.0),
+            )
+            camera_sequence = timing.get("camera_sequence")
+            if not isinstance(camera_sequence, int):
+                return None
+
+            bbox = selected["bbox"]
+            frame_height, frame_width = frame.shape[:2]
+            x1 = max(
+                0, min(round(float(bbox["x1"])), frame_width - 1)
+            )
+            y1 = max(
+                0, min(round(float(bbox["y1"])), frame_height - 1)
+            )
+            x2 = max(0, min(round(float(bbox["x2"])), frame_width))
+            y2 = max(0, min(round(float(bbox["y2"])), frame_height))
+            width = x2 - x1
+            height = y2 - y1
+            if width < 2 or height < 2:
+                return None
+
+            confidence = float(selected.get("confidence") or 0.0)
+            self.detection_confidence = confidence
+            self.csrt_tracker.begin_tracking(
+                detection_sequence=camera_sequence,
+                initialization_frame=frame,
+                bbox_xywh=(x1, y1, width, height),
+                target=target,
+            )
+            return "yoloe-11m", confidence
 
     async def _object_tracking_loop(self):
         failure_frames = 0
@@ -438,7 +511,10 @@ class TrackingService:
 
         self.active = True
         self.completion_future = asyncio.get_running_loop().create_future()
-        self._tracking_task = asyncio.create_task(self._person_tracking_loop())
+        self._tracking_task = self._create_tracking_task(
+            self._person_tracking_loop,
+            kind="person",
+        )
 
         return ActionResult(
             action_id=self.action_id,
@@ -548,6 +624,56 @@ class TrackingService:
         self._last_person_lidar_seed_key = seed_key
         return True
 
+    def _create_tracking_task(self, tracking_loop, *, kind):
+        """Run a tracking loop without allowing stale active state on failure."""
+        session_id = self.action_id
+        return asyncio.create_task(
+            self._supervise_tracking_loop(tracking_loop, session_id),
+            name=f"track-{kind}-{session_id}",
+        )
+
+    async def _supervise_tracking_loop(self, tracking_loop, session_id):
+        try:
+            await tracking_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            error_detail = f"{type(error).__name__}: {error}"
+            print(
+                f"[TRACKING][{session_id}] loop_failed "
+                f"error={error_detail!r}",
+                flush=True,
+            )
+            if not self.active or self.action_id != session_id:
+                return
+            try:
+                await self.stop(
+                    reason_code="TRACKING_LOOP_ERROR",
+                    status="failed",
+                    outcome="tracking_loop_error",
+                    data={"error": error_detail},
+                )
+            except Exception as stop_error:
+                # Local action state must still become terminal even if the
+                # robot command channel fails at the same time as tracking.
+                print(
+                    f"[TRACKING][{session_id}] cleanup_command_failed "
+                    f"error={type(stop_error).__name__}: {stop_error}",
+                    flush=True,
+                )
+                if self.active and self.action_id == session_id:
+                    self.complete_tracking(
+                        status="failed",
+                        outcome="tracking_loop_error",
+                        reason_code="TRACKING_LOOP_ERROR",
+                        data={
+                            "error": error_detail,
+                            "cleanup_error": (
+                                f"{type(stop_error).__name__}: {stop_error}"
+                            ),
+                        },
+                    )
+
     async def _publish_person_visual_observation(
         self,
         person,
@@ -595,8 +721,16 @@ class TrackingService:
             return False
         distance = camera_state["camera_tof_range"]
 
-        frame_height, frame_width = self.camera.snapshot(
-        ).tracking_bgr.shape[:2]
+        try:
+            frame_height, frame_width = self.camera.snapshot(
+            ).tracking_bgr.shape[:2]
+        except RuntimeError as error:
+            if str(error) != "No camera frame is available.":
+                raise
+            # CameraStream deliberately clears its latest frame while a USB
+            # camera reconnects. That short gap invalidates this ToF sample,
+            # but it must not terminate the continuous tracking session.
+            return False
         bbox = person["bbox"]
         projected = {
             name: (int(point["x"]), int(point["y"]))
@@ -938,6 +1072,7 @@ class TrackingService:
         status="cancelled",
         outcome="tracking_stopped",
         reset_camera=True,
+        data=None,
     ):
         if not self.active:
             return
@@ -959,6 +1094,7 @@ class TrackingService:
             status=status,
             outcome=outcome,
             reason_code=reason_code,
+            data=data,
         )
 
         if (tracking_task is not None

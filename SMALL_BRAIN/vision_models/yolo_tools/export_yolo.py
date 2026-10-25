@@ -4,7 +4,6 @@ classes = [
     "guitar",
     "chair",
     "table",
-    "person",
     "laptop",
     "door",
     "television",
@@ -21,7 +20,11 @@ classes = [
     "microphone",
     "smartphone",
     "air conditioner",
-    "remote control"
+    "remote control",
+    "board",
+    "tree",
+    "car",
+    "elevator"
 ]
 
 # 1. Get text prompt embeddings from the pretrained seg model

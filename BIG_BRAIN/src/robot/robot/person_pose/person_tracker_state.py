@@ -35,7 +35,7 @@ class TrackerSettings:
     recovery_expand_delay_seconds: float = 0.50
     velocity_decay_time_seconds: float = 1.0
     visual_gate_confirm_seconds: float = 1.0
-    visual_missing_in_fov_timeout_seconds: float = 3.0
+    visual_missing_in_fov_timeout_seconds: float = 5.0
     visual_recovery_confirm_seconds: float = 1.0
     visual_recovery_timeout_seconds: float = 8.0
     visual_centered_gate_deg: float = 10.0

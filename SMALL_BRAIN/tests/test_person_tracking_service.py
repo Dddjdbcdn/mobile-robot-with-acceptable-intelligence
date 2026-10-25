@@ -726,6 +726,17 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(expired, ())
 
+    async def test_snapshot_reports_gallery_update_age(self):
+        service = self.make_service()
+        initial = await service.update(
+            1, self.frame(),
+            [person("target", 0.3, [1, 0, 0])], captured_at=152.0)
+        self.assertEqual(initial[0].gallery_update_age_seconds, 0.0)
+
+        lost = await service.update(
+            2, self.frame(), [], captured_at=152.4)
+        self.assertAlmostEqual(lost[0].gallery_update_age_seconds, 0.4)
+
     async def test_follow_session_retains_target_past_timeout(self):
         service = self.make_service(lost_timeout_seconds=1.0)
         await service.update(
@@ -764,7 +775,7 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(
             track.person["bbox"]["normalized_center_x"], 0.32)
 
-    async def test_debug_gallery_survives_loss_and_is_deleted_on_expiry(self):
+    async def test_gallery_survives_expiry_until_new_gallery_is_active(self):
         with tempfile.TemporaryDirectory() as directory:
             config = PersonTrackingConfig(
                 embedding_interval_frames=1,
@@ -784,7 +795,28 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.update(2, self.frame(), [], captured_at=170.1)
             self.assertTrue(path.is_file())
             await service.update(3, self.frame(), [], captured_at=170.7)
+            self.assertTrue(path.is_file())
+            retired = service._retired_gallery_track
+            self.assertIsNotNone(retired)
+            self.assertEqual(len(retired.gallery), 1)
+
+            # A confirmed partial detection does not have a valid ReID crop,
+            # so it must not retire the previous gallery yet.
+            await service.update(
+                4, self.frame(),
+                [partial_person("partial", 0.4)], captured_at=170.8)
+            self.assertTrue(path.is_file())
+            self.assertIs(service._retired_gallery_track, retired)
+
+            await service.update(
+                5, self.frame(),
+                [person("replacement", 0.4, [0, 1, 0])],
+                captured_at=170.9,
+            )
+            self.assertIsNone(service._retired_gallery_track)
             self.assertFalse(path.exists())
+            self.assertTrue(
+                (Path(directory) / "id_0002_gallery.jpg").is_file())
 
 
 if __name__ == "__main__":

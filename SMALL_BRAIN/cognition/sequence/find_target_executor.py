@@ -8,6 +8,7 @@ import time
 from actions.action_result import ActionResult
 from cognition.manager.world_state import robot_state
 from actions.tracking.target_catalog import (
+    YOLO_OBJECT_CLASSES,
     normalize_human_target,
     normalize_object_target,
 )
@@ -62,8 +63,11 @@ class FindTargetExecutor:
         map_navigation_action,
         send_map_overlay,
         move_camera_action=None,
+        yolo_search_action=None,
     ):
         self.search_action = search_action
+        self.yolo_search_action = yolo_search_action
+        self._last_search_action = search_action
         self.track_action = track_action
         self.navigation_action = navigation_action
         self.see_action = see_action
@@ -172,8 +176,9 @@ class FindTargetExecutor:
             await self.navigation_action.stop(reason_code)
         if self.map_navigation_action.active:
             await self.map_navigation_action.stop(reason_code)
-        if self.search_action.active:
-            await self.search_action.stop(reason_code)
+        for search_action in (self.search_action, self.yolo_search_action):
+            if search_action is not None and search_action.active:
+                await search_action.stop(reason_code)
 
         result = self._complete(
             status="cancelled",
@@ -190,6 +195,8 @@ class FindTargetExecutor:
             result = None
             if self.target_kind == "person":
                 result = await self._try_fast_person_tracking()
+            elif self.target_kind == "object":
+                result = await self._try_fast_object_tracking()
             if result is None:
                 person = robot_state.get("person") or {}
                 robot_pose = robot_state.get("pose") or {}
@@ -273,6 +280,30 @@ class FindTargetExecutor:
             "person_tracking_reused"
             if (tracked.data or {}).get("reused_tracking")
             else "person_tracked_in_current_view"
+        )
+        if self.approach_target:
+            return await self._track_approach_and_reacquire(0)
+        return tracked
+
+    async def _try_fast_object_tracking(self) -> ActionResult | None:
+        """Try the current YOLO frame before starting an object search."""
+        normalized_target = normalize_object_target(self.target)
+        if normalized_target not in YOLO_OBJECT_CLASSES:
+            return None
+
+        tracked = await self._track(
+            allow_grounding_dino=False,
+            step="direct_object",
+        )
+        if tracked.status != "succeeded":
+            if tracked.reason_code == "OBJECT_DETECTION_FAILED":
+                return None
+            return tracked
+
+        self._completed_steps.append(
+            "object_tracking_reused"
+            if (tracked.data or {}).get("reused_tracking")
+            else "object_tracked_in_current_view"
         )
         if self.approach_target:
             return await self._track_approach_and_reacquire(0)
@@ -518,7 +549,8 @@ class FindTargetExecutor:
                 )
             candidate_context = None
 
-            observation = self.search_action.last_observation_frame
+            search_action = self._last_search_action
+            observation = search_action.last_observation_frame
             candidate_type = str(
                 (observation or {}).get("candidate_type") or ""
             )
@@ -547,7 +579,7 @@ class FindTargetExecutor:
                 visual_observation = (
                     dict(observation) if isinstance(observation, dict) else None
                 )
-                self.search_action.last_observation_frame = None
+                search_action.last_observation_frame = None
                 waypoint_count_before = self._search_waypoint_count
                 if (
                     self.target_kind != "place"
@@ -678,16 +710,18 @@ class FindTargetExecutor:
         candidate_context=None,
     ):
         """Run one search step; tracking begins after search returns found."""
+        search_action = self._search_action_for_target()
+        self._last_search_action = search_action
         if (
-            self.search_action.active
-            and self._normalize_target(self.search_action.target)
+            search_action.active
+            and self._normalize_target(search_action.target)
             == self._normalize_target(self.target)
-            and self.search_action.search_mode
+            and search_action.search_mode
             == ("place" if self.target_kind == "place" else "specific")
         ):
-            search_result = await self.search_action.wait_until_finished()
+            search_result = await search_action.wait_until_finished()
         else:
-            search_result = await self.search_action.start_searching(
+            search_result = await search_action.start_searching(
                 target=self.target,
                 action_id=self._step_id(step),
                 effort=effort,
@@ -701,16 +735,25 @@ class FindTargetExecutor:
                 person_search=self.target_kind == "person",
             )
             search_result = await self._terminal_result(
-                self.search_action, search_result
+                search_action, search_result
             )
-        coverage_frames = self.search_action.last_coverage_frames or (
-            [self.search_action.last_observation_frame]
-            if self.search_action.last_observation_frame
+        coverage_frames = search_action.last_coverage_frames or (
+            [search_action.last_observation_frame]
+            if search_action.last_observation_frame
             else []
         )
         if self._remember_search_pose(step, frames=coverage_frames):
             await self._publish_map_overlay()
         return search_result
+
+    def _search_action_for_target(self):
+        if (
+            self.yolo_search_action is not None
+            and self.target_kind == "object"
+            and normalize_object_target(self.target) in YOLO_OBJECT_CLASSES
+        ):
+            return self.yolo_search_action
+        return self.search_action
 
     def _remember_search_pose(self, reason, pose=None, frames=None):
         """Upsert robot poses and attach every camera view captured there."""

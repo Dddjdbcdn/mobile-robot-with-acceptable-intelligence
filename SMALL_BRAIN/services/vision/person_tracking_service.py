@@ -52,8 +52,8 @@ class PersonTrackingConfig:
     recent_geometry_minimum_iou: float = 0.02
     recent_geometry_maximum_center_distance: float = 0.35
     multi_person_minimum_similarity: float = 0.60
-    single_person_reacquisition_minimum_similarity: float = 0.50
-    multi_person_reacquisition_minimum_similarity: float = 0.55
+    single_person_reacquisition_minimum_similarity: float = 0.45
+    multi_person_reacquisition_minimum_similarity: float = 0.50
     reid_winner_margin: float = 0.12
     reacquisition_confirmation_frames: int = 3
 
@@ -199,6 +199,7 @@ class PersonTrackSnapshot:
     appearance_cost: float | None = None
     pose_cost: float | None = None
     pose_cost_is_fallback: bool = False
+    gallery_update_age_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -237,6 +238,7 @@ class _TargetTrack:
     association_confidence: float = 1.0
     gallery: list[_AppearanceSample] = field(default_factory=list)
     appearance_prototype: np.ndarray | None = None
+    gallery_last_updated_at: float | None = None
     appearance_match_source: str = "WAIT"
     reid_similarity: float | None = None
     association_cost: float | None = None
@@ -396,6 +398,10 @@ class PersonTrackingService:
         self.lost_timeout_seconds = self.config.lost_timeout_seconds
 
         self._tracks: dict[int, _TargetTrack] = {}
+        # Keep the most recently retired appearance memory until a replacement
+        # target has learned its first embedding.  This avoids throwing away
+        # the only useful ReID gallery during the gap between targets.
+        self._retired_gallery_track: _TargetTrack | None = None
         self._next_candidate_id = 1
         self._next_track_id = 1
         self._last_embedding_sequence: int | None = None
@@ -494,6 +500,25 @@ class PersonTrackingService:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    @staticmethod
+    def _has_appearance_memory(track):
+        return bool(track.gallery or track.appearance_prototype is not None)
+
+    def _retire_gallery(self, track):
+        if not self._has_appearance_memory(track):
+            return
+        previous = self._retired_gallery_track
+        if previous is not None and previous is not track:
+            self._delete_debug_image(previous)
+        self._retired_gallery_track = track
+
+    def _clear_retired_gallery(self):
+        retired = self._retired_gallery_track
+        if retired is None:
+            return
+        self._delete_debug_image(retired)
+        self._retired_gallery_track = None
 
     def _save_debug_image(self, track):
         path = self._debug_path(track)
@@ -1030,6 +1055,7 @@ class PersonTrackingService:
                 self._debug_reid_source = match.source
         self._last_embedding_sequence = sequence
         track.mark_gallery_support(embedding, sequence, self.config)
+        activating_gallery = not self._has_appearance_memory(track)
         changed = track.add_embedding(
             embedding,
             quality=_confidence(person),
@@ -1038,7 +1064,10 @@ class PersonTrackingService:
             sequence=sequence,
             config=self.config,
         )
+        if activating_gallery and self._has_appearance_memory(track):
+            self._clear_retired_gallery()
         if changed:
+            track.gallery_last_updated_at = track.last_seen_at
             self._debug_gallery_decision = "updated"
             self._save_debug_image(track)
         else:
@@ -1183,7 +1212,7 @@ class PersonTrackingService:
     def _reset_target(self, *, keep_preference=False):
         track = self._target()
         if track is not None:
-            self._delete_debug_image(track)
+            self._retire_gallery(track)
         self._tracks.clear()
         self._reacquisition_hits = 0
         self._last_embedding_sequence = None
@@ -1225,6 +1254,11 @@ class PersonTrackingService:
                 appearance_cost=track.appearance_cost,
                 pose_cost=track.pose_cost,
                 pose_cost_is_fallback=track.pose_cost_is_fallback,
+                gallery_update_age_seconds=(
+                    None
+                    if track.gallery_last_updated_at is None
+                    else max(0.0, now - track.gallery_last_updated_at)
+                ),
             ),)
         with self._snapshot_lock:
             self._snapshot_sequence = int(sequence)

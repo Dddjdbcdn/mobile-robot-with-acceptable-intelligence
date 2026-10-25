@@ -20,6 +20,37 @@ def person(x1, x2, nose_x):
 
 
 class CameraDisplayTests(unittest.TestCase):
+    def test_person_status_shows_id_gallery_size_and_update_age(self):
+        track = PersonTrackSnapshot(
+            track_id=14,
+            state="lost",
+            visible=False,
+            person=None,
+            bbox=(0.1, 0.1, 0.3, 0.9),
+            association_confidence=0.0,
+            appearance_samples=4,
+            age_seconds=8.0,
+            missing_seconds=1.2,
+            gallery_update_age_seconds=2.6,
+        )
+
+        value, color = camera_display.person_tracking_status_display([track])
+
+        self.assertEqual(
+            value,
+            "ID 14  |  4 IMAGES  |  2.6s",
+        )
+        self.assertEqual(color, (0, 210, 255))
+
+    def test_person_status_shows_empty_state(self):
+        value, color = camera_display.person_tracking_status_display(())
+
+        self.assertEqual(
+            value,
+            "ID --  |  0 IMAGES  |  --",
+        )
+        self.assertEqual(color, (170, 170, 170))
+
     def test_debug_board_toggle_is_clickable_and_shows_state(self):
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
 
@@ -66,6 +97,28 @@ class CameraDisplayTests(unittest.TestCase):
             )
         self.assertEqual(debug_bounds[0], bounds["speaker"][0])
         self.assertLess(debug_bounds[3], bounds["speaker"][1])
+
+    def test_vision_mode_control_shows_mode_and_lock_state(self):
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            bounds = camera_display.draw_vision_mode_control(
+                frame, object_mode=True, enabled=True
+            )
+        self.assertIn("YOLO OBJECT [O]", put_text.call_args.args[1])
+        left, top, right, bottom = bounds
+        self.assertTrue(camera_display.control_button_clicked(
+            camera_display.cv2.EVENT_LBUTTONUP,
+            (left + right) // 2,
+            (top + bottom) // 2,
+            bounds,
+        ))
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            camera_display.draw_vision_mode_control(
+                frame, object_mode=False, enabled=False
+            )
+        self.assertIn("YOLO POSE LOCKED", put_text.call_args.args[1])
 
     def test_debug_board_no_longer_shows_lift_row(self):
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)

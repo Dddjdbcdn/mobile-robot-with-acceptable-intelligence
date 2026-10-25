@@ -87,6 +87,7 @@ class CognitionManager:
         map_navigation_action,
         hand_gesture_interface,
         proximity_cooldown=8.0,
+        yolo=None,
     ):
         self.navigation_action = navigation_action
         self.search_action = search_action
@@ -97,6 +98,7 @@ class CognitionManager:
         self.find_target_executor = find_target_executor
         self.follow_person_executor = follow_person_executor
         self.response_manager = response_manager
+        self.yolo = yolo
 
         self.events = asyncio.Queue()
         self.action_results = []
@@ -391,6 +393,7 @@ class CognitionManager:
         self.current_action_task.add_done_callback(action_executed)
 
     async def execute_request(self, request):
+        self._restore_pose_debug_mode()
         name = request.function_name
         args = request.arguments
 
@@ -881,7 +884,27 @@ class CognitionManager:
             self._autonomy_task)["active_actions"]
         return self.current_action_task is not None or bool(active)
 
+    def debug_object_mode_available(self):
+        """Only allow manual vision switching while robot actions are idle."""
+        return bool(
+            self.yolo is not None
+            and not self._robot_action_in_progress()
+            and not self.track_action.active
+        )
+
+    def toggle_debug_object_mode(self):
+        if not self.debug_object_mode_available():
+            return False
+        self.yolo.set_debug_object_mode(not self.yolo.debug_object_mode)
+        return True
+
+    def _restore_pose_debug_mode(self):
+        yolo = getattr(self, "yolo", None)
+        if yolo is not None:
+            yolo.set_debug_object_mode(False)
+
     def _replace_autonomy_task(self, coroutine, name):
+        self._restore_pose_debug_mode()
         old_task = self._autonomy_task
         if old_task is not None and not old_task.done():
             old_task.cancel()

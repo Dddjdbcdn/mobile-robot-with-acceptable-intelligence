@@ -3,7 +3,7 @@ import time
 import unittest
 import math
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
@@ -103,6 +103,19 @@ class PersonTofMaskTests(unittest.TestCase):
                 self.person,
                 robot_state["camera"],
             )
+
+        self.assertFalse(intersects)
+
+    def test_missing_camera_frame_during_reconnect_is_rejected(self):
+        self.set_camera_seed(time.monotonic())
+        self.service.camera.snapshot = Mock(
+            side_effect=RuntimeError("No camera frame is available."),
+        )
+
+        intersects = self.service._person_tof_intersects_mask(
+            self.person,
+            robot_state["camera"],
+        )
 
         self.assertFalse(intersects)
 
@@ -228,6 +241,84 @@ class FollowTrackingStateTests(unittest.TestCase):
         self.service.set_follow_person_active(False)
 
         self.assertEqual(persistence, [True, False])
+
+
+class TrackingLoopSupervisionTests(unittest.IsolatedAsyncioTestCase):
+
+    def make_service(self, send_robot_command=None):
+        service = TrackingService.__new__(TrackingService)
+        service.active = True
+        service.action_id = "tracking-session"
+        service.target = "person"
+        service._tracking_task = None
+        service._tracked_person_id = 1
+        service._visual_target_override = None
+        service._follow_person_active = False
+        service.stable_seeds = StableTargetSeedTracker()
+        service.completion_future = asyncio.get_running_loop().create_future()
+        service.send_robot_command = (
+            send_robot_command
+            or AsyncMock(return_value={"status": "accepted"})
+        )
+        service.person_tracking_service = SimpleNamespace(
+            stop_target_tracking=Mock(),
+        )
+        service.csrt_tracker = SimpleNamespace(stop_tracking=Mock())
+        return service
+
+    async def test_loop_failure_stops_and_completes_tracking(self):
+        service = self.make_service()
+
+        async def failing_loop():
+            raise RuntimeError("camera unavailable")
+
+        task = asyncio.create_task(
+            service._supervise_tracking_loop(
+                failing_loop,
+                service.action_id,
+            ),
+        )
+        service._tracking_task = task
+        await task
+
+        self.assertFalse(service.active)
+        service.send_robot_command.assert_awaited_once()
+        self.assertEqual(
+            service.send_robot_command.await_args.args[0]["command"],
+            "stop_tracking",
+        )
+        result = service.completion_future.result()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason_code, "TRACKING_LOOP_ERROR")
+        self.assertEqual(
+            result.data["error"],
+            "RuntimeError: camera unavailable",
+        )
+
+    async def test_loop_failure_clears_state_when_stop_command_fails(self):
+        command = AsyncMock(side_effect=TimeoutError("robot unavailable"))
+        service = self.make_service(command)
+
+        async def failing_loop():
+            raise ValueError("bad tracking frame")
+
+        task = asyncio.create_task(
+            service._supervise_tracking_loop(
+                failing_loop,
+                service.action_id,
+            ),
+        )
+        service._tracking_task = task
+        await task
+
+        self.assertFalse(service.active)
+        result = service.completion_future.result()
+        self.assertEqual(result.reason_code, "TRACKING_LOOP_ERROR")
+        self.assertEqual(
+            result.data["cleanup_error"],
+            "TimeoutError: robot unavailable",
+        )
+
 
 class MissingKeypointTrackingTests(unittest.IsolatedAsyncioTestCase):
 

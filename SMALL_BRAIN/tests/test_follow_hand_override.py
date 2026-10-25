@@ -11,6 +11,59 @@ from cognition.sequence.follow_person_executor import FollowPersonExecutor
 
 class FollowLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
+    async def test_execution_and_cleanup_errors_still_finish(self):
+        class TrackAction:
+            session_id = "follow-1:acquire-person:direct_person"
+
+            def __init__(self):
+                self.follow_states = []
+
+            def set_follow_person_active(self, active):
+                self.follow_states.append(active)
+
+        async def send_robot_command(command):
+            if command["command"] == "follow_action":
+                raise RuntimeError("follow transport failed")
+            raise RuntimeError("stop transport failed")
+
+        track_action = TrackAction()
+        executor = FollowPersonExecutor(None, track_action, send_robot_command)
+        executor._acquire_target = AsyncMock(return_value=ActionResult(
+            "follow-1", "follow_person", "succeeded", target="person",
+            outcome="person_acquired",
+        ))
+
+        started = await executor.start("person", "follow-1")
+        result = await asyncio.wait_for(executor.wait_until_finished(), 1.0)
+        await executor._runner
+
+        self.assertEqual(started.status, "running")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason_code, "FOLLOW_EXECUTION_ERROR")
+        self.assertIn("follow transport failed", result.data["error"])
+        self.assertIn("stop transport failed", result.data["cleanup_error"])
+        self.assertFalse(executor.active)
+        self.assertEqual(track_action.follow_states, [True, False])
+
+    async def test_stop_command_error_does_not_strand_follow(self):
+        track_action = SimpleNamespace(set_follow_person_active=Mock())
+        executor = FollowPersonExecutor(
+            None,
+            track_action,
+            AsyncMock(side_effect=RuntimeError("bridge unavailable")),
+        )
+        executor.active = True
+        executor.action_id = "follow-stop"
+        executor.target = "person"
+        executor.completion_future = asyncio.get_running_loop().create_future()
+
+        result = await executor.stop("USER_REQUESTED")
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertIn("bridge unavailable", result.data["cleanup_error"])
+        self.assertFalse(executor.active)
+        self.assertTrue(executor.completion_future.done())
+
     async def test_acquisition_delegates_to_find_executor_and_waits_for_seed(self):
         find_target = SimpleNamespace(
             start=AsyncMock(return_value=ActionResult(

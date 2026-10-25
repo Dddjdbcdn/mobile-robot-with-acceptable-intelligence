@@ -172,7 +172,7 @@ class Stm32SensorBridge(Node):
         range_msg.header.frame_id = frame_id
         range_msg.radiation_type = Range.INFRARED
         range_msg.field_of_view = math.radians(27.0)
-        range_msg.min_range = 0.05
+        range_msg.min_range = 0.001
         range_msg.max_range = 0.3
 
         if distance < 0.0 or distance > range_msg.max_range or not math.isfinite(distance):

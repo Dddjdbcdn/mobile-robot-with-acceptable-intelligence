@@ -81,6 +81,58 @@ class ControlledYolo:
 
 
 class SearchCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_assessment_error_completes_search(self):
+        search = SearchAction(
+            ws=type("WS", (), {
+                "send": AsyncMock(side_effect=RuntimeError("socket closed")),
+            })(),
+            send_robot_command=None,
+            camera=SnapshotCamera(),
+        )
+
+        started = await search.start_searching(
+            target="bottle",
+            action_id="find-error",
+            initial_view_only=True,
+        )
+        result = await asyncio.wait_for(search.wait_until_finished(), 1.0)
+
+        self.assertEqual(started.status, "running")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.outcome, "search_error")
+        self.assertEqual(result.reason_code, "SEARCH_EXECUTION_ERROR")
+        self.assertEqual(result.data["failed_task"], "initial_frame_assessment")
+        self.assertIn("socket closed", result.data["error"])
+        self.assertFalse(search.active)
+
+    async def test_assessment_task_error_completes_search(self):
+        search = SearchAction(
+            ws=type("WS", (), {"send": AsyncMock()})(),
+            send_robot_command=None,
+            camera=SnapshotCamera(),
+        )
+        await search.start_searching(
+            target="bottle",
+            action_id="find-assessment-error",
+            initial_view_only=True,
+        )
+        await search.search_task
+
+        async def fail_assessment():
+            raise RuntimeError("bad assessment")
+
+        task = search.create_assessment_task(
+            fail_assessment(),
+            name="assess_frame_search",
+        )
+        result = await asyncio.wait_for(search.wait_until_finished(), 1.0)
+        await task
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason_code, "SEARCH_EXECUTION_ERROR")
+        self.assertEqual(result.data["failed_task"], "assess_frame_search")
+        self.assertFalse(search.active)
+
     async def test_stop_cancels_assessment_before_recentering(self):
         camera_movement = BlockingCameraMovement()
         search = SearchAction(

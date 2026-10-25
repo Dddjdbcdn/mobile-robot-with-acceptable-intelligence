@@ -119,7 +119,7 @@ class TorsoTargetEstimator:
     )
     HIP_NAMES = ("left_hip", "right_hip")
     DEFAULT_OFFSET_X_BOX_RATIO = 0.0
-    DEFAULT_OFFSET_Y_BOX_RATIO = -0.20
+    DEFAULT_OFFSET_Y_BOX_RATIO = -0.35
 
     def __init__(
         self,

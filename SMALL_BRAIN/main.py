@@ -17,6 +17,7 @@ from typing import Any
 from services.display.camera_display import display_camera_loop
 
 from actions.search_action import SearchAction
+from actions.yolo_search_action import YoloSearchAction
 from actions.see_action import SeeAction
 from actions.track_action import TrackingService
 from actions.move_camera_action import MoveCameraAction
@@ -486,6 +487,13 @@ async def main():
                 move_camera_action=move_camera_action,
                 yolo=yolo,
             )
+            yolo_search_action = YoloSearchAction(
+                ws=ws,
+                send_robot_command=send_robot_command,
+                camera=camera,
+                move_camera_action=move_camera_action,
+                yolo=yolo,
+            )
             navigation_action = NavigationAction(send_robot_command)
             see_action = SeeAction(
                 ws=ws,
@@ -511,6 +519,7 @@ async def main():
                 map_navigation_action=map_navigation_action,
                 send_map_overlay=map_client.command,
                 move_camera_action=move_camera_action,
+                yolo_search_action=yolo_search_action,
             )
             hand_gesture_interface = HandGestureInterface(hand_landmarks)
             follow_person_executor = FollowPersonExecutor(
@@ -529,6 +538,7 @@ async def main():
                 find_target_executor=find_target_executor,
                 follow_person_executor=follow_person_executor,
                 response_manager=response_manager,
+                yolo=yolo,
             )
             session_update = {
                 "type": "session.update",
@@ -600,6 +610,7 @@ async def main():
                     person_tracking,
                     app,
                     connection_status,
+                    cognitive_manager,
                 ), person_tracking.run(), hand_gesture_interface.run(yolo),
                 wait_for_dino(),
                 wait_for_yolo())
