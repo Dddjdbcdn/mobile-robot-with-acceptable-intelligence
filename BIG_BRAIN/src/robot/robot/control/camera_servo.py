@@ -1,11 +1,16 @@
-"""Pan/tilt camera servo control and a one-shot hardware test."""
+"""Pan/tilt camera servo control and an interactive hardware test."""
 
 import argparse
 import math
+import select
+import sys
+import termios
 import threading
 import time
+import tty
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Float32
 
@@ -61,6 +66,23 @@ class CameraServo:
             self.min_tilt_angle, min(self.max_tilt_angle, float(tilt_angle))
         )
         self._publish_angles()
+
+    def handle_teleop_key(self, key, step_degrees=5.0):
+        """Apply an I/J/K/L/comma teleop key and report whether it was handled."""
+        key = key.lower()
+        if key == "i":
+            self.set_angles(self.pan_angle, self.tilt_angle - step_degrees)
+        elif key == "j":
+            self.set_angles(self.pan_angle - step_degrees, self.tilt_angle)
+        elif key == "k":
+            self.set_angles(self.reset_pan_angle, self.reset_tilt_angle)
+        elif key == "l":
+            self.set_angles(self.pan_angle + step_degrees, self.tilt_angle)
+        elif key == ",":
+            self.set_angles(self.pan_angle, self.tilt_angle + step_degrees)
+        else:
+            return False
+        return True
 
     def tracking_snapshot(self):
         with self.command_lock:
@@ -222,13 +244,78 @@ def test_servo(pan_angle=95.0, tilt_angle=90.0):
             rclpy.shutdown()
 
 
+def teleop_servo(pan_angle=95.0, tilt_angle=90.0, step_degrees=5.0):
+    """Control the camera servos from a terminal until Q or Ctrl-C."""
+    if not sys.stdin.isatty():
+        raise RuntimeError("servo teleop requires an interactive terminal")
+    if step_degrees <= 0.0:
+        raise ValueError("step_degrees must be greater than zero")
+
+    initialized_here = not rclpy.ok()
+    if initialized_here:
+        rclpy.init(args=[])
+    node = Node("camera_servo_teleop")
+    original_terminal = termios.tcgetattr(sys.stdin)
+    try:
+        pan_pub = node.create_publisher(Float32, "/stm32/servo_pan", 10)
+        tilt_pub = node.create_publisher(Float32, "/stm32/servo_tilt", 10)
+        servo = CameraServo(pan_pub, tilt_pub, node.get_logger())
+        rclpy.spin_once(node, timeout_sec=0.5)
+        servo.set_angles(pan_angle, tilt_angle)
+
+        print(
+            "Camera servo teleop: I=tilt up, J=pan left, "
+            "K=reset, L=pan right, ,=tilt down, Q=quit"
+        )
+        print(f"Step: {step_degrees:g} degrees")
+        tty.setcbreak(sys.stdin.fileno())
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not readable:
+                continue
+            key = sys.stdin.read(1)
+            if key.lower() == "q" or key == "\x03":
+                break
+            if servo.handle_teleop_key(key, step_degrees):
+                print(
+                    f"\rpan={servo.pan_angle:5.1f}  "
+                    f"tilt={servo.tilt_angle:5.1f}   ",
+                    end="",
+                    flush=True,
+                )
+        print()
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal)
+        node.destroy_node()
+        if initialized_here:
+            rclpy.shutdown()
+
+
 def main(args=None):
-    parser = argparse.ArgumentParser(description="Send one camera servo pose")
+    parser = argparse.ArgumentParser(description="Teleoperate the camera servos")
     parser.add_argument("--pan", type=float, default=95.0)
     parser.add_argument("--tilt", type=float, default=90.0)
+    parser.add_argument(
+        "--step",
+        type=float,
+        default=5.0,
+        help="degrees moved by each key press (default: 5)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="publish --pan/--tilt once instead of starting keyboard teleop",
+    )
     parsed, _ = parser.parse_known_args(args)
-    pan, tilt = test_servo(parsed.pan, parsed.tilt)
-    print(f"Published camera servo pose: pan={pan:.1f}, tilt={tilt:.1f}")
+    if parsed.once:
+        pan, tilt = test_servo(parsed.pan, parsed.tilt)
+        print(f"Published camera servo pose: pan={pan:.1f}, tilt={tilt:.1f}")
+        return
+    try:
+        teleop_servo(parsed.pan, parsed.tilt, parsed.step)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
 
 
 if __name__ == "__main__":

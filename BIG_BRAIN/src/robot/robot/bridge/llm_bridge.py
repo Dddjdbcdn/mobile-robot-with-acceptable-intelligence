@@ -9,9 +9,9 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Range
-from std_msgs.msg import Empty, Float32, String
+from std_msgs.msg import Float32, String
 import tf2_geometry_msgs  # noqa: F401
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -86,6 +86,10 @@ class LLMRosBridge(Node):
         self.latest_person_pose_map = None
         self.latest_person_pose_at = None
         self.person_tracker_status = {"state": None}
+        self.lift_state = None
+        self.reset_state = None
+        self.stm32_health = None
+        self.stm32_health_at = None
         self.navigation = NavigationController(
             node=self,
             tf_buffer=self.tf_buffer,
@@ -111,7 +115,32 @@ class LLMRosBridge(Node):
         self.create_subscription(
             String, "/person_tracker/status", self.person_tracker_status_callback, 10
         )
-        self.create_subscription(Empty, "/big_brain/reset", self.reset_callback, 10)
+        self.create_subscription(
+            String,
+            "/lift_detector/state",
+            self.lift_state_callback,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self.create_subscription(
+            String,
+            "/reset/state",
+            self.reset_state_callback,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self.create_subscription(
+            String, "/stm32/debug_msg", self.stm32_debug_callback, qos
+        )
+        self.create_subscription(
+            String, "/big_brain/reset_reason", self.reset_callback, 10
+        )
         self.create_timer(0.05, self.state_pub_loop)
         self.create_timer(0.1, self.update_robot_pose)
         self.track_action_timer = self.create_timer(0.01, self.track_action_loop)
@@ -141,7 +170,7 @@ class LLMRosBridge(Node):
         msg.twist.angular.z = float(angular_z)
         self.cmd_pub.publish(msg)
 
-    def reset_callback(self, _message: Empty) -> None:
+    def reset_callback(self, message: String) -> None:
         self._set_tracking_enabled(False)
         self.tracking_body_active = False
         self.stop_all_motion()
@@ -152,7 +181,11 @@ class LLMRosBridge(Node):
         )
         self.latest_person_pose_map = None
         self.latest_person_pose_at = None
-        self.get_logger().info("Robot stopped and camera recentered")
+        reason = str(message.data or "MANUAL_RESET")
+        self.send_event("robot_reset", "requested", reason_code=reason)
+        self.get_logger().info(
+            "Robot stopped, camera recentered, and SMALL_BRAIN reset requested"
+        )
 
     def state_pub_loop(self):
         with self.pub_lock:
@@ -165,6 +198,18 @@ class LLMRosBridge(Node):
                 "person_pose": self._person_state(),
                 "person_tracker_state": self.person_tracker_status.get("state"),
                 "person_tracker_status": self.person_tracker_status,
+                "lift_state": self.lift_state,
+                "reset_state": self.reset_state,
+                "navigation_status": self.navigation.status_snapshot(),
+                "stm32_health": (
+                    {
+                        "message": self.stm32_health,
+                        "age_seconds": max(
+                            0.0, time.monotonic() - self.stm32_health_at
+                        ),
+                    }
+                    if self.stm32_health_at is not None else None
+                ),
             })
 
     def update_robot_pose(self):
@@ -219,6 +264,19 @@ class LLMRosBridge(Node):
             self.latest_person_pose_at = None
         self.navigation.note_person_tracker_state(state, previous, status)
 
+    def lift_state_callback(self, msg):
+        self.lift_state = str(msg.data or "").strip() or None
+
+    def reset_state_callback(self, msg):
+        self.reset_state = str(msg.data or "").strip() or None
+
+    def stm32_debug_callback(self, msg):
+        message = str(msg.data or "").strip()
+        if not message.startswith("[HEALTH]"):
+            return
+        self.stm32_health = message.removeprefix("[HEALTH]").strip()
+        self.stm32_health_at = time.monotonic()
+
     def camera_tof_callback(self, msg):
         self.camera_tof_range = msg.range
 
@@ -236,6 +294,16 @@ class LLMRosBridge(Node):
     def resolve_request(self, request):
         try:
             command = request.get("command")
+            if (
+                self.lift_state in {"lifted", "resetting"}
+                and command not in {
+                    "stop_follow_action", "stop_moving", "stop_tracking"
+                }
+            ):
+                return {
+                    "status": "error",
+                    "message": f"Robot is {self.lift_state}",
+                }
             if command == "move_camera":
                 self.servo.set_error(
                     request.get("delta_pan_angle", 0.0),

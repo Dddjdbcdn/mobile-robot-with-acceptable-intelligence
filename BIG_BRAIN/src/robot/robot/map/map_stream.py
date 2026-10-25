@@ -19,7 +19,10 @@ IMAGE_ENDPOINT = "tcp://127.0.0.1:5559"
 
 class MapImageStream:
     def __init__(self, node, tf_buffer, context):
-        from nav_msgs.msg import OccupancyGrid
+        from geometry_msgs.msg import PolygonStamped
+        from nav_msgs.msg import OccupancyGrid, Path
+        from sensor_msgs.msg import LaserScan
+        from std_msgs.msg import String
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
         self.node = node
@@ -35,6 +38,14 @@ class MapImageStream:
         self.state_lock = threading.Lock()
         self.map_msg = None
         self.cost_msg = None
+        self.local_cost_msg = None
+        self.scan_msg = None
+        self.footprint_msg = None
+        self.plan_msg = None
+        self.navigation_goal = None
+        self.reset_state = None
+        self._grid_received_at_unix_ns = {}
+        self._overlay_received_at_unix_ns = {}
         self._map_revision = 0
         self._map_received_at_unix_ns = 0
         self.analysis_lock = threading.Lock()
@@ -51,6 +62,23 @@ class MapImageStream:
         node.create_subscription(
             OccupancyGrid, "/global_costmap/costmap", self._cost, qos
         )
+        node.create_subscription(
+            OccupancyGrid, "/local_costmap/costmap", self._local_cost, qos
+        )
+        stream_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        node.create_subscription(LaserScan, "/scan", self._scan, stream_qos)
+        node.create_subscription(
+            PolygonStamped,
+            "/global_costmap/published_footprint",
+            self._footprint,
+            1,
+        )
+        node.create_subscription(Path, "/plan", self._plan, 1)
+        node.create_subscription(String, "/reset/state", self._reset_state, qos)
 
         self.stream_thread = threading.Thread(
             target=self._stream_loop,
@@ -64,10 +92,53 @@ class MapImageStream:
             self.map_msg = msg
             self._map_revision += 1
             self._map_received_at_unix_ns = time.time_ns()
+            self._grid_received_at_unix_ns["slam"] = self._map_received_at_unix_ns
 
     def _cost(self, msg):
         with self.state_lock:
             self.cost_msg = msg
+            self._grid_received_at_unix_ns["global_costmap"] = time.time_ns()
+
+    def _local_cost(self, msg):
+        with self.state_lock:
+            self.local_cost_msg = msg
+            self._grid_received_at_unix_ns["local_costmap"] = time.time_ns()
+
+    def _reset_state(self, msg):
+        with self.state_lock:
+            self.reset_state = str(msg.data or "").strip() or None
+
+    def _scan(self, msg):
+        with self.state_lock:
+            self.scan_msg = msg
+            self._overlay_received_at_unix_ns["lidar"] = time.time_ns()
+
+    def _footprint(self, msg):
+        with self.state_lock:
+            self.footprint_msg = msg
+            self._overlay_received_at_unix_ns["footprint"] = time.time_ns()
+
+    def _plan(self, msg):
+        with self.state_lock:
+            if self.navigation_goal is None:
+                return
+            self.plan_msg = msg
+            self._overlay_received_at_unix_ns["plan"] = time.time_ns()
+
+    def set_navigation_goal(self, pose):
+        """Expose the current Nav2 goal to the low-rate map display."""
+        normalized = self._overlay_pose(pose)
+        with self.state_lock:
+            self.navigation_goal = normalized
+            self.plan_msg = None
+            self._overlay_received_at_unix_ns.pop("plan", None)
+
+    def clear_navigation_goal(self):
+        """Remove completed/cancelled navigation data from the display."""
+        with self.state_lock:
+            self.navigation_goal = None
+            self.plan_msg = None
+            self._overlay_received_at_unix_ns.pop("plan", None)
 
     def map_revision(self):
         """Return the revision of the latest received /map message."""
@@ -98,6 +169,109 @@ class MapImageStream:
             "y": float(position.y),
             "yaw": yaw_of(orientation),
             "frame_id": frame_id,
+        }
+
+    def _transform_points(self, points, source_frame, target_frame):
+        """Transform a small diagnostic point set using the latest 2-D TF."""
+        if not points:
+            return []
+        if not source_frame or source_frame == target_frame:
+            return [(float(x), float(y)) for x, y in points]
+        import rclpy.time
+        try:
+            transform = self.tf.lookup_transform(
+                target_frame, source_frame, rclpy.time.Time()
+            ).transform
+        except Exception:
+            return []
+        q = transform.rotation
+        yaw = math.atan2(
+            2 * (q.w * q.z + q.x * q.y),
+            1 - 2 * (q.y * q.y + q.z * q.z),
+        )
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        tx = float(transform.translation.x)
+        ty = float(transform.translation.y)
+        return [
+            (tx + cosine * float(x) - sine * float(y),
+             ty + sine * float(x) + cosine * float(y))
+            for x, y in points
+        ]
+
+    def _diagnostic_overlays(self, target_frame):
+        """Build bounded, target-frame overlay arrays for one snapshot."""
+        with self.state_lock:
+            scan = self.scan_msg
+            footprint = self.footprint_msg
+            plan = self.plan_msg
+            goal = dict(self.navigation_goal) if self.navigation_goal else None
+            received_at = dict(self._overlay_received_at_unix_ns)
+
+        now = time.time_ns()
+        if now - received_at.get("lidar", 0) > 1_000_000_000:
+            scan = None
+        if now - received_at.get("footprint", 0) > 3_000_000_000:
+            footprint = None
+
+        lidar_points = []
+        if scan is not None:
+            count = len(scan.ranges)
+            stride = max(1, math.ceil(count / 180))
+            for index in range(0, count, stride):
+                distance = float(scan.ranges[index])
+                if not math.isfinite(distance):
+                    continue
+                if distance < float(scan.range_min) or distance > float(scan.range_max):
+                    continue
+                angle = float(scan.angle_min) + index * float(scan.angle_increment)
+                lidar_points.append((
+                    distance * math.cos(angle), distance * math.sin(angle)
+                ))
+            lidar_points = self._transform_points(
+                lidar_points, str(scan.header.frame_id), target_frame
+            )
+
+        footprint_points = []
+        if footprint is not None:
+            footprint_points = self._transform_points(
+                [(point.x, point.y) for point in footprint.polygon.points],
+                str(footprint.header.frame_id), target_frame,
+            )
+
+        plan_points = []
+        if plan is not None and plan.poses:
+            stride = max(1, math.ceil(len(plan.poses) / 200))
+            sampled = plan.poses[::stride]
+            plan_points = self._transform_points(
+                [(item.pose.position.x, item.pose.position.y) for item in sampled],
+                str(plan.header.frame_id), target_frame,
+            )
+
+        transformed_goal = None
+        if goal is not None:
+            point = self._transform_points(
+                [(goal["x"], goal["y"])], goal["frame_id"], target_frame
+            )
+            heading = self._transform_points(
+                [(goal["x"] + math.cos(goal["yaw"]),
+                  goal["y"] + math.sin(goal["yaw"]))],
+                goal["frame_id"], target_frame,
+            )
+            if point and heading:
+                transformed_goal = {
+                    "x": point[0][0],
+                    "y": point[0][1],
+                    "yaw": math.atan2(
+                        heading[0][1] - point[0][1],
+                        heading[0][0] - point[0][0],
+                    ),
+                }
+        return {
+            "lidar": lidar_points,
+            "footprint": footprint_points,
+            "plan": plan_points,
+            "goal": transformed_goal,
         }
 
     @staticmethod
@@ -268,11 +442,25 @@ class MapImageStream:
             if operation != "snapshot":
                 self.socket.send_json({"ok": True, "operation": operation})
                 return
-            crop_size_m = message.get("crop_size_m")
+            crop_size_m = self._normalize_crop_size(
+                message.get("crop_size_m")
+            )
             render_frontiers = bool(message.get("render_frontiers", False))
+            rotate_180 = bool(message.get("rotate_180", False))
             pending_navigation_pose = self._overlay_pose(
                 message.get("pending_navigation_pose")
             )
+            display_layer = str(message.get("display_layer") or "")
+            if display_layer:
+                metadata, jpeg = self._encode_grid_diagnostic(display_layer)
+                response_metadata = dict(metadata)
+                response_metadata["snapshot_request_id"] = str(
+                    message.get("request_id") or ""
+                )
+                self.socket.send_multipart([
+                    json.dumps(response_metadata).encode("utf-8"), jpeg,
+                ])
+                return
             try:
                 prepared, pose = self.prepare_map()
             except ValueError as error:
@@ -288,6 +476,7 @@ class MapImageStream:
                 crop_size_m=crop_size_m,
                 render_frontiers=render_frontiers,
                 pending_navigation_pose=pending_navigation_pose,
+                rotate_180=rotate_180,
             )
             response_metadata = dict(metadata)
             response_metadata["snapshot_request_id"] = str(
@@ -304,9 +493,80 @@ class MapImageStream:
                 "retryable": False,
             })
 
+    @staticmethod
+    def _normalize_crop_size(value):
+        """Validate the optional square view size supplied by map clients."""
+        if value is None:
+            return None
+        size = float(value)
+        if not 1.0 <= size <= 20.0:
+            raise ValueError("crop_size_m must be between 1 and 20 metres")
+        return size
+
+    def _encode_grid_diagnostic(self, layer):
+        sources = {
+            "slam": ("/map", "map_msg"),
+            "local_costmap": ("/local_costmap/costmap", "local_cost_msg"),
+            "global_costmap": ("/global_costmap/costmap", "cost_msg"),
+        }
+        if layer not in sources:
+            raise ValueError(f"unsupported display layer: {layer!r}")
+        topic, attribute = sources[layer]
+        with self.state_lock:
+            msg = getattr(self, attribute)
+            received_at = self._grid_received_at_unix_ns.get(layer, 0)
+            reset_state = self.reset_state
+        if msg is None:
+            raise ValueError(f"Waiting for OccupancyGrid on {topic}")
+        frame_id = str(msg.header.frame_id)
+        pose = self._pose(frame_id)
+        if pose is None:
+            raise ValueError(f"TF unavailable: {frame_id} -> {self.base_frame}")
+
+        started_at = time.monotonic()
+        overlays = self._diagnostic_overlays(frame_id)
+        image = self.renderer.render_grid_diagnostic(
+            msg, pose, layer, overlays=overlays
+        )
+        ok, jpeg = cv2.imencode(
+            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88]
+        )
+        if not ok:
+            raise RuntimeError("OpenCV failed to encode the diagnostic map JPEG")
+        self.sequence += 1
+        generated_at = time.time_ns()
+        metadata = {
+            "schema_version": 1,
+            "snapshot_id": uuid.uuid4().hex,
+            "snapshot_request_id": None,
+            "sequence": self.sequence,
+            "publish_mode": "on_request",
+            "display_layer": layer,
+            "source_topic": topic,
+            "frame_id": frame_id,
+            "robot_pose": pose,
+            "reset_state": reset_state,
+            "width": int(msg.info.width),
+            "height": int(msg.info.height),
+            "resolution": float(msg.info.resolution),
+            "source_age_ms": round(max(0, generated_at - received_at) / 1e6, 1),
+            "generated_at_unix_ns": generated_at,
+            "render_ms": round((time.monotonic() - started_at) * 1000, 1),
+            "overlay_counts": {
+                "lidar": len(overlays["lidar"]),
+                "footprint": len(overlays["footprint"]),
+                "plan": len(overlays["plan"]),
+                "goal": int(overlays["goal"] is not None),
+            },
+            "candidates": [],
+            "frontiers": [],
+        }
+        return metadata, jpeg.tobytes()
+
     def _compose_snapshot(
         self, prepared, pose, camera_pan_angle, crop_size_m=None,
         render_frontiers=False, pending_navigation_pose=None,
+        rotate_180=False,
     ):
         """Coordinate planning, visibility analysis, rendering, and metadata."""
         overlay = self.search_overlay
@@ -342,7 +602,7 @@ class MapImageStream:
             rendered = dict(prepared)
             rendered["background"], rendered["view"] = (
                 self.renderer.render_background(
-                    prepared, pose, view_size_m=view_size_m
+                    prepared, pose, view_size_m=view_size_m,
                 )
             )
             marker_scale = self.renderer.pose_marker_scale_for_crop(
@@ -357,10 +617,13 @@ class MapImageStream:
                 pose_marker_scale=marker_scale,
                 frontiers=(prepared["frontiers"] if render_frontiers else None),
                 pending_navigation_pose=pending_navigation_pose,
+                diagnostic_overlays=self._diagnostic_overlays(pose["frame_id"]),
             )
             return image, rendered["view"]
 
         image, image_view = render_view(crop_size_m)
+        if rotate_180:
+            image = self.renderer.rotate_180(image)
 
         mode = str((overlay or {}).get("mode") or "goal")
         search_poses = (overlay or {}).get("search_poses") or []
@@ -370,6 +633,7 @@ class MapImageStream:
             "snapshot_request_id": None,
             "frame_id": pose["frame_id"],
             "robot_pose": pose,
+            "reset_state": self.reset_state,
             "candidates": candidates,
             "frontiers": prepared["frontiers"],
             "pending_navigation_pose": pending_navigation_pose,
@@ -405,6 +669,7 @@ class MapImageStream:
                     "origin_y", "heading_yaw",
                 )
             },
+            "image_rotation_degrees": 180 if rotate_180 else 0,
         }
         if crop_size_m is not None:
             size = float(crop_size_m)
@@ -427,7 +692,7 @@ class MapImageStream:
 
     def _encode_snapshot(
         self, prepared, pose, crop_size_m=None, render_frontiers=False,
-        pending_navigation_pose=None,
+        pending_navigation_pose=None, rotate_180=False,
     ):
         started_at = time.monotonic()
         captured_at_unix_ns = time.time_ns()
@@ -436,6 +701,7 @@ class MapImageStream:
             prepared, pose, camera_pan_angle, crop_size_m=crop_size_m,
             render_frontiers=render_frontiers,
             pending_navigation_pose=pending_navigation_pose,
+            rotate_180=rotate_180,
         )
         ok, jpeg = cv2.imencode(
             ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]

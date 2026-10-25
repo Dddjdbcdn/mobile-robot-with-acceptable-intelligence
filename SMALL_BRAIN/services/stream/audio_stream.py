@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
 import numpy as np
 import pyaudio
 
@@ -19,6 +20,12 @@ class AudioApp:
         self.play_queue = queue.Queue()
         self.mic_queue = asyncio.Queue()
         self.loop = asyncio.get_event_loop()
+        self.output_muted = False
+        self.input_muted = False
+        self._voice_lock = threading.Lock()
+        self._person_speaking = False
+        self._playback_active = False
+        self._last_playback_at = 0.0
 
         self.input_device_index = self._resolve_device(
             "AUDIO_INPUT_DEVICE", input_device=True
@@ -104,8 +111,65 @@ class AudioApp:
 
     def mic_callback(self, in_data, frame_count, time_info, status):
         # Safely push raw mic bytes to the async event loop
-        self.loop.call_soon_threadsafe(self.mic_queue.put_nowait, in_data)
+        if not self.input_muted:
+            self.loop.call_soon_threadsafe(self.mic_queue.put_nowait, in_data)
         return (None, pyaudio.paContinue)
+
+    def set_output_muted(self, muted):
+        """Gate speaker playback without stopping the audio device."""
+        self.output_muted = bool(muted)
+        if self.output_muted:
+            self.clear_queue()
+            with self._voice_lock:
+                self._playback_active = False
+
+    def set_input_muted(self, muted):
+        """Gate microphone upload while leaving visual gestures active."""
+        muted = bool(muted)
+        if muted == self.input_muted:
+            return
+        self.input_muted = muted
+        if muted:
+            self.set_person_speaking(False)
+            self.clear_mic_queue()
+            # Wake the sender so it can also clear audio already buffered by
+            # the Realtime service. ``None`` is an internal control marker.
+            self.mic_queue.put_nowait(None)
+
+    def clear_mic_queue(self):
+        while not self.mic_queue.empty():
+            try:
+                self.mic_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def queue_audio(self, data):
+        if not self.output_muted:
+            self.play_queue.put(data)
+
+    def set_person_speaking(self, speaking):
+        """Record the server-VAD speech state for the local display."""
+        with self._voice_lock:
+            self._person_speaking = bool(speaking) and not self.input_muted
+
+    def voice_state(self):
+        """Return the locally observable voice state without audio analysis."""
+        with self._voice_lock:
+            person_speaking = self._person_speaking
+            playback_active = self._playback_active
+            last_playback_at = self._last_playback_at
+        if person_speaking and not self.input_muted:
+            return "listening"
+        if (
+            not self.output_muted
+            and (
+                playback_active
+                or not self.play_queue.empty()
+                or time.monotonic() - last_playback_at <= 0.25
+            )
+        ):
+            return "talking"
+        return "idle"
 
     def playback_worker(self):
         speed_factor = 1.25
@@ -113,19 +177,29 @@ class AudioApp:
         while self.running:
             try:
                 data = self.play_queue.get(timeout=0.1)
-                
-                # 1. Convert bytes to numpy array (16-bit PCM)
-                audio_array = np.frombuffer(data, dtype=np.int16)
-                
-                # 2. Resample by picking indices (The "lowest effort" trick)
-                # This creates the higher pitch/faster speed instantly
-                indices = np.round(np.arange(0, len(audio_array), speed_factor)).astype(int)
-                indices = indices[indices < len(audio_array)]
-                resampled_data = audio_array[indices]
-                
-                # 3. Write back to stream
-                self.output_stream.write(resampled_data.tobytes())
-                self._playback_error_reported = False
+                if self.output_muted:
+                    continue
+                with self._voice_lock:
+                    self._playback_active = True
+                try:
+                    # 1. Convert bytes to numpy array (16-bit PCM)
+                    audio_array = np.frombuffer(data, dtype=np.int16)
+
+                    # 2. Resample by picking indices (The "lowest effort" trick)
+                    # This creates the higher pitch/faster speed instantly
+                    indices = np.round(
+                        np.arange(0, len(audio_array), speed_factor)
+                    ).astype(int)
+                    indices = indices[indices < len(audio_array)]
+                    resampled_data = audio_array[indices]
+
+                    # 3. Write back to stream
+                    self.output_stream.write(resampled_data.tobytes())
+                    self._playback_error_reported = False
+                finally:
+                    with self._voice_lock:
+                        self._playback_active = False
+                        self._last_playback_at = time.monotonic()
                 
             except queue.Empty:
                 continue
@@ -171,6 +245,11 @@ async def send_mic_audio(ws, app):
     """Continuously stream microphone data to OpenAI."""
     while True:
         data = await app.mic_queue.get()
+        if data is None:
+            await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            continue
+        if app.input_muted:
+            continue
         base64_audio = base64.b64encode(data).decode('utf-8')
         event = {
             "type": "input_audio_buffer.append",

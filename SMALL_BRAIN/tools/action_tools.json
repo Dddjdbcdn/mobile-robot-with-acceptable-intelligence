@@ -94,7 +94,7 @@
   {
     "type": "function",
     "name": "follow_person",
-    "description": "Continuously move behind a person. Trigger phrases include 'follow me', 'come with me', 'walk with me', 'stay with me', 'trail me', and 'follow that person'. The robot finds the person, initializes camera/ToF-assisted lidar tracking, and repeatedly follows the estimated pose with Nav2 until stop_follow is called. Do not use follow_person for 'look at me' (use watch_target) or 'come here' (use explicit navigation).",
+    "description": "Continuously move behind a person. Trigger phrases include 'follow me', 'come with me', 'walk with me', 'stay with me', 'trail me', and 'follow that person'. The robot finds the person, initializes camera/ToF-assisted lidar tracking, and repeatedly follows the estimated pose with Nav2 until stop_movement is called. Do not use follow_person for 'look at me' (use watch_target) or 'come here' (use explicit navigation).",
     "parameters": {
       "type": "object",
       "properties": {

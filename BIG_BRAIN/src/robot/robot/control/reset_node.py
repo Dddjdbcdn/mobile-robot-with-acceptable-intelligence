@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import math
-from pathlib import Path
+import os
+import queue
+import threading
 import time
 
 from geometry_msgs.msg import TwistStamped
 from nav2_msgs.srv import ClearEntireCostmap
+from nav_msgs.msg import OccupancyGrid
 import rclpy
+import zmq
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2
 from slam_toolbox.srv import Reset
 from std_msgs.msg import Empty, String
@@ -27,10 +30,9 @@ STABLE_GYRO_RAD_S = 0.12
 GRAVITY_M_S2 = 9.80665
 GRAVITY_TOLERANCE_M_S2 = 1.5
 PLACEMENT_COSINE = math.cos(math.radians(10.0))
-DIAGNOSTIC_PERIOD_SECONDS = 0.1
-DIAGNOSTIC_LOG_MAX_BYTES = 5 * 1024 * 1024
 CLIFF_FRESH_SECONDS = 0.5
-BIG_BRAIN_ROOT = Path(__file__).resolve().parents[4]
+RESET_ENDPOINT = os.environ.get("RESET_ENDPOINT", "tcp://127.0.0.1:5561")
+MANUAL_RESET_TIMEOUT_SECONDS = 12.0
 
 
 class LiftDetector:
@@ -45,13 +47,6 @@ class LiftDetector:
         self.lift_rotation = 0.0
         self.lifted_at: float | None = None
         self.stable_since: float | None = None
-        self.last_acceleration = (math.nan, math.nan, math.nan)
-        self.last_angular_velocity = (math.nan, math.nan, math.nan)
-        self.last_acceleration_norm = math.nan
-        self.last_gyro_norm = math.nan
-        self.last_gx = math.nan
-        self.last_alignment = math.nan
-        self.sample_valid = False
 
     @staticmethod
     def norm(values: tuple[float, float, float]) -> float:
@@ -66,9 +61,7 @@ class LiftDetector:
     ) -> str | None:
         values = (*acceleration, *angular_velocity, now)
         if not all(math.isfinite(value) for value in values):
-            self.sample_valid = False
             return None
-        self.sample_valid = True
 
         dt = 0.0 if self.last_time is None else max(
             0.0, min(0.1, now - self.last_time)
@@ -76,19 +69,6 @@ class LiftDetector:
         self.last_time = now
         acceleration_norm = self.norm(acceleration)
         gyro_norm = self.norm(angular_velocity)
-        self.last_acceleration = acceleration
-        self.last_angular_velocity = angular_velocity
-        self.last_acceleration_norm = acceleration_norm
-        self.last_gyro_norm = gyro_norm
-        self.last_gx = angular_velocity[0]
-
-        if self.gravity_direction is not None and acceleration_norm > 1e-6:
-            self.last_alignment = sum(
-                value * baseline / acceleration_norm
-                for value, baseline in zip(
-                    acceleration, self.gravity_direction, strict=True
-                )
-            )
 
         if self.state == "calibrating":
             stable = (
@@ -141,7 +121,6 @@ class LiftDetector:
                 direction, self.gravity_direction, strict=True
             )
         )
-        self.last_alignment = alignment
         stable = (
             gyro_norm <= STABLE_GYRO_RAD_S
             and abs(acceleration_norm - GRAVITY_M_S2)
@@ -167,16 +146,24 @@ class LiftDetector:
         self.stable_since = None
 
 
-class LiftNode(Node):
+class ResetNode(Node):
     """Coordinate stopping and a fresh spatial session after placement."""
 
     def __init__(self) -> None:
-        super().__init__("lift_detector")
+        super().__init__("reset_node")
         self.detector = LiftDetector()
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Imu, "/imu", self._imu_callback, qos)
         self.create_subscription(
             PointCloud2, "/cliff_layer", self._cliff_callback, qos
+        )
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            OccupancyGrid, "/map", self._map_callback, map_qos
         )
         self.stop_publisher = self.create_publisher(
             TwistStamped, "/diff_drive_controller/cmd_vel", 10
@@ -184,8 +171,26 @@ class LiftNode(Node):
         self.reset_publisher = self.create_publisher(
             Empty, "/big_brain/reset", 10
         )
+        self.reset_reason_publisher = self.create_publisher(
+            String, "/big_brain/reset_reason", 10
+        )
         self.state_publisher = self.create_publisher(
-            String, "/lift_detector/state", 10
+            String,
+            "/lift_detector/state",
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self.reset_state_publisher = self.create_publisher(
+            String,
+            "/reset/state",
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
         )
         self.slam = self.create_client(Reset, "/slam_toolbox/reset")
         self.local_costmap = self.create_client(
@@ -197,30 +202,31 @@ class LiftNode(Node):
             "/global_costmap/clear_entirely_global_costmap",
         )
         self._reset_futures = None
+        self._reset_mode: str | None = None
+        self._manual_reset = None
+        self._manual_requests: queue.Queue = queue.Queue()
         self._retry_after = 0.0
         self._last_state = None
-        self._last_diagnostic_at = -math.inf
-        self._diagnostic_sequence = 0
+        self._last_reset_state = None
         self._last_cliff_at: float | None = None
         self._cliff_point_count = 0
-        self._diagnostic_log_path: Path | None = (
-            BIG_BRAIN_ROOT / "results" / "lift_detection.log"
-        )
-        try:
-            self._diagnostic_log_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            self.get_logger().error(
-                f"Lift diagnostics disabled: cannot create log directory: {error}"
-            )
-            self._diagnostic_log_path = None
+        self._map_revision = 0
+        self._map_wait_revision: int | None = None
 
         self.create_timer(0.1, self._control_tick)
+        self._zmq_stop = threading.Event()
+        self._zmq_context = zmq.Context()
+        self._zmq_thread = threading.Thread(
+            target=self._serve_reset_requests,
+            name="lift-reset-zmq",
+            daemon=True,
+        )
+        self._zmq_thread.start()
         self._publish_state()
-        self._write_session_start()
-        if self._diagnostic_log_path is not None:
-            self.get_logger().info(
-                f"Lift diagnostics: {self._diagnostic_log_path}"
-            )
+        self._publish_reset_state()
+        self.get_logger().info(
+            f"Listening for manual reset requests on {RESET_ENDPOINT}"
+        )
 
     def _imu_callback(self, message: Imu) -> None:
         now = time.monotonic()
@@ -236,27 +242,30 @@ class LiftNode(Node):
                 float(message.angular_velocity.y),
                 float(message.angular_velocity.z),
             ),
-            self._placement_clear(now),
+            placement_clear=self._placement_clear(now),
         )
         if event == "lifted":
-            self.get_logger().warning(
-                "Lift detected: canceling motion"
-            )
-            self.reset_publisher.publish(Empty())
-            self._publish_stop()
+            self.get_logger().warning("Lift detected: canceling motion")
             self._publish_state()
+            self._publish_reset_state()
+            self.stop_movement("ROBOT_LIFTED")
         elif event == "placed":
             self.get_logger().info(
                 "Stable upright placement detected; requesting spatial reset"
             )
             self._publish_state()
-        self._write_diagnostic(event or "", force=event is not None)
 
     def _cliff_callback(self, message: PointCloud2) -> None:
         self._last_cliff_at = time.monotonic()
         self._cliff_point_count = message.width * message.height
         if self._cliff_point_count > 0:
             self.detector.stable_since = None
+
+    def _map_callback(self, message: OccupancyGrid) -> None:
+        cell_count = int(message.info.width) * int(message.info.height)
+        if cell_count <= 0 or len(message.data) != cell_count:
+            return
+        self._map_revision += 1
 
     def _cliff_fresh(self, now: float) -> bool:
         return (
@@ -265,7 +274,10 @@ class LiftNode(Node):
         )
 
     def _placement_clear(self, now: float) -> bool:
-        return not self._cliff_fresh(now) or self._cliff_point_count == 0
+        return (
+            not self._cliff_fresh(now)
+            or self._cliff_point_count == 0
+        )
 
     def _publish_stop(self) -> None:
         message = TwistStamped()
@@ -273,19 +285,79 @@ class LiftNode(Node):
         message.header.frame_id = "base_footprint"
         self.stop_publisher.publish(message)
 
-    def _request_spatial_reset(self) -> None:
+    def stop_movement(self, reason: str) -> None:
+        """Stop all motion and clear transient behavior for either reset path."""
+        self._publish_stop()
+        self.reset_publisher.publish(Empty())
+        self.reset_reason_publisher.publish(String(data=reason))
+
+    def reset_map(self) -> bool:
+        """Start one SLAM and costmap reset; return false until services exist."""
         clients = (self.slam, self.local_costmap, self.global_costmap)
         if not all(client.service_is_ready() for client in clients):
-            return
+            return False
         request = Reset.Request()
-        # SLAM remains active while carried; this reset starts a clean map.
         request.pause_new_measurements = False
         self._reset_futures = (
             self.slam.call_async(request),
             self.local_costmap.call_async(ClearEntireCostmap.Request()),
             self.global_costmap.call_async(ClearEntireCostmap.Request()),
         )
-        self._write_diagnostic("spatial_reset_requested", force=True)
+        return True
+
+    def _serve_reset_requests(self) -> None:
+        socket = self._zmq_context.socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        try:
+            socket.bind(RESET_ENDPOINT)
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
+            while not self._zmq_stop.is_set():
+                if socket not in dict(poller.poll(timeout=100)):
+                    continue
+                request = socket.recv_json()
+                request_id = (
+                    str(request.get("request_id") or "")
+                    if isinstance(request, dict) else ""
+                )
+                if (
+                    not isinstance(request, dict)
+                    or request.get("operation") != "reset"
+                ):
+                    socket.send_json({
+                        "ok": False,
+                        "error": "Unsupported reset request",
+                        "request_id": request_id,
+                    })
+                    continue
+                completion: queue.Queue = queue.Queue(maxsize=1)
+                self._manual_requests.put((request_id, completion))
+                response_deadline = (
+                    time.monotonic() + MANUAL_RESET_TIMEOUT_SECONDS + 1.0
+                )
+                while not self._zmq_stop.is_set():
+                    try:
+                        ok, error = completion.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        if time.monotonic() >= response_deadline:
+                            ok, error = False, "Manual reset timed out"
+                            break
+                else:
+                    break
+                response = {
+                    "ok": ok,
+                    "operation": "reset",
+                    "request_id": request_id,
+                }
+                if error:
+                    response["error"] = error
+                socket.send_json(response)
+        except Exception as error:
+            if not self._zmq_stop.is_set():
+                self.get_logger().error(f"Reset ZMQ service failed: {error}")
+        finally:
+            socket.close(linger=0)
 
     def _reset_succeeded(self) -> bool | None:
         if self._reset_futures is None:
@@ -304,114 +376,65 @@ class LiftNode(Node):
             return False
 
     def _control_tick(self) -> None:
+        self._accept_manual_reset()
         state = self.detector.state
-        if state in {"lifted", "resetting"}:
+        if state in {"lifted", "resetting"} or self._reset_mode is not None:
             self._publish_stop()
-        if state == "resetting":
+        if state == "resetting" and self._reset_mode is None:
+            self._reset_mode = "lift"
+        if self._reset_mode is not None:
             now = time.monotonic()
-            if self._reset_futures is None and now >= self._retry_after:
-                self._request_spatial_reset()
-            result = self._reset_succeeded()
-            if result is True:
-                self.detector.reset_complete()
-                self._reset_futures = None
-                self.get_logger().info(
-                    "SLAM and costmaps reset; movement may resume"
-                )
-                self._write_diagnostic("spatial_reset_complete", force=True)
-            elif result is False:
-                self._reset_futures = None
-                self._retry_after = now + 1.0
-                self._write_diagnostic("spatial_reset_failed", force=True)
+            if self._map_wait_revision is not None:
+                if self._map_revision > self._map_wait_revision:
+                    if self._reset_mode == "lift":
+                        self.detector.reset_complete()
+                    self._finish_reset(True, None)
+                    self.get_logger().info(
+                        "Fresh SLAM map received; movement may resume"
+                    )
+            else:
+                if self._reset_futures is None and now >= self._retry_after:
+                    self.reset_map()
+                result = self._reset_succeeded()
+                if result is True:
+                    self._map_wait_revision = self._map_revision
+                    self.get_logger().info(
+                        "SLAM and costmaps reset; waiting for a fresh map"
+                    )
+                elif result is False:
+                    self._reset_futures = None
+                    self._retry_after = now + 1.0
         self._publish_state()
+        self._publish_reset_state()
 
-    @staticmethod
-    def _number(value: float, digits: int = 3) -> str:
-        return f"{value:.{digits}f}" if math.isfinite(value) else "--"
-
-    def _write_log_line(self, line: str) -> None:
-        path = self._diagnostic_log_path
-        if path is None:
-            return
+    def _accept_manual_reset(self) -> None:
         try:
-            if path.exists() and path.stat().st_size >= DIAGNOSTIC_LOG_MAX_BYTES:
-                path.replace(path.with_suffix(".log.1"))
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(line + "\n")
-        except OSError as error:
-            self.get_logger().error(f"Lift diagnostics disabled: {error}")
-            self._diagnostic_log_path = None
-
-    def _write_session_start(self) -> None:
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        self._write_log_line(
-            f"[LIFT] session=start wall_time={timestamp} "
-            f"rate_threshold={LIFT_RATE_RAD_S:.3f}rad/s "
-            f"rotation_threshold={LIFT_ROTATION_RAD:.3f}rad "
-            f"minimum_lift={MINIMUM_LIFT_SECONDS:.2f}s "
-            f"stable_gyro={STABLE_GYRO_RAD_S:.3f}rad/s "
-            f"gravity={GRAVITY_M_S2:.3f}+/-{GRAVITY_TOLERANCE_M_S2:.3f}m/s2 "
-            f"upright=10.0deg stable_time={STABLE_SECONDS:.2f}s "
-            f"cliff_fresh={CLIFF_FRESH_SECONDS:.2f}s"
-        )
-
-    def _write_diagnostic(self, event: str, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self._last_diagnostic_at < DIAGNOSTIC_PERIOD_SECONDS:
+            request_id, completion = self._manual_requests.get_nowait()
+        except queue.Empty:
             return
-        self._last_diagnostic_at = now
-        self._diagnostic_sequence += 1
-        detector = self.detector
-        alignment = detector.last_alignment
-        tilt = (
-            math.degrees(math.acos(max(-1.0, min(1.0, alignment))))
-            if math.isfinite(alignment)
-            else math.nan
+        if self._reset_mode is not None:
+            completion.put((False, "A spatial reset is already running"))
+            return
+        if self.detector.state in {"lifted", "resetting"}:
+            completion.put((False, "Place the robot down before resetting"))
+            return
+        self._manual_reset = (
+            request_id,
+            completion,
         )
-        stable_for = (
-            max(0.0, now - detector.stable_since)
-            if detector.stable_since is not None
-            else 0.0
-        )
-        cliff_fresh = self._cliff_fresh(now)
-        placement_clear = not cliff_fresh or self._cliff_point_count == 0
-        acceleration = detector.last_acceleration
-        gyro = detector.last_angular_velocity
-        criteria = (
-            abs(detector.last_gx) >= LIFT_RATE_RAD_S,
-            detector.lift_rotation >= LIFT_ROTATION_RAD,
-            detector.lifted_at is not None
-            and now - detector.lifted_at >= MINIMUM_LIFT_SECONDS,
-            detector.last_gyro_norm <= STABLE_GYRO_RAD_S,
-            abs(detector.last_acceleration_norm - GRAVITY_M_S2)
-            <= GRAVITY_TOLERANCE_M_S2,
-            math.isfinite(alignment) and alignment >= PLACEMENT_COSINE,
-            placement_clear,
-            stable_for >= STABLE_SECONDS,
-        )
-        values = (
-            self._number(acceleration[0]), self._number(acceleration[1]),
-            self._number(acceleration[2]), self._number(detector.last_acceleration_norm),
-            self._number(gyro[0]), self._number(gyro[1]), self._number(gyro[2]),
-            self._number(detector.last_gyro_norm), self._number(detector.lift_rotation),
-            self._number(alignment), self._number(tilt),
-        )
-        self._write_log_line(
-            f"[LIFT] seq={self._diagnostic_sequence} state={detector.state} "
-            f"event={event or '--'} valid={int(detector.sample_valid)} "
-            f"accel=({values[0]},{values[1]},{values[2]})m/s2 "
-            f"accel_norm={values[3]}m/s2 "
-            f"gyro=({values[4]},{values[5]},{values[6]})rad/s "
-            f"gyro_norm={values[7]}rad/s lift_rotation={values[8]}rad "
-            f"alignment={values[9]} tilt={values[10]}deg "
-            f"criteria=rate:{int(criteria[0])},rotation:{int(criteria[1])},"
-            f"min_time:{int(criteria[2])},gyro:{int(criteria[3])},"
-            f"gravity:{int(criteria[4])},upright:{int(criteria[5])},"
-            f"cliff_clear:{int(criteria[6])},stable:{int(criteria[7])} "
-            f"cliff_fresh:{int(cliff_fresh)},"
-            f"cliff_points:{self._cliff_point_count} "
-            f"stable_for={stable_for:.2f}s"
-        )
+        self._reset_mode = "manual"
+        self._retry_after = 0.0
+        self.stop_movement("MANUAL_RESET")
+        self.get_logger().info("Manual reset: motion stopped; resetting map")
+
+    def _finish_reset(self, ok: bool, error: str | None) -> None:
+        if self._reset_mode == "manual" and self._manual_reset is not None:
+            self._manual_reset[1].put((ok, error))
+        self._manual_reset = None
+        self._reset_mode = None
+        self._reset_futures = None
+        self._map_wait_revision = None
+        self._retry_after = 0.0
 
     def _publish_state(self) -> None:
         state = self.detector.state
@@ -421,10 +444,33 @@ class LiftNode(Node):
         self.state_publisher.publish(String(data=state))
         self.get_logger().info(f"Lift state: {state}")
 
+    def _publish_reset_state(self) -> None:
+        if self._reset_mode == "manual":
+            state = "resetting_manual"
+        elif self.detector.state == "lifted":
+            state = "lifted"
+        elif self.detector.state == "resetting" or self._reset_mode == "lift":
+            state = "resetting_lift"
+        elif self.detector.state == "calibrating":
+            state = "initializing"
+        else:
+            state = "ready"
+        if state == self._last_reset_state:
+            return
+        self._last_reset_state = state
+        self.reset_state_publisher.publish(String(data=state))
+        self.get_logger().info(f"Reset state: {state}")
+
+    def destroy_node(self) -> None:
+        self._zmq_stop.set()
+        self._zmq_thread.join(timeout=1.0)
+        self._zmq_context.term()
+        super().destroy_node()
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = LiftNode()
+    node = ResetNode()
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):

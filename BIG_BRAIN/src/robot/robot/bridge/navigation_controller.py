@@ -12,6 +12,7 @@ It is deliberately a helper owned by the bridge, rather than another ROS node.
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,6 +145,97 @@ class NavigationController:
         self.person_visual_recovery_active = False
         self.person_recovery_remaining_yaw = 0.0
 
+        self._navigation_status_lock = threading.Lock()
+        self._navigation_status = {
+            "state": "idle",
+            "mode": None,
+            "distance_remaining": None,
+            "navigation_seconds": 0.0,
+            "recoveries": 0,
+            "error_code": None,
+            "error_message": "",
+            "updated_at": time.monotonic(),
+        }
+
+    def _set_navigation_status(self, state, *, mode=None, reset=False, **fields):
+        """Update the small display snapshot without publishing another topic."""
+        with self._navigation_status_lock:
+            if reset:
+                self._navigation_status.update({
+                    "mode": mode,
+                    "distance_remaining": None,
+                    "navigation_seconds": 0.0,
+                    "recoveries": 0,
+                    "error_code": None,
+                    "error_message": "",
+                })
+            elif mode is not None:
+                self._navigation_status["mode"] = mode
+            self._navigation_status.update(fields)
+            self._navigation_status["state"] = str(state)
+            self._navigation_status["updated_at"] = time.monotonic()
+
+    def status_snapshot(self):
+        """Return navigation state for the existing BIG-to-SMALL ZMQ stream."""
+        with self._navigation_status_lock:
+            status = dict(self._navigation_status)
+        age = max(0.0, time.monotonic() - status.pop("updated_at"))
+        if status["state"] in {"succeeded", "canceled"} and age > 5.0:
+            return {
+                "state": "idle",
+                "mode": None,
+                "distance_remaining": None,
+                "navigation_seconds": 0.0,
+                "recoveries": 0,
+                "error_code": None,
+                "error_message": "",
+                "age_seconds": 0.0,
+            }
+        status["age_seconds"] = age
+        return status
+
+    @staticmethod
+    def _duration_seconds(duration):
+        return float(duration.sec) + float(duration.nanosec) / 1_000_000_000.0
+
+    def _navigation_feedback(self, message, navigation):
+        if self.active is not navigation:
+            return
+        feedback = message.feedback
+        distance = float(feedback.distance_remaining)
+        if not math.isfinite(distance):
+            distance = None
+        self._set_navigation_status(
+            "navigating",
+            mode=navigation.mode,
+            distance_remaining=distance,
+            navigation_seconds=self._duration_seconds(feedback.navigation_time),
+            recoveries=max(0, int(feedback.number_of_recoveries)),
+            error_code=None,
+            error_message="",
+        )
+
+    def _show_map_goal(self, pose):
+        map_stream = getattr(self, "map_stream", None)
+        if map_stream is None:
+            return
+        orientation = pose.pose.orientation
+        yaw = math.atan2(
+            2 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
+        map_stream.set_navigation_goal({
+            "x": pose.pose.position.x,
+            "y": pose.pose.position.y,
+            "yaw": yaw,
+            "frame_id": pose.header.frame_id,
+        })
+
+    def _clear_map_goal(self):
+        map_stream = getattr(self, "map_stream", None)
+        if map_stream is not None:
+            map_stream.clear_navigation_goal()
+
     @property
     def is_active(self):
         return (
@@ -199,7 +291,9 @@ class NavigationController:
         self.follow_recovery_failure = None
         self.follow_goal_generator.reset()
         self.sequence = None
+        NavigationController._clear_map_goal(self)
         self.stop_robot()
+        self._set_navigation_status("idle", reset=True)
 
     def shutdown(self):
         self.stop()
@@ -256,6 +350,7 @@ class NavigationController:
             self.active = None
             if active.goal_handle is not None:
                 active.goal_handle.cancel_goal_async()
+            NavigationController._clear_map_goal(self)
         self.stop_robot()
 
     def _start_or_resume_visual_recovery(self, status, *, relocated=False):
@@ -314,6 +409,10 @@ class NavigationController:
             target_yaw,
         )
         self.person_recovery_spin = recovery
+        self._set_navigation_status(
+            "recovery_spin", mode="follow", error_code=None,
+            error_message="",
+        )
 
         goal = Spin.Goal()
         goal.target_yaw = target_yaw
@@ -363,6 +462,7 @@ class NavigationController:
         self.follow_recovery_deadline = None
         self.follow_recovery_failure = None
         self.follow_timer.reset()
+        self._set_navigation_status("waiting_target", mode="follow")
 
     def _fail_visual_recovery(self, reason_code, data=None):
         """End follow and report the terminal shared-search failure."""
@@ -385,6 +485,11 @@ class NavigationController:
         self.follow_recovery_failure = None
         self.follow_goal_generator.reset()
         self.stop_robot()
+        self._set_navigation_status(
+            "failed",
+            mode="follow",
+            error_message=str(reason_code or "person recovery failed"),
+        )
         self.send_event(
             "navigation",
             "failed",
@@ -486,11 +591,16 @@ class NavigationController:
     def start_follow(self, request):
         self.stop()
         if not self.nav_client.wait_for_server(timeout_sec=1.0):
+            self._set_navigation_status(
+                "failed", mode="follow", reset=True,
+                error_message="Nav2 not available",
+            )
             return {"status": "error", "message": "Nav2 not available"}
         self.follow_action_id = request.get("action_id")
         self.follow_enabled = True
         self.follow_person_recovery_arrived = False
         self.follow_timer.reset()
+        self._set_navigation_status("waiting_target", mode="follow", reset=True)
         return {"status": "accepted"}
 
     def set_follow_target_override(self, request):
@@ -609,7 +719,13 @@ class NavigationController:
             goal = NavigateToPose.Goal()
             goal.pose = goal_pose
             goal.behavior_tree = self.follow_bt
-            future = self.nav_client.send_goal_async(goal)
+            self._set_navigation_status("sending", mode="follow", reset=True)
+            future = self.nav_client.send_goal_async(
+                goal,
+                feedback_callback=lambda feedback: self._navigation_feedback(
+                    feedback, navigation
+                ),
+            )
             future.add_done_callback(
                 lambda completed: self._goal_response(completed, navigation)
             )
@@ -617,6 +733,7 @@ class NavigationController:
         elif self.active.mode == "follow" and should_publish:
             self.goal_update_pub.publish(goal_pose)
         if should_publish:
+            NavigationController._show_map_goal(self, goal_pose)
             self.last_follow_goal = (generated.x, generated.y, generated.yaw)
 
     def _notify_follow_recovery_arrived(self, action_id):
@@ -628,6 +745,7 @@ class NavigationController:
             self.active = None
             if active.goal_handle is not None:
                 active.goal_handle.cancel_goal_async()
+            NavigationController._clear_map_goal(self)
             stop_robot = getattr(self, "stop_robot", None)
             if callable(stop_robot):
                 stop_robot()
@@ -850,6 +968,7 @@ class NavigationController:
         sequence = self.sequence
         if sequence is None:
             return
+        self._set_navigation_status("waiting_map", mode="sequence")
         sequence["arrival_map_revision"] = self.map_stream.map_revision()
         sequence["map_wait_started"] = time.monotonic()
 
@@ -886,6 +1005,11 @@ class NavigationController:
             self.sequence_map_timer = None
         sequence = self.sequence
         self.sequence = None
+        self._set_navigation_status(
+            "succeeded" if status == "succeeded" else "failed",
+            mode="sequence",
+            error_message="" if status == "succeeded" else str(reason_code or outcome),
+        )
         if sequence is not None:
             self.send_event(
                 "navigation",
@@ -914,8 +1038,16 @@ class NavigationController:
                     timeout=rclpy.duration.Duration(seconds=0.3),
                 )
             except Exception as error:
-                return f"TF Transform failed: {error}"
+                message = f"TF Transform failed: {error}"
+                self._set_navigation_status(
+                    "failed", mode=mode, reset=True, error_message=message
+                )
+                return message
         if not self.nav_client.wait_for_server(timeout_sec=1.0):
+            self._set_navigation_status(
+                "failed", mode=mode, reset=True,
+                error_message="Nav2 not available",
+            )
             return "Nav2 not available"
 
         pose.header.stamp = self.node.get_clock().now().to_msg()
@@ -926,8 +1058,15 @@ class NavigationController:
         goal = NavigateToPose.Goal()
         goal.pose = pose
         goal.behavior_tree = self.navigate_bt
-        future = self.nav_client.send_goal_async(goal)
+        self._set_navigation_status("sending", mode=mode, reset=True)
+        future = self.nav_client.send_goal_async(
+            goal,
+            feedback_callback=lambda feedback: self._navigation_feedback(
+                feedback, navigation
+            ),
+        )
         future.add_done_callback(lambda completed: self._goal_response(completed, navigation))
+        NavigationController._show_map_goal(self, pose)
         return None
 
     def _goal_response(self, future, navigation):
@@ -937,6 +1076,11 @@ class NavigationController:
             if self.active is not navigation:
                 return
             self.active = None
+            NavigationController._clear_map_goal(self)
+            self._set_navigation_status(
+                "failed", mode=navigation.mode,
+                error_message=f"{type(error).__name__}: {error}",
+            )
             if navigation.mode == "follow":
                 self._handle_follow_recovery(
                     navigation,
@@ -954,6 +1098,11 @@ class NavigationController:
             return
         if not goal_handle.accepted:
             self.active = None
+            NavigationController._clear_map_goal(self)
+            self._set_navigation_status(
+                "rejected", mode=navigation.mode,
+                error_message="Goal rejected by Nav2",
+            )
             if navigation.mode == "follow":
                 self._handle_follow_recovery(navigation, "Goal Rejected by Nav2", {})
             elif navigation.mode == "sequence":
@@ -975,6 +1124,10 @@ class NavigationController:
                 self.send_event("navigation", "Goal Rejected by Nav2", navigation.action_id)
             return
         navigation.goal_handle = goal_handle
+        self._set_navigation_status(
+            "navigating", mode=navigation.mode,
+            error_code=None, error_message="",
+        )
         goal_handle.get_result_async().add_done_callback(
             lambda completed: self._goal_result(completed, navigation)
         )
@@ -983,9 +1136,14 @@ class NavigationController:
         if self.active is not navigation:
             return
         self.active = None
+        NavigationController._clear_map_goal(self)
         try:
             response = future.result()
         except Exception as error:
+            self._set_navigation_status(
+                "failed", mode=navigation.mode,
+                error_message=f"{type(error).__name__}: {error}",
+            )
             if navigation.mode == "follow":
                 self._handle_follow_recovery(
                     navigation,
@@ -1004,6 +1162,22 @@ class NavigationController:
             "nav2_error_code": int(error_code) if error_code is not None else None,
             "nav2_error_msg": str(getattr(result, "error_msg", "") or ""),
         }
+        terminal_state = (
+            "succeeded"
+            if status == GoalStatus.STATUS_SUCCEEDED
+            else "canceled"
+            if status == GoalStatus.STATUS_CANCELED
+            else "failed"
+        )
+        self._set_navigation_status(
+            terminal_state,
+            mode=navigation.mode,
+            error_code=(
+                int(error_code)
+                if error_code not in {None, 0} else None
+            ),
+            error_message=str(getattr(result, "error_msg", "") or ""),
+        )
         if navigation.mode == "follow":
             if (
                 status == GoalStatus.STATUS_SUCCEEDED

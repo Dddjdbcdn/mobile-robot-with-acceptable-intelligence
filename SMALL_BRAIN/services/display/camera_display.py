@@ -1,9 +1,11 @@
 """Camera visualization and sensor-projection helpers."""
 
 import asyncio
-import numpy as np
-import cv2
+import subprocess
 import time
+
+import cv2
+import numpy as np
 
 from cognition.manager.world_state import robot_state
 from services.vision.hand_landmark_service import HAND_CONNECTIONS
@@ -108,6 +110,48 @@ class CpuUsage:
         self._last_idle = idle
         self._last_sample_at = now
         return self._usage
+
+
+class WifiStatus:
+    """Read the active NetworkManager Wi-Fi name at a low polling rate."""
+
+    def __init__(self, sample_interval_s=2.0):
+        self.sample_interval_s = float(sample_interval_s)
+        self._last_sample_at = None
+        self._connection_name = None
+
+    def sample(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        if (
+            self._last_sample_at is not None
+            and now - self._last_sample_at < self.sample_interval_s
+        ):
+            return self._connection_name
+        self._last_sample_at = now
+        try:
+            result = subprocess.run(
+                [
+                    "nmcli", "-t", "-f", "TYPE,STATE,CONNECTION",
+                    "device", "status",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            self._connection_name = None
+            return None
+        self._connection_name = next((
+            fields[2].replace(r"\:", ":")
+            for line in result.stdout.splitlines()
+            if len(fields := line.split(":", 2)) == 3
+            and fields[0] == "wifi"
+            and fields[1] == "connected"
+            and fields[2]
+        ), None)
+        return self._connection_name
 
 def _focal_lengths_from_fov(
     width: int,
@@ -722,11 +766,211 @@ def draw_hand_landmark_overlay(frame, hand_interface):
     return frame
 
 
+def compact_stm32_health_message(message):
+    """Return a short status and readable diagnostic for firmware health."""
+    fields = str(message or "").strip().split()
+    if not fields:
+        return "", ""
+    level = fields[0].upper()
+    if level == "OK":
+        return level, ""
+    details = dict(
+        field.split("=", 1) for field in fields[1:] if "=" in field
+    )
+    detail_parts = []
+    failing = str(details.get("failing") or "").replace("_", " ").upper()
+    reason = str(details.get("reason") or "").replace("_", " ").upper()
+    if failing:
+        detail_parts.append(failing)
+    if reason:
+        detail_parts.append(reason)
+    rc = details.get("rc")
+    if rc not in {None, "0"}:
+        detail_parts.append(f"RC {rc}")
+    return level, "  |  ".join(detail_parts)
+
+
+def stm32_health_display(health):
+    """Return STM32 status, secondary diagnostic, and BGR status color."""
+    health = health or {}
+    message = str(health.get("message") or "").strip()
+    age = health.get("age_seconds")
+    if not message:
+        return "NO DATA", "NO HEALTH MESSAGE", (80, 80, 255)
+    if isinstance(age, (int, float)) and age > 5.0:
+        return "STALE", f"LAST UPDATE {float(age):.1f}s AGO", (80, 80, 255)
+    status, detail = compact_stm32_health_message(message)
+    if message == "OK":
+        return status, detail, (70, 240, 70)
+    if message.startswith("DEGRADED"):
+        return status, detail, (0, 210, 255)
+    return status, detail, (80, 80, 255)
+
+
+def navigation_status_display(status):
+    """Return the compact Nav2 value and color used by the debug board."""
+    status = status or {}
+    state = str(status.get("state") or "idle").lower()
+    labels = {
+        "idle": "IDLE",
+        "sending": "SENDING",
+        "navigating": "MOVING",
+        "waiting_target": "WAIT TARGET",
+        "waiting_map": "WAIT MAP",
+        "recovery_spin": "RECOVERY SPIN",
+        "succeeded": "REACHED",
+        "canceled": "CANCELED",
+        "rejected": "REJECTED",
+        "failed": "FAILED",
+    }
+    value = labels.get(state, state.replace("_", " ").upper())
+    green = (70, 240, 70)
+    yellow = (0, 210, 255)
+    red = (80, 80, 255)
+    gray = (170, 170, 170)
+    color = (
+        green
+        if state in {"navigating", "succeeded"}
+        else yellow
+        if state in {"sending", "waiting_target", "waiting_map", "recovery_spin"}
+        else red
+        if state in {"failed", "rejected", "canceled"}
+        else gray
+    )
+
+    if state == "navigating":
+        distance = status.get("distance_remaining")
+        if isinstance(distance, (int, float)) and np.isfinite(distance):
+            value += f"  |  {max(0.0, float(distance)):.1f}m"
+        recoveries = max(0, int(status.get("recoveries") or 0))
+        value += f"  |  R{recoveries}"
+        if recoveries:
+            color = yellow
+    elif state in {"failed", "rejected"}:
+        error_code = status.get("error_code")
+        if error_code not in {None, 0, "0"}:
+            value += f"  |  CODE {error_code}"
+    return value, color
+
+
+def voice_status_display(state):
+    """Return the bracketed local voice state and its display color."""
+    state = str(state or "idle").lower()
+    labels = {
+        "listening": "[LISTENING]",
+        "talking": "[TALKING]",
+        "idle": "[IDLE]",
+    }
+    value = labels.get(state, f"[{state.replace('_', ' ').upper()}]")
+    color = (
+        (0, 210, 255)
+        if state == "listening"
+        else (70, 240, 70)
+        if state == "talking"
+        else (170, 170, 170)
+    )
+    return value, color
+
+
+class ResetOverlayState:
+    """Hold a short READY confirmation after a blocking reset state clears."""
+
+    def __init__(self, ready_seconds=3.0):
+        self.ready_seconds = float(ready_seconds)
+        self.previous = None
+        self.ready_until = 0.0
+
+    def visible_state(self, state, now):
+        state = str(state or "").lower()
+        if state != self.previous:
+            if state == "ready" and self.previous in {
+                "initializing", "lifted", "resetting_lift", "resetting_manual",
+            }:
+                self.ready_until = float(now) + self.ready_seconds
+            self.previous = state
+        if state and state != "ready":
+            return state
+        if state == "ready" and float(now) < self.ready_until:
+            return "ready"
+        return None
+
+
+def draw_reset_state_overlay(frame, state):
+    """Draw a high-priority centered reset/recovery layer."""
+    messages = {
+        "initializing": ("INITIALIZING", "KEEP ROBOT STILL", (0, 210, 255)),
+        "lifted": ("ROBOT LIFTED", "PLACE ROBOT DOWN", (80, 80, 255)),
+        "resetting_lift": ("RESETTING MAP", "PLEASE WAIT", (0, 210, 255)),
+        "resetting_manual": ("RESETTING ROBOT", "PLEASE WAIT", (0, 210, 255)),
+        "ready": ("READY", "ROBOT CAN MOVE", (70, 240, 70)),
+    }
+    if state not in messages:
+        return frame
+    title, detail, color = messages[state]
+    height, width = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (width, height), (5, 5, 5), -1)
+    opacity = 0.45 if state == "ready" else 0.68
+    cv2.addWeighted(overlay, opacity, frame, 1.0 - opacity, 0, frame)
+
+    panel_width = min(width - 32, max(420, int(width * 0.52)))
+    panel_height = min(height - 32, 150)
+    left = (width - panel_width) // 2
+    top = (height - panel_height) // 2
+    right = left + panel_width
+    bottom = top + panel_height
+    cv2.rectangle(frame, (left, top), (right, bottom), (12, 15, 20), -1)
+    cv2.rectangle(frame, (left, top), (right, bottom), color, 4, cv2.LINE_AA)
+
+    title_scale = max(0.8, min(1.35, width / 1000.0))
+    detail_scale = title_scale * 0.58
+    title_size = cv2.getTextSize(
+        title, cv2.FONT_HERSHEY_SIMPLEX, title_scale, 3
+    )[0]
+    detail_size = cv2.getTextSize(
+        detail, cv2.FONT_HERSHEY_SIMPLEX, detail_scale, 2
+    )[0]
+    cv2.putText(
+        frame, title,
+        ((width - title_size[0]) // 2, top + 62),
+        cv2.FONT_HERSHEY_SIMPLEX, title_scale, color, 3, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, detail,
+        ((width - detail_size[0]) // 2, top + 112),
+        cv2.FONT_HERSHEY_SIMPLEX, detail_scale,
+        (225, 225, 225), 2, cv2.LINE_AA,
+    )
+    return frame
+
+
+def tracking_panel_width(rows, frame_width, scale):
+    """Size the left debug board to its current text instead of a fixed box."""
+    label_offset = int(round(20 * scale))
+    value_offset = int(round(180 * scale))
+    right_padding = int(round(20 * scale))
+    required = 0
+    for label, value, _color in rows:
+        label_width = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, scale * 0.72, 2
+        )[0][0]
+        value_width = cv2.getTextSize(
+            value, cv2.FONT_HERSHEY_SIMPLEX, scale * 0.82, 2
+        )[0][0]
+        required = max(
+            required,
+            label_offset + label_width,
+            value_offset + value_width,
+        )
+    return min(frame_width - 24, required + right_padding)
+
+
 def draw_tracking_status_overlay(
     frame,
     track_action,
     hand_interface,
     person_tracks=(),
+    voice_state="idle",
 ):
     """Draw the high-value tracking signals as a readable HUD."""
     hand_status = hand_interface.gesture_status() or {}
@@ -812,8 +1056,15 @@ def draw_tracking_status_overlay(
         (70, 240, 70) if visible_tracks else (170, 170, 170)
     )
 
+    navigation_value, navigation_color = navigation_status_display(
+        robot_state.get("navigation")
+    )
+    voice_value, voice_color = voice_status_display(voice_state)
+
     rows = [
         ("ACTION", action_value, action_color),
+        ("VOICE", voice_value, voice_color),
+        ("NAV2", navigation_value, navigation_color),
         ("PERSON IDS", person_memory_value, person_memory_color),
         ("TOF SEED", seed_value, seed_color),
         ("LIDAR SEED", lidar_seed_value, lidar_seed_color),
@@ -823,7 +1074,7 @@ def draw_tracking_status_overlay(
     width = frame.shape[1]
     scale = max(0.62, min(1.05, width / 1280.0))
     row_height = int(round(43 * scale))
-    panel_width = min(width - 24, int(round(760 * scale)))
+    panel_width = tracking_panel_width(rows, width, scale)
     panel_height = row_height * len(rows) + int(round(18 * scale))
     x1, y1 = 12, 12
 
@@ -859,28 +1110,84 @@ def draw_tracking_status_overlay(
 
 
 def draw_pipeline_fps_overlay(
-    frame, camera_fps, yolo_fps, hand_fps, cpu_usage=0.0
+    frame,
+    camera_fps,
+    yolo_fps,
+    hand_fps,
+    cpu_usage=0.0,
+    wifi_value="DISCONNECTED",
+    wifi_connected=False,
+    stm32_status="NO DATA",
+    stm32_detail="NO HEALTH MESSAGE",
+    stm32_color=(80, 80, 255),
 ):
-    """Draw measured pipeline rates and whole-system CPU utilization."""
+    """Draw performance, Wi-Fi, and firmware status on the right panel."""
+    yellow = (80, 240, 255)
     rows = (
-        f"CAMERA     {float(camera_fps):4.1f} FPS",
-        f"YOLO       {float(yolo_fps):4.1f} FPS",
-        f"HAND DET   {float(hand_fps):4.1f} FPS",
-        f"CPU        {float(cpu_usage):4.1f} %",
+        (f"CAMERA     {float(camera_fps):4.1f} FPS", yellow),
+        (f"YOLO       {float(yolo_fps):4.1f} FPS", yellow),
+        (f"HAND DET   {float(hand_fps):4.1f} FPS", yellow),
+        (f"CPU        {float(cpu_usage):4.1f} %", yellow),
+        (
+            f"WIFI       {wifi_value}",
+            yellow if wifi_connected else (80, 80, 255),
+        ),
+        (f"STM32      {stm32_status}", stm32_color),
     )
     width = frame.shape[1]
     scale = max(0.50, min(0.72, width / 1800.0))
     thickness = 2
+    padding = max(7, int(round(10 * scale)))
+    max_content_width = min(width - 24, max(220, int(width * 0.30)))
+
+    def fit_text(text, font_scale, font_thickness):
+        if cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
+        )[0][0] <= max_content_width:
+            return text
+        suffix = "..."
+        while text and cv2.getTextSize(
+                text + suffix,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                font_thickness,
+        )[0][0] > max_content_width:
+            text = text[:-1]
+        return text.rstrip() + suffix
+
+    fitted_rows = tuple(
+        (fit_text(row, scale, thickness), color) for row, color in rows
+    )
+    detail_scale = scale * 0.70
+    detail_thickness = 1
+    fitted_detail = fit_text(
+        str(stm32_detail or ""), detail_scale, detail_thickness
+    )
     text_sizes = [
-        cv2.getTextSize(row, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-        for row in rows
+        cv2.getTextSize(row[0], cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        for row in fitted_rows
     ]
     text_width = max(size[0][0] for size in text_sizes)
+    if fitted_detail:
+        detail_size, detail_baseline = cv2.getTextSize(
+            fitted_detail,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            detail_scale,
+            detail_thickness,
+        )
+        text_width = max(text_width, detail_size[0])
+    else:
+        detail_size = (0, 0)
+        detail_baseline = 0
     text_height = max(size[0][1] for size in text_sizes)
     baseline = max(size[1] for size in text_sizes)
-    padding = max(7, int(round(10 * scale)))
     row_height = text_height + baseline + padding
-    panel_height = row_height * len(rows) + padding
+    main_last_y = padding + text_height + (len(fitted_rows) - 1) * row_height
+    detail_y = main_last_y + detail_size[1] + max(4, padding // 2)
+    panel_height = (
+        detail_y + detail_baseline + padding
+        if fitted_detail else main_last_y + baseline + padding
+    )
     x = max(4, width - text_width - padding * 2 - 12)
     y = 12
     overlay = frame.copy()
@@ -893,23 +1200,64 @@ def draw_pipeline_fps_overlay(
         -1,
     )
     cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
-    for index, row in enumerate(rows):
+    for index, (row, color) in enumerate(fitted_rows):
         cv2.putText(
             frame,
             row,
             (x + padding, y + padding + text_height + index * row_height),
             cv2.FONT_HERSHEY_SIMPLEX,
             scale,
-            (80, 240, 255),
+            color,
             thickness,
+            cv2.LINE_AA,
+        )
+    if fitted_detail:
+        cv2.putText(
+            frame,
+            fitted_detail,
+            (x + padding, y + detail_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            detail_scale,
+            stm32_color,
+            detail_thickness,
             cv2.LINE_AA,
         )
     return frame
 
 
-def draw_debug_board_toggle(frame, enabled):
+def draw_connection_lost_warning(frame):
+    """Draw an always-visible warning when the AI connection is gone."""
+    label = "WIFI / AI CONNECTION LOST - PRESS STOP ROBOT"
+    scale = max(0.58, min(0.92, frame.shape[1] / 1500.0))
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+    )
+    padding_x, padding_y = 18, 10
+    left = max(8, (frame.shape[1] - text_width) // 2 - padding_x)
+    right = min(frame.shape[1] - 8, left + text_width + padding_x * 2)
+    top = 8
+    bottom = top + text_height + baseline + padding_y * 2
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (left, top), (right, bottom), (20, 20, 110), -1)
+    cv2.addWeighted(overlay, 0.90, frame, 0.10, 0, frame)
+    cv2.rectangle(frame, (left, top), (right, bottom), (80, 80, 255), 2)
+    cv2.putText(
+        frame,
+        label,
+        (left + padding_x, bottom - padding_y - baseline),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (220, 220, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
+def draw_debug_board_toggle(frame, enabled, above_bounds=None):
     """Draw the small always-visible control for the optional debug boards."""
-    label = f"DEBUG {'ON' if enabled else 'OFF'}  [D]"
+    label = f"DEBUG {'ON' if enabled else 'OFF'}"
     scale = max(0.48, min(0.68, frame.shape[1] / 1900.0))
     thickness = 2
     (text_width, text_height), baseline = cv2.getTextSize(
@@ -921,9 +1269,13 @@ def draw_debug_board_toggle(frame, enabled):
     padding_x = 10
     padding_y = 7
     margin = 12
-    right = frame.shape[1] - margin
-    bottom = frame.shape[0] - margin
-    left = max(0, right - text_width - padding_x * 2)
+    left = margin if above_bounds is None else above_bounds[0]
+    bottom = (
+        frame.shape[0] - margin
+        if above_bounds is None
+        else above_bounds[1] - 10
+    )
+    right = min(frame.shape[1], left + text_width + padding_x * 2)
     top = max(0, bottom - text_height - baseline - padding_y * 2)
     color = (70, 240, 70) if enabled else (170, 170, 170)
 
@@ -952,6 +1304,49 @@ def debug_board_toggle_clicked(event, x, y, bounds):
     return left <= x <= right and top <= y <= bottom
 
 
+def _draw_control_button(frame, label, left, bottom, color):
+    scale = max(0.48, min(0.68, frame.shape[1] / 1900.0))
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+    )
+    padding_x, padding_y = 10, 7
+    right = left + text_width + padding_x * 2
+    top = bottom - text_height - baseline - padding_y * 2
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (left, top), (right, bottom), (5, 5, 5), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+    cv2.rectangle(frame, (left, top), (right, bottom), color, 1, cv2.LINE_AA)
+    cv2.putText(
+        frame, label, (left + padding_x, bottom - padding_y - baseline),
+        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA,
+    )
+    return left, top, right, bottom
+
+
+def draw_audio_controls(frame, output_muted, input_muted):
+    """Draw independent speaker and microphone controls."""
+    bottom = frame.shape[0] - 12
+    speaker_label = "UNMUTE" if output_muted else "MUTE"
+    speaker_color = (80, 80, 255) if output_muted else (70, 240, 70)
+    speaker = _draw_control_button(
+        frame, speaker_label, 12, bottom, speaker_color
+    )
+    ear_label = "UNCOVER EAR [E]" if input_muted else "COVER EAR"
+    ear_color = (80, 80, 255) if input_muted else (70, 240, 70)
+    ear = _draw_control_button(
+        frame, ear_label, speaker[2] + 10, bottom, ear_color
+    )
+    return {"speaker": speaker, "ear": ear}
+
+
+def control_button_clicked(event, x, y, bounds):
+    if event != cv2.EVENT_LBUTTONUP or bounds is None:
+        return False
+    left, top, right, bottom = bounds
+    return left <= x <= right and top <= y <= bottom
+
+
 async def display_camera_loop(
     camera,
     csrt_tracker,
@@ -959,6 +1354,8 @@ async def display_camera_loop(
     track_action,
     hand_interface,
     person_tracking_service=None,
+    audio_app=None,
+    connection_status=None,
 ):
     """Render the complete camera debug view."""
     window_name = "Robot Vision"
@@ -970,16 +1367,25 @@ async def display_camera_loop(
     yolo_rate = SequenceFps()
     hand_rate = SequenceFps()
     cpu_usage = CpuUsage()
+    wifi_status = WifiStatus()
+    reset_overlay = ResetOverlayState()
     person_tracks = ()
     debug_control = {
         "visible": True,
         "button_bounds": None,
+        "audio_bounds": {},
     }
 
     def handle_mouse(event, x, y, _flags, _parameter):
         if debug_board_toggle_clicked(
                 event, x, y, debug_control["button_bounds"]):
             debug_control["visible"] = not debug_control["visible"]
+        elif audio_app is not None and control_button_clicked(
+                event, x, y, debug_control["audio_bounds"].get("speaker")):
+            audio_app.set_output_muted(not audio_app.output_muted)
+        elif audio_app is not None and control_button_clicked(
+                event, x, y, debug_control["audio_bounds"].get("ear")):
+            audio_app.set_input_muted(not audio_app.input_muted)
 
     cv2.setMouseCallback(window_name, handle_mouse)
 
@@ -1019,12 +1425,27 @@ async def display_camera_loop(
                 display_frame, hand_interface
             )
             cpu_percent = cpu_usage.sample(now)
+            wifi_name = wifi_status.sample(now)
+            connection_lost = bool(
+                connection_status is not None
+                and connection_status.get("lost")
+            )
+            wifi_connected = wifi_name is not None and not connection_lost
+            wifi_value = (
+                "LOST CONNECTION"
+                if connection_lost or wifi_name is None
+                else wifi_name.upper()
+            )
+            stm32_status, stm32_detail, stm32_color = stm32_health_display(
+                robot_state.get("stm32_health")
+            )
             if debug_control["visible"]:
                 display_frame = draw_tracking_status_overlay(
                     display_frame,
                     track_action,
                     hand_interface,
                     person_tracks,
+                    audio_app.voice_state() if audio_app is not None else "idle",
                 )
                 display_frame = draw_pipeline_fps_overlay(
                     display_frame,
@@ -1032,15 +1453,40 @@ async def display_camera_loop(
                     yolo_fps,
                     hand_fps,
                     cpu_percent,
+                    wifi_value,
+                    wifi_connected,
+                    stm32_status,
+                    stm32_detail,
+                    stm32_color,
+                )
+            if connection_lost or wifi_name is None:
+                display_frame = draw_connection_lost_warning(display_frame)
+            visible_reset_state = reset_overlay.visible_state(
+                robot_state.get("reset_state"), now
+            )
+            if visible_reset_state is not None:
+                display_frame = draw_reset_state_overlay(
+                    display_frame, visible_reset_state
+                )
+            if audio_app is not None:
+                debug_control["audio_bounds"] = draw_audio_controls(
+                    display_frame,
+                    audio_app.output_muted,
+                    audio_app.input_muted,
                 )
             debug_control["button_bounds"] = draw_debug_board_toggle(
                 display_frame,
                 debug_control["visible"],
+                debug_control["audio_bounds"].get("speaker"),
             )
             cv2.imshow(window_name, display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("d"), ord("D")):
                 debug_control["visible"] = not debug_control["visible"]
+            elif audio_app is not None and key in (ord("m"), ord("M")):
+                audio_app.set_output_muted(not audio_app.output_muted)
+            elif audio_app is not None and key in (ord("e"), ord("E")):
+                audio_app.set_input_muted(not audio_app.input_muted)
 
             now = time.monotonic()
             if (

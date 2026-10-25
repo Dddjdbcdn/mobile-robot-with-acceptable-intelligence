@@ -31,6 +31,93 @@ class MapRenderer:
     def __init__(self):
         self.cfg = RenderConfig()
 
+    def render_grid_diagnostic(self, msg, pose, layer, overlays=None):
+        """Render one raw OccupancyGrid for the on-robot diagnostic display."""
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        if width <= 0 or height <= 0:
+            raise ValueError("OccupancyGrid has empty dimensions")
+        values = np.asarray(msg.data, dtype=np.int16)
+        if values.size != width * height:
+            raise ValueError("OccupancyGrid data does not match its dimensions")
+        values = values.reshape((height, width))
+
+        image = np.full((height, width, 3), (112, 112, 112), np.uint8)
+        known = values >= 0
+        if layer == "slam":
+            image[known] = (246, 246, 246)
+            occupied = values >= self.cfg.occupied
+            image[occupied] = (24, 24, 24)
+            partial = known & ~occupied & (values > 0)
+            if np.any(partial):
+                shade = (246 - values[partial] * 1.4).clip(80, 246).astype(np.uint8)
+                image[partial] = np.column_stack((shade, shade, shade))
+        else:
+            image[known] = (246, 246, 246)
+            inflated = known & (values > 0) & (values < self.cfg.cost_limit)
+            if np.any(inflated):
+                strength = values[inflated].astype(np.float32) / self.cfg.cost_limit
+                image[inflated, 0] = (235 - 105 * strength).astype(np.uint8)
+                image[inflated, 1] = (238 - 145 * strength).astype(np.uint8)
+                image[inflated, 2] = 245
+            image[values >= self.cfg.cost_limit] = (45, 45, 210)
+
+        # OccupancyGrid row zero is at the map origin; screen row zero is at
+        # the top. Flip before converting world coordinates to pixels.
+        image = np.flipud(image).copy()
+        max_side = max(width, height)
+        scale = min(1.0, float(self.cfg.image_max_size) / max_side)
+        if scale < 1.0:
+            image = cv2.resize(
+                image,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        origin = msg.info.origin
+        quaternion = origin.orientation
+        origin_yaw = math.atan2(
+            2 * (quaternion.w * quaternion.z + quaternion.x * quaternion.y),
+            1 - 2 * (quaternion.y * quaternion.y + quaternion.z * quaternion.z),
+        )
+        dx = float(pose["x"]) - float(origin.position.x)
+        dy = float(pose["y"]) - float(origin.position.y)
+        col = (math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy) / msg.info.resolution
+        row = (-math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy) / msg.info.resolution
+        point = (round(col * scale), round((height - 1 - row) * scale))
+        def grid_pixel(item):
+            item_dx = float(item[0]) - float(origin.position.x)
+            item_dy = float(item[1]) - float(origin.position.y)
+            item_col = (
+                math.cos(origin_yaw) * item_dx
+                + math.sin(origin_yaw) * item_dy
+            ) / msg.info.resolution
+            item_row = (
+                -math.sin(origin_yaw) * item_dx
+                + math.cos(origin_yaw) * item_dy
+            ) / msg.info.resolution
+            return (
+                round(item_col * scale),
+                round((height - 1 - item_row) * scale),
+            )
+
+        self._draw_diagnostic_overlays(
+            image, overlays or {}, grid_pixel,
+            pixels_per_meter=scale / float(msg.info.resolution),
+        )
+        radius = max(7, round(0.20 / float(msg.info.resolution) * scale))
+        yaw = float(pose["yaw"]) - origin_yaw
+        arrow_length = max(radius * 2, 22)
+        tip = (
+            round(point[0] + arrow_length * math.cos(yaw)),
+            round(point[1] - arrow_length * math.sin(yaw)),
+        )
+        cv2.circle(image, point, radius, (30, 210, 80), 3, cv2.LINE_AA)
+        cv2.arrowedLine(
+            image, point, tip, (30, 210, 80), 4, cv2.LINE_AA, tipLength=0.35
+        )
+        return image
+
     def render_background(self, prepared, pose, view_size_m=None):
         return self._render(
             prepared["grid"], prepared["costmap"], pose, [], [],
@@ -38,15 +125,27 @@ class MapRenderer:
             view_size_m=view_size_m,
         )
 
+    @staticmethod
+    def rotate_180(image):
+        """Rotate the complete rendered map for a viewer facing the robot."""
+        return cv2.rotate(image, cv2.ROTATE_180)
+
     def render_snapshot(
         self, prepared, pose, candidates, coverage_counts,
         search_overlay=None, live_fov_mask=None,
         observation=None, observation_mask=None,
         pose_marker_scale=1.0, frontiers=None,
         pending_navigation_pose=None,
+        diagnostic_overlays=None,
     ):
         image = prepared["background"].copy()
         view = prepared["view"]
+        self._draw_diagnostic_overlays(
+            image,
+            diagnostic_overlays or {},
+            lambda item: self._pixel(view, item[0], item[1]),
+            pixels_per_meter=float(view["ppm"]),
+        )
         if isinstance(search_overlay, dict):
             self._draw_search_overlay(
                 image, view, search_overlay, coverage_counts
@@ -75,12 +174,45 @@ class MapRenderer:
                 image, view, pending_navigation_pose,
                 marker_scale=pose_marker_scale,
             )
-        self._draw_orientation_legend(image)
         if mode == "exploration" and len(candidates) == 1:
             self._draw_selected_pose(
                 image, view, candidates[0], marker_scale=pose_marker_scale
             )
         return image
+
+    @staticmethod
+    def _draw_diagnostic_overlays(
+        image, overlays, pixel_of, pixels_per_meter,
+    ):
+        """Draw low-rate operator diagnostics below navigation markers."""
+        plan = overlays.get("plan") or []
+        if len(plan) >= 2:
+            points = np.asarray([pixel_of(item) for item in plan], np.int32)
+            cv2.polylines(image, [points], False, (220, 145, 30), 3, cv2.LINE_AA)
+
+        for item in overlays.get("lidar") or []:
+            cv2.circle(image, pixel_of(item), 2, (0, 210, 255), -1, cv2.LINE_AA)
+
+        footprint = overlays.get("footprint") or []
+        if len(footprint) >= 3:
+            points = np.asarray([pixel_of(item) for item in footprint], np.int32)
+            cv2.polylines(image, [points], True, (30, 210, 80), 3, cv2.LINE_AA)
+
+        goal = overlays.get("goal")
+        if goal is not None:
+            center = pixel_of((goal["x"], goal["y"]))
+            radius = max(7, round(0.14 * pixels_per_meter))
+            yaw = float(goal.get("yaw", 0.0))
+            length = max(radius * 2, round(0.30 * pixels_per_meter))
+            tip = pixel_of((
+                float(goal["x"]) + length / pixels_per_meter * math.cos(yaw),
+                float(goal["y"]) + length / pixels_per_meter * math.sin(yaw),
+            ))
+            cv2.circle(image, center, radius, (220, 40, 220), 3, cv2.LINE_AA)
+            cv2.arrowedLine(
+                image, center, tip, (220, 40, 220), 3,
+                cv2.LINE_AA, tipLength=0.35,
+            )
 
     def _draw_pending_navigation_pose(
         self, image, view, pose, marker_scale=1.0
@@ -112,24 +244,6 @@ class MapRenderer:
             return 1.0
         crop_pixels = float(crop_size_m) * float(view["ppm"])
         return crop_pixels / float(self.cfg.pose_reference_crop_px)
-
-    @staticmethod
-    def _draw_orientation_legend(image):
-        """Make the camera/map correspondence explicit in every snapshot."""
-        labels = (
-            ("UP = FORWARD / IMAGE CENTER", (18, 28)),
-            ("MAP LEFT = IMAGE LEFT", (18, 50)),
-            ("MAP RIGHT = IMAGE RIGHT", (18, 72)),
-        )
-        for text, origin in labels:
-            cv2.putText(
-                image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                0.46, (255, 255, 255), 4, cv2.LINE_AA,
-            )
-            cv2.putText(
-                image, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                0.46, (30, 30, 30), 1, cv2.LINE_AA,
-            )
 
     def _draw_observation_fov(
         self, image, view, observation, grid_mask
@@ -402,11 +516,6 @@ class MapRenderer:
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(image, contours, -1, (210, 185, 20), 3, cv2.LINE_AA)
-        robot = self._pixel(view, view["origin_x"], view["origin_y"])
-        self._outlined_label(
-            image, (robot[0] + 18, robot[1] - 34),
-            "CURRENT VIEW", (210, 185, 20), scale=0.42,
-        )
 
     def _draw_dynamic(
         self, image, view, pose, locals_, marker_scale=1.0
@@ -449,8 +558,10 @@ class MapRenderer:
                 image, (center[0] + 17, center[1] + 24),
                 "H", robot_color, scale=0.5,
             )
-    def _render(self, grid, costmap, pose, locals_, frontiers,
-                frontier_mask, draw_robot=True, view_size_m=None):
+    def _render(
+        self, grid, costmap, pose, locals_, frontiers, frontier_mask,
+        draw_robot=True, view_size_m=None,
+    ):
         """Render a clean metric map intended for VLM waypoint selection."""
         view = self._make_view(grid, pose, view_size_m=view_size_m)
         rights = view["xmin"] + (np.arange(view["width"]) + 0.5) / view["ppm"]
@@ -506,8 +617,7 @@ class MapRenderer:
                 core_tint[frontier_pixels], 0.40, 0,
             )
 
-        # A robot-relative metric grid reinforces that up is forward and the
-        # camera image's left/right correspond directly to the map.
+        # Draw the robot-relative metric grid over the rendered map.
         spacing = self.cfg.grid_spacing
         x0 = math.ceil(view["xmin"] / spacing)
         x1 = math.floor(view["xmax"] / spacing)

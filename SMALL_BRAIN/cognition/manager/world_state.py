@@ -4,6 +4,10 @@ robot_state = {
     "pose": None,
     "person": None,
     "lidar_person": {"state": None, "pose_age_seconds": None},
+    "lift_state": None,
+    "reset_state": None,
+    "navigation": None,
+    "stm32_health": None,
     "camera": {
         "camera_tof_range": 0.0,
         "pan_angle": 0.0,
@@ -24,6 +28,14 @@ def update_state(message):
     robot_pose = message.get("robot_pose")
     person_pose = message.get("person_pose")
     tracker_status = message.get("person_tracker_status")
+    robot_state["lift_state"] = message.get("lift_state")
+    robot_state["reset_state"] = message.get("reset_state")
+    navigation = message.get("navigation_status")
+    robot_state["navigation"] = (
+        dict(navigation) if isinstance(navigation, dict) else None
+    )
+    health = message.get("stm32_health")
+    robot_state["stm32_health"] = health if isinstance(health, dict) else None
 
     zenith = math.radians(tilt_angle)
     azimuth = math.radians(pan_angle - 95)

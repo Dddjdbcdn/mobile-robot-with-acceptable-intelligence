@@ -260,7 +260,7 @@ class MissingKeypointTrackingTests(unittest.IsolatedAsyncioTestCase):
             "keypoints": keypoints,
         }
 
-    async def test_tracks_last_keypoint_after_prediction_until_next_appears(
+    async def test_does_not_fall_back_after_prediction_while_next_is_missing(
         self,
     ):
         service = TrackingService.__new__(TrackingService)
@@ -330,11 +330,140 @@ class MissingKeypointTrackingTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(service._person_tracking_loop(), timeout=1.0)
 
         payloads = service.zmq_pub_socket.payloads
-        self.assertEqual(len(payloads), 3)
+        self.assertEqual(len(payloads), 2)
         self.assertLess(payloads[0]["delta_pan_angle"], 0.0)
-        self.assertGreater(payloads[1]["delta_pan_angle"], 0.0)
-        self.assertLess(payloads[2]["delta_pan_angle"], 0.0)
+        self.assertLess(payloads[1]["delta_pan_angle"], 0.0)
         self.assertEqual(service.person_path_index, 2)
+
+    async def test_skips_to_furthest_visible_keypoint_before_current_is_centered(
+        self,
+    ):
+        service = TrackingService.__new__(TrackingService)
+        person = self.person(ankle_x=0.2, knee_x=0.3, hip_x=0.8)
+
+        class YoloFrame:
+            def __init__(self):
+                self.sequence = 0
+
+            def detection_snapshot_with_frame(self):
+                self.sequence += 1
+                service.active = False
+                captured_at = time.monotonic()
+                return (
+                    self.sequence,
+                    [person],
+                    None,
+                    {
+                        "source_captured_at": captured_at,
+                        "inference_started_at": captured_at,
+                        "inference_completed_at": captured_at,
+                    },
+                )
+
+        class PersonTracks:
+            def tracking_snapshot_with_time(self):
+                return (
+                    service.yolo.sequence,
+                    (SimpleNamespace(
+                        track_id=1,
+                        visible=True,
+                        person=person,
+                    ),),
+                    time.monotonic(),
+                )
+
+        service.active = True
+        service.target = "person"
+        service.action_id = "track-person"
+        service.person_path = ["left_ankle", "left_knee", "left_hip"]
+        service.person_path_index = 0
+        service.person_tracking_service = PersonTracks()
+        service._tracked_person_id = 1
+        service._visual_target_override = None
+        service._follow_person_active = False
+        service.person_tracker_pub_socket = None
+        service.stable_seeds = StableTargetSeedTracker()
+        service.stable_threshold = 0.05
+        service.yolo = YoloFrame()
+        service.zmq_pub_socket = SimpleNamespace(send_json=AsyncMock())
+
+        await asyncio.wait_for(service._person_tracking_loop(), timeout=1.0)
+
+        self.assertEqual(service.person_path_index, 2)
+        payload = service.zmq_pub_socket.send_json.await_args.args[0]
+        self.assertLess(payload["delta_pan_angle"], 0.0)
+
+    async def test_path_starting_at_hip_advances_to_bootstrap_torso_offset(
+        self,
+    ):
+        service = TrackingService.__new__(TrackingService)
+        person = {
+            "class": "person",
+            "confidence": 0.9,
+            "bbox": {
+                "normalized_x1": 0.1,
+                "normalized_y1": 0.1,
+                "normalized_x2": 0.9,
+                "normalized_y2": 0.9,
+            },
+            "keypoints": {
+                "left_hip": {
+                    "normalized_x": 0.5,
+                    "normalized_y": 0.5,
+                },
+            },
+        }
+
+        class YoloFrames:
+            def __init__(self):
+                self.sequence = 0
+
+            def detection_snapshot_with_frame(self):
+                self.sequence += 1
+                if self.sequence == 2:
+                    service.active = False
+                captured_at = time.monotonic()
+                return (
+                    self.sequence,
+                    [person],
+                    None,
+                    {
+                        "source_captured_at": captured_at,
+                        "inference_started_at": captured_at,
+                        "inference_completed_at": captured_at,
+                    },
+                )
+
+        class PersonTracks:
+            def tracking_snapshot_with_time(self):
+                return (
+                    service.yolo.sequence,
+                    (SimpleNamespace(
+                        track_id=1,
+                        visible=True,
+                        person=person,
+                    ),),
+                    time.monotonic(),
+                )
+
+        service.active = True
+        service.target = "person"
+        service.action_id = "track-person"
+        service.person_path = ["left_hip", "torso_center"]
+        service.person_path_index = 0
+        service.person_tracking_service = PersonTracks()
+        service._tracked_person_id = 1
+        service._visual_target_override = None
+        service._follow_person_active = False
+        service.person_tracker_pub_socket = None
+        service.stable_seeds = StableTargetSeedTracker()
+        service.stable_threshold = 0.05
+        service.yolo = YoloFrames()
+        service.zmq_pub_socket = AsyncMock()
+
+        await asyncio.wait_for(service._person_tracking_loop(), timeout=1.0)
+
+        self.assertEqual(service.person_path_index, 1)
 
 
 if __name__ == "__main__":

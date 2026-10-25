@@ -41,6 +41,257 @@ class CameraDisplayTests(unittest.TestCase):
             bounds,
         ))
 
+    def test_audio_controls_are_independently_clickable(self):
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            bounds = camera_display.draw_audio_controls(frame, False, True)
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("MUTE", labels)
+        self.assertNotIn("MUTE [M]", labels)
+        self.assertIn("UNCOVER EAR [E]", labels)
+        for name in ("speaker", "ear"):
+            left, top, right, bottom = bounds[name]
+            self.assertTrue(camera_display.control_button_clicked(
+                camera_display.cv2.EVENT_LBUTTONUP,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                bounds[name],
+            ))
+
+        with patch.object(camera_display.cv2, "putText"):
+            debug_bounds = camera_display.draw_debug_board_toggle(
+                frame, False, bounds["speaker"]
+            )
+        self.assertEqual(debug_bounds[0], bounds["speaker"][0])
+        self.assertLess(debug_bounds[3], bounds["speaker"][1])
+
+    def test_debug_board_no_longer_shows_lift_row(self):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        previous_health = camera_display.robot_state.get("stm32_health")
+        camera_display.robot_state["stm32_health"] = {
+            "message": "DEGRADED failing=tof_sensor reason=no_valid_targets rc=0",
+            "age_seconds": 0.4,
+        }
+        track_action = SimpleNamespace(
+            target=None,
+            action_id=None,
+            active=False,
+            stable_seeds=SimpleNamespace(
+                status=lambda **_kwargs: {
+                    "valid": False,
+                    "sample_count": 0,
+                    "sample_target": 3,
+                }
+            ),
+        )
+        hand = SimpleNamespace(gesture_status=lambda: {})
+
+        try:
+            with patch.object(camera_display.cv2, "putText") as put_text:
+                camera_display.draw_tracking_status_overlay(
+                    frame, track_action, hand
+                )
+        finally:
+            camera_display.robot_state["stm32_health"] = previous_health
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertNotIn("LIFT", labels)
+        self.assertNotIn("STM32", labels)
+
+    def test_reset_overlay_shows_recovery_and_brief_ready_state(self):
+        state = camera_display.ResetOverlayState(ready_seconds=3.0)
+
+        self.assertEqual(state.visible_state("lifted", 10.0), "lifted")
+        self.assertEqual(
+            state.visible_state("resetting_lift", 11.0), "resetting_lift"
+        )
+        self.assertEqual(state.visible_state("ready", 12.0), "ready")
+        self.assertIsNone(state.visible_state("ready", 15.1))
+
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            camera_display.draw_reset_state_overlay(frame, "lifted")
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("ROBOT LIFTED", labels)
+        self.assertIn("PLACE ROBOT DOWN", labels)
+
+    def test_debug_board_shows_compact_navigation_status(self):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        previous_navigation = camera_display.robot_state.get("navigation")
+        camera_display.robot_state["navigation"] = {
+            "state": "navigating",
+            "distance_remaining": 1.64,
+            "recoveries": 1,
+        }
+        track_action = SimpleNamespace(
+            target=None,
+            action_id=None,
+            active=False,
+            stable_seeds=SimpleNamespace(
+                status=lambda **_kwargs: {
+                    "valid": False,
+                    "sample_count": 0,
+                    "sample_target": 3,
+                }
+            ),
+        )
+        hand = SimpleNamespace(gesture_status=lambda: {})
+
+        try:
+            with patch.object(camera_display.cv2, "putText") as put_text:
+                camera_display.draw_tracking_status_overlay(
+                    frame, track_action, hand
+                )
+        finally:
+            camera_display.robot_state["navigation"] = previous_navigation
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("NAV2", labels)
+        self.assertIn("MOVING  |  1.6m  |  R1", labels)
+
+    def test_navigation_failure_retains_nav2_error_code(self):
+        value, color = camera_display.navigation_status_display({
+            "state": "failed",
+            "error_code": 201,
+        })
+
+        self.assertEqual(value, "FAILED  |  CODE 201")
+        self.assertEqual(color, (80, 80, 255))
+
+    def test_debug_board_shows_bracketed_voice_state(self):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        track_action = SimpleNamespace(
+            target=None,
+            action_id=None,
+            active=False,
+            stable_seeds=SimpleNamespace(
+                status=lambda **_kwargs: {
+                    "valid": False,
+                    "sample_count": 0,
+                    "sample_target": 3,
+                }
+            ),
+        )
+        hand = SimpleNamespace(gesture_status=lambda: {})
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            camera_display.draw_tracking_status_overlay(
+                frame, track_action, hand, voice_state="listening"
+            )
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("VOICE", labels)
+        self.assertIn("[LISTENING]", labels)
+        self.assertEqual(
+            camera_display.voice_status_display("talking"),
+            ("[TALKING]", (70, 240, 70)),
+        )
+
+    def test_left_debug_board_width_adapts_to_its_longest_value(self):
+        short_rows = [("NAV2", "IDLE", (170, 170, 170))]
+        long_rows = [(
+            "NAV2",
+            "MOVING  |  12.4m  |  R3",
+            (70, 240, 70),
+        )]
+
+        short_width = camera_display.tracking_panel_width(
+            short_rows, frame_width=1280, scale=1.0
+        )
+        long_width = camera_display.tracking_panel_width(
+            long_rows, frame_width=1280, scale=1.0
+        )
+
+        self.assertLess(short_width, long_width)
+        self.assertLess(long_width, 760)
+        self.assertLessEqual(long_width, 1280 - 24)
+
+    def test_right_panel_shows_wifi_and_compact_stm32_health(self):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        stm32_status, stm32_detail, stm32_color = (
+            camera_display.stm32_health_display({
+                "message": (
+                    "DEGRADED failing=tof_sensor "
+                    "reason=no_valid_targets rc=0"
+                ),
+                "age_seconds": 0.4,
+            })
+        )
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            camera_display.draw_pipeline_fps_overlay(
+                frame,
+                30.0,
+                12.0,
+                8.0,
+                42.0,
+                "VIETTEL 1671 1",
+                True,
+                stm32_status,
+                stm32_detail,
+                stm32_color,
+            )
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("WIFI       VIETTEL 1671 1", labels)
+        self.assertIn("STM32      DEGRADED", labels)
+        self.assertIn("TOF SENSOR  |  NO VALID TARGETS", labels)
+        stm32_call = next(
+            call for call in put_text.call_args_list
+            if call.args[1] == "STM32      DEGRADED"
+        )
+        detail_call = next(
+            call for call in put_text.call_args_list
+            if call.args[1] == "TOF SENSOR  |  NO VALID TARGETS"
+        )
+        self.assertGreater(detail_call.args[2][1], stm32_call.args[2][1])
+        self.assertLess(detail_call.args[4], stm32_call.args[4])
+
+    def test_compact_stm32_health_retains_nonzero_error_code(self):
+        self.assertEqual(
+            camera_display.compact_stm32_health_message(
+                "FAIL failing=micro_ros reason=agent_ping rc=4"
+            ),
+            ("FAIL", "MICRO ROS  |  AGENT PING  |  RC 4"),
+        )
+
+    def test_stm32_diagnostic_is_truncated_inside_right_panel(self):
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        long_detail = "VERY LONG SENSOR NAME  |  " + "FAILURE " * 20
+
+        with patch.object(camera_display.cv2, "putText") as put_text:
+            camera_display.draw_pipeline_fps_overlay(
+                frame, 30.0, 12.0, 8.0, 42.0,
+                stm32_status="DEGRADED",
+                stm32_detail=long_detail,
+            )
+
+        detail_call = put_text.call_args_list[-1]
+        rendered = detail_call.args[1]
+        origin_x = detail_call.args[2][0]
+        rendered_width = camera_display.cv2.getTextSize(
+            rendered,
+            camera_display.cv2.FONT_HERSHEY_SIMPLEX,
+            detail_call.args[4],
+            detail_call.args[6],
+        )[0][0]
+        self.assertTrue(rendered.endswith("..."))
+        self.assertLessEqual(origin_x + rendered_width, frame.shape[1] - 4)
+
+    def test_wifi_status_reads_active_network_and_caches_it(self):
+        output = "wifi:connected:Lab Network\nethernet:unavailable:\n"
+        with patch.object(
+            camera_display.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout=output),
+        ) as run:
+            status = camera_display.WifiStatus(sample_interval_s=2.0)
+            self.assertEqual(status.sample(now=10.0), "Lab Network")
+            self.assertEqual(status.sample(now=11.0), "Lab Network")
+        run.assert_called_once()
+
     def test_scene_id_is_attached_to_existing_yolo_label(self):
         detection = person(100, 300, 200)
         track = PersonTrackSnapshot(

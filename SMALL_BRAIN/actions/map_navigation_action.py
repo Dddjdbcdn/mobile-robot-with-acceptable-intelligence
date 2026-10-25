@@ -122,7 +122,7 @@ class MapNavigationAction:
         )
         self.map_crop_size_m = float(
             map_crop_size_m if map_crop_size_m is not None
-            else os.environ.get("NAVIGATION_MAP_CROP_SIZE_M", "6.0")
+            else os.environ.get("NAVIGATION_MAP_CROP_SIZE_M", "3.0")
         )
         if not 1.0 <= self.map_crop_size_m <= 20.0:
             raise ValueError("navigation map crop size must be between 1 and 20 metres")
@@ -285,7 +285,7 @@ class MapNavigationAction:
             )
 
     async def _capture(self):
-        # Center first so the rendered CURRENT VIEW and the camera image agree.
+        # Center first so the rendered camera FOV and camera image agree.
         if self._mode == "exploration":
             await self._center_camera()
 

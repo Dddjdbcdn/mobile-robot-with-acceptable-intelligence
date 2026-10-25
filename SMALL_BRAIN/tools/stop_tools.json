@@ -11,18 +11,8 @@
   },
   {
     "type": "function",
-    "name": "stop_navigation",
-    "description": "Cancel active explicit or automatic hand-guided movement. Trigger phrases include 'stop moving', 'stop navigation', 'cancel that movement', 'don't go there', and 'halt'. Do not use this for continuous follow_person, find_target, or passive watch-target tracking.",
-    "parameters": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": false
-    }
-  },
-  {
-    "type": "function",
-    "name": "stop_follow",
-    "description": "Stop only the active continuous follow_person movement. Shared visual tracking may continue so the robot can keep watching the person. Trigger phrases include 'stop following me', 'don't follow me', 'wait here', 'stay here', and 'stop trailing that person'. Do not use this merely because the robot is looking at a person without following.",
+    "name": "stop_movement",
+    "description": "Immediately stop every action that can move the robot base, including navigation, approaching a target, continuous following, automatic hand-guided movement, and any find_target sequence that could resume moving. Trigger phrases include 'stop moving', 'halt', 'stop navigation', 'cancel that movement', 'don't go there', 'stop following me', 'wait here', and 'stay here'. Standalone passive watching or searching may continue. Use stop_goal when the user specifically wants to abandon a find/search goal, and stop_watching_target to stop camera tracking.",
     "parameters": {
       "type": "object",
       "properties": {},

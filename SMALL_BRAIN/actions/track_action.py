@@ -6,6 +6,7 @@ import time
 from actions.action_result import ActionResult
 from actions.move_camera_action import PAN_POSITION_ANGLE
 from actions.tracking.person_pose import (
+    TorsoTargetEstimator,
     find_best_person_path,
     person_keypoint,
     predict_next_keypoint,
@@ -638,8 +639,8 @@ class TrackingService:
         filtered_target = None
         filtered_target_name = None
         pan_reset_for_current_absence = False
-        last_reached_keypoint_name = None
         prediction_attempted = False
+        torso_estimator = TorsoTargetEstimator()
 
         while self.active:
             (
@@ -736,80 +737,82 @@ class TrackingService:
             missing_person_since = None
             pan_reset_for_current_absence = False
             current_name = self.person_path[self.person_path_index]
-            current_keypoint = person_keypoint(person, current_name)
+            torso_target = torso_estimator.update(
+                person,
+                allow_bootstrap=(
+                    prediction_attempted or current_name == "torso_center"
+                ),
+            )
+
+            # Intermediate joints only guide the camera until a better point
+            # on the remaining skeleton path is visible. Prefer the furthest
+            # visible downstream point so we do not finish centering a joint
+            # that is no longer needed to reveal the requested target.
+            better_keypoint = None
+            for candidate_index in range(
+                len(self.person_path) - 1,
+                self.person_path_index,
+                -1,
+            ):
+                candidate_name = self.person_path[candidate_index]
+                candidate_keypoint = person_keypoint(
+                    person,
+                    candidate_name,
+                    torso_target=torso_target,
+                )
+                if candidate_keypoint is not None:
+                    self.person_path_index = candidate_index
+                    current_name = candidate_name
+                    better_keypoint = candidate_keypoint
+                    current_reached = False
+                    predicted_target = None
+                    prediction_attempted = False
+                    print(f"\nTRACING TO: {current_name}\n")
+                    break
+
+            current_keypoint = better_keypoint
+            if current_keypoint is None:
+                current_keypoint = person_keypoint(
+                    person,
+                    current_name,
+                    torso_target=torso_target,
+                )
             using_prediction = False
-            using_keypoint_fallback = False
             selected_target_name = current_name
 
             if not current_reached:
                 if current_keypoint is None:
-                    fallback_keypoint = person_keypoint(
-                        person,
-                        last_reached_keypoint_name,
-                    )
-                    if fallback_keypoint is None:
-                        self.stable_seeds.clear()
-                        await asyncio.sleep(0.05)
-                        continue
-                    target_x = fallback_keypoint["normalized_x"]
-                    target_y = fallback_keypoint["normalized_y"]
-                    using_keypoint_fallback = True
-                    selected_target_name = (
-                        f"fallback:{last_reached_keypoint_name}"
-                    )
-                else:
-                    target_x = current_keypoint["normalized_x"]
-                    target_y = current_keypoint["normalized_y"]
+                    self.stable_seeds.clear()
+                    await asyncio.sleep(0.05)
+                    continue
+                target_x = current_keypoint["normalized_x"]
+                target_y = current_keypoint["normalized_y"]
 
             if self.person_path_index < len(self.person_path) - 1:
                 if current_reached:
                     next_name = self.person_path[self.person_path_index + 1]
-                    next_keypoint = person_keypoint(person, next_name)
-
-                    if next_keypoint is not None:
-                        self.person_path_index += 1
-                        current_reached = False
-                        predicted_target = None
-                        prediction_attempted = False
-                        target_x = next_keypoint["normalized_x"]
-                        target_y = next_keypoint["normalized_y"]
-                        selected_target_name = next_name
-
-                        print(f"\nTRACING TO: {next_name}\n")
-
+                    if (predicted_target is not None
+                            and not prediction_attempted):
+                        target_x, target_y = predicted_target
+                        using_prediction = True
+                        selected_target_name = f"prediction:{next_name}"
                     else:
-                        if (predicted_target is not None
-                                and not prediction_attempted):
-                            target_x, target_y = predicted_target
-                            using_prediction = True
-                            selected_target_name = f"prediction:{next_name}"
-                        else:
-                            fallback_keypoint = person_keypoint(
-                                person,
-                                last_reached_keypoint_name,
-                            )
-                            if fallback_keypoint is None:
-                                self.stable_seeds.clear()
-                                await asyncio.sleep(0.05)
-                                continue
-                            target_x = fallback_keypoint["normalized_x"]
-                            target_y = fallback_keypoint["normalized_y"]
-                            using_keypoint_fallback = True
-                            selected_target_name = (
-                                f"fallback:{last_reached_keypoint_name}"
-                            )
+                        self.stable_seeds.clear()
+                        await asyncio.sleep(0.05)
+                        continue
 
                 else:
-                    if (not using_keypoint_fallback
-                            and abs(target_x - 0.5) < self.stable_threshold
+                    if (abs(target_x - 0.5) < self.stable_threshold
                             and abs(target_y - 0.5) < self.stable_threshold):
-                        last_reached_keypoint_name = current_name
                         predicted_target = predict_next_keypoint(
                             person,
                             self.person_path,
                             self.person_path_index,
                         )
-                        prediction_attempted = False
+                        # A path that starts at a hip has no previous joint to
+                        # extrapolate from. In that case the torso estimator's
+                        # configured hip offset is the next step immediately.
+                        prediction_attempted = predicted_target is None
                         current_reached = True
 
             if visual_override is not None:
@@ -883,7 +886,6 @@ class TrackingService:
             if visual_override is not None and target_centered:
                 seed_target = "hand"
             elif (visual_override is None and final_keypoint
-                  and not using_keypoint_fallback
                   and not using_prediction):
                 seed_target = self.target
 

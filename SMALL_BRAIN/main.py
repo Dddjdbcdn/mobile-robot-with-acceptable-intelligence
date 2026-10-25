@@ -112,6 +112,33 @@ def create_tool_task(coroutine, name):
     return task
 
 
+async def keep_runtime_after_connection_loss(
+    coroutine,
+    connection_status,
+    task_name,
+    *,
+    closed_on_return=True,
+):
+    """Keep local robot tasks alive after the Realtime socket is lost."""
+    try:
+        await coroutine
+        if not closed_on_return:
+            return
+        detail = "connection closed"
+    except asyncio.CancelledError:
+        raise
+    except (OSError, websockets.exceptions.ConnectionClosed) as error:
+        detail = f"{type(error).__name__}: {error}"
+
+    if not connection_status.get("lost"):
+        print(f"\n[AI CONNECTION LOST] {task_name}: {detail}")
+    connection_status["lost"] = True
+    connection_status["detail"] = detail
+    # This task deliberately remains alive until systemd stops Small Brain.
+    # Cancellation then reaches main's normal cleanup path.
+    await asyncio.Event().wait()
+
+
 async def background_status_monitor(cognitive_manager):
     print("[System: Background Monitor Listening for ROS 2 feedback...]")
     while True:
@@ -256,6 +283,8 @@ async def receive_events(ws, app, response_manager, camera, cognitive_manager):
                 )
 
         elif event_type == "conversation.item.input_audio_transcription.delta":
+            if app.input_muted:
+                continue
             transcript = event.get("delta", "")
 
             def has_meaningful_speech(text):
@@ -267,24 +296,30 @@ async def receive_events(ws, app, response_manager, camera, cognitive_manager):
             if not human_speaking and has_meaningful_speech(transcript):
                 app.clear_queue()
                 human_speaking = True
+                app.set_person_speaking(True)
                 cognitive_manager.note_user_activity()
 
                 print("\n[SPEECH STARTED]")
 
         elif event_type == "input_audio_buffer.speech_started":
+            app.set_person_speaking(True)
             print("\n[VAD TRIGGERED]")
 
         elif event_type == "input_audio_buffer.speech_stopped":
+            app.set_person_speaking(False)
             if human_speaking:
                 human_speaking = False
-                create_tool_task(response_manager.create_voice_response(),
-                                 name="response_task")
+                if not app.input_muted:
+                    create_tool_task(
+                        response_manager.create_voice_response(),
+                        name="response_task",
+                    )
 
         elif event_type == "response.output_audio.delta":
             audio_base64 = event.get("delta")
 
             if audio_base64:
-                app.play_queue.put(base64.b64decode(audio_base64))
+                app.queue_audio(base64.b64decode(audio_base64))
 
         elif event_type == "response.output_audio_transcript.delta":
             print(event.get("delta", ""), end="", flush=True)
@@ -335,6 +370,7 @@ async def main():
     print("\n🤖 DJ STARTING TO CONNECT")
     cognitive_manager = None
     person_tracking = None
+    connection_status = {"lost": False, "detail": ""}
 
     identity_file = load_json(IDENTITY_PATH)
     memory_file = load_json(MEMORY_PATH)
@@ -535,10 +571,24 @@ async def main():
             await ws.send(json.dumps(session_update))
 
             await asyncio.gather(
-                send_mic_audio(ws, app),
-                send_typed_messages(response_manager, cognitive_manager),
-                receive_events(ws, app, response_manager, camera,
-                               cognitive_manager),
+                keep_runtime_after_connection_loss(
+                    send_mic_audio(ws, app),
+                    connection_status,
+                    "microphone sender",
+                ),
+                keep_runtime_after_connection_loss(
+                    send_typed_messages(response_manager, cognitive_manager),
+                    connection_status,
+                    "typed input",
+                    closed_on_return=False,
+                ),
+                keep_runtime_after_connection_loss(
+                    receive_events(
+                        ws, app, response_manager, camera, cognitive_manager
+                    ),
+                    connection_status,
+                    "event receiver",
+                ),
                 background_status_monitor(cognitive_manager),
                 cognitive_manager.cognition_loop(),
                 display_camera_loop(
@@ -548,6 +598,8 @@ async def main():
                     track_action,
                     hand_gesture_interface,
                     person_tracking,
+                    app,
+                    connection_status,
                 ), person_tracking.run(), hand_gesture_interface.run(yolo),
                 wait_for_dino(),
                 wait_for_yolo())

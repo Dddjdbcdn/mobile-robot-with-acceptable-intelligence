@@ -36,6 +36,42 @@ While the robot is running, FACE becomes a compact Stop panel in the lower
 corner so the fullscreen `Robot Vision` camera/debug overlay remains visible.
 Stopping or detecting a failure restores the full control screen.
 
+The compact panel also has a `MAP` button. It opens a touchscreen overview from
+BIG_BRAIN's local map service, refreshing every two seconds only while the page
+is visible; FACE does not need ROS Python libraries. The overview uses the full
+screen while preserving its aspect ratio, with status and controls overlaid so
+they do not shrink the map. A compact `LOCAL` control switches to the stream's
+robot-centred local render and becomes `FULL` to return to the overview. The
+adjacent minus and plus controls adjust the local area from 3 m × 3 m through
+10 m × 10 m in one-metre steps and are hidden in full-overview mode. These map
+controls are stacked on the right.
+The status overlay reports compute time, render time, and total end-to-end map
+time in milliseconds, plus whole-system CPU usage. The compact `CAMERA`,
+`RESET`, and `STOP ROBOT` controls form a vertical lower-right panel, matching
+the camera view's vertical `MAP`, `RESET`, and `STOP ROBOT` panel. `RESET` sends
+a local ZeroMQ request to BIG_BRAIN's lift/reset coordinator. It stops movement,
+clears accumulated behavior and tracking state, resets SLAM and both costmaps,
+then reports success only after the spatial reset completes. Lift recovery uses
+the same operations but waits for stable upright placement before resetting the
+map.
+
+Lift and reset progress is presented as a centered high-priority overlay in
+both camera and map modes. It instructs the operator to place a lifted robot
+down, reports map/manual reset progress, and confirms `READY` briefly once
+movement is safe again; lift state is not duplicated in the debug board.
+
+At the same low display rate, BIG_BRAIN overlays the current robot footprint,
+up to 180 fresh LiDAR returns, the active Nav2 goal, and up to 200 points from
+the current global plan. LiDAR and footprint data disappear when stale, while
+the goal and plan are cleared when navigation completes or is cancelled.
+
+While stopped, the lobby shows the active Wi-Fi connection and provides a
+`CHANGE WI-FI` button that opens Ubuntu's network panel. During a run, Wi-Fi
+and STM32 firmware health appear in the right-side diagnostics panel. If the
+Wi-Fi or Realtime connection is lost, local vision, gestures, ROS control, and
+the Stop panel remain active so the operator can stop safely and return to the
+lobby to select another network.
+
 ## Runtime configuration
 
 Optional service variables can be placed in:

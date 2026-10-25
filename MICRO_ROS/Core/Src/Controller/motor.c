@@ -91,7 +91,7 @@ bool Motor_WheelCommandIsFresh(uint32_t now) {
 #define SERVO_MAX_TILT_ANGLE      120.0f
 
 // Tune this single value to change pan/tilt slew speed.
-#define SERVO_SPEED_DEG_PER_SEC    360.0f
+#define SERVO_SPEED_DEG_PER_SEC    180.0f
 
 volatile float servo_pan_angle = 95.0f;
 volatile float servo_tilt_angle = 90.0f;

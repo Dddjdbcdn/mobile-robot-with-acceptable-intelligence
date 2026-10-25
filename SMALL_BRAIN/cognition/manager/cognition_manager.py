@@ -66,6 +66,7 @@ class CognitionManager:
         "stop_follow",
         "stop_watching_target",
     }
+    INTERNAL_STOP_TOOLS = {"reset_robot"}
     PREEMPTIVE_ACTIONS = {
         "explicit_navigation",
         "approach_target",
@@ -115,6 +116,8 @@ class CognitionManager:
         self._proximity_candidate_count = 0
         self._hand_location = None
         self._hand_approach_started_at = None
+        self._lift_reset_active = False
+        self._last_lift_state = None
 
         self.action_state = ActionState(
             search=self.search_action,
@@ -150,11 +153,25 @@ class CognitionManager:
         await self.events.put(request)
 
     async def handle_tool_msg(self, message):
+        if message.get("event") == "robot_reset":
+            await self._queue_robot_reset(
+                message.get("reason_code") or "ROBOT_RESET"
+            )
+            return
         self.navigation_action.handle_navigation_event(message)
         await self.follow_person_executor.handle_navigation_event(message)
         self.map_navigation_action.handle_navigation_event(message)
 
     async def publish_world_state(self, payload):
+        lift_state = str(payload.get("lift_state") or "")
+        if lift_state in {"lifted", "resetting"}:
+            await self._queue_robot_reset("ROBOT_LIFTED")
+        elif (
+            lift_state == "normal"
+            and self._last_lift_state in {"lifted", "resetting"}
+        ):
+            self._lift_reset_active = False
+        self._last_lift_state = lift_state
         self._pending_world_state = dict(payload)
         if self._world_state_queued:
             return
@@ -296,11 +313,39 @@ class CognitionManager:
                 )
 
     async def handle_tool_request(self, request):
+        if (
+            self._lift_reset_active
+            and request.function_name not in (
+                self.STOP_TOOLS | self.INTERNAL_STOP_TOOLS
+            )
+        ):
+            result = ActionResult(
+                action_id=request.action_id,
+                action_type=request.function_name,
+                status="failed",
+                target=request.arguments.get("target"),
+                outcome="rejected",
+                reason_code="ROBOT_LIFTED",
+                retryable=True,
+            )
+            if not request.silent:
+                await self.response_manager.send_function_output(
+                    request.call_id,
+                    action_envelope(
+                        "command_result",
+                        result,
+                        self.action_state.snapshot(self._autonomy_task),
+                    ),
+                )
+            return
+
         if request.function_name in self.OOB_TOOLS:
             await self.oob_assessment(request)
             return
 
-        if request.function_name in self.STOP_TOOLS:
+        if request.function_name in (
+            self.STOP_TOOLS | self.INTERNAL_STOP_TOOLS
+        ):
             await self.execute_stop(request)
             return
 
@@ -515,17 +560,69 @@ class CognitionManager:
             if action.active:
                 await action.stop(reason)
 
+    async def _stop_movement_goals(self, reason):
+        """Stop actions that can command the base; preserve perception."""
+        for action in (
+            self.follow_person_executor,
+            self.find_target_executor,
+            self.navigation_action,
+            self.map_navigation_action,
+        ):
+            if action.active:
+                await action.stop(reason)
+
+    async def _queue_robot_reset(self, reason):
+        is_lift_reset = reason == "ROBOT_LIFTED"
+        if is_lift_reset and self._lift_reset_active:
+            return
+        if is_lift_reset:
+            self._lift_reset_active = True
+        reset_id = uuid.uuid4().hex
+        await self.events.put(ToolRequest(
+            function_name="reset_robot",
+            arguments={"reason": reason},
+            call_id=f"robot-reset-{reset_id}",
+            action_id=f"robot-reset-{reset_id}",
+            response_metadata={"silent": True, "robot_reset": True},
+        ))
+
     async def execute_stop(self, request):
+        if request.function_name == "reset_robot":
+            reason = request.arguments.get("reason", "USER_REQUESTED")
+            tasks = [self.current_action_task, self._autonomy_task]
+            current_task = asyncio.current_task()
+            pending = [
+                task for task in tasks
+                if task is not None and task is not current_task
+                and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            await self._stop_active_goals(reason)
+            if self.track_action.active:
+                await self.track_action.stop(reason)
+            await self.hand_gesture_interface.stop(reason)
+            self._hand_location = None
+            self._hand_approach_started_at = None
+            self.track_action.clear_visual_target_override()
+            self._tof_history.clear()
+            self._proximity_candidate_count = 0
+            self._startup_person_acquisition_pending = False
+            return
+
         if request.function_name == "stop_movement":
-            was_active = any(action.active for action in (
+            reason = request.arguments.get("reason", "USER_REQUESTED")
+            movement_actions = (
                 self.follow_person_executor,
                 self.find_target_executor,
                 self.navigation_action,
                 self.map_navigation_action,
-                self.search_action,
-            ))
-            await self._stop_active_goals(
-                request.arguments.get("reason", "HAND_PUSH"))
+            )
+            was_active = any(action.active for action in movement_actions)
+            await self._stop_movement_goals(reason)
             if not request.silent:
                 await self.response_manager.send_function_output(
                     request.call_id,
