@@ -14,6 +14,7 @@ extern volatile uint32_t range_response_frame_count[3];
 extern volatile uint32_t range_valid_frame_count[3];
 extern volatile uint32_t range_checksum_error_count[3];
 extern volatile uint32_t range_rejected_frame_count[3];
+extern volatile uint16_t range_last_status_code[3];
 extern volatile uint16_t range_last_reject_code[3];
 extern volatile uint32_t range_uart_error_count[3];
 extern volatile uint32_t range_restart_count[3];

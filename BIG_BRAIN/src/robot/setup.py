@@ -38,6 +38,7 @@ setup(
             'person_lidar_tracker.py = robot.person_pose.person_lidar_tracker:main',
             'reset_node.py = robot.control.reset_node:main',
             'system_watchdog.py = robot.watchdog.system_watchdog:main',
+            'microros_recorder.py = robot.diagnostics.microros_recorder:main',
             'velocity_clamper.py = robot.control.velocity_clamper:main',
             'cliff_detector.py = robot.control.cliff_detector:main',
         ],

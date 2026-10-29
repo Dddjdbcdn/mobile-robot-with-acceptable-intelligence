@@ -18,13 +18,14 @@ import time
 import cv2
 import numpy as np
 
+from services.diagnostic_session import smallbrain_diagnostics
+
 
 _SHOULDERS = frozenset(("left_shoulder", "right_shoulder"))
 _HIPS = frozenset(("left_hip", "right_hip"))
 _DEBUG_TILE_WIDTH = 112
 _DEBUG_TILE_HEIGHT = 196
 _DEBUG_GALLERY_COLUMNS = 5
-_DEBUG_TRACKING_LOG_MAX_BYTES = 5 * 1024 * 1024
 _SMALL_BRAIN_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -427,11 +428,6 @@ class PersonTrackingService:
         self._debug_reid_role = "--"
         self._debug_candidates = "--"
         self._last_console_debug_key = None
-        self._debug_log_path = _SMALL_BRAIN_ROOT / "results/person_tracking.log"
-        try:
-            self._debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            self._debug_log_path = None
         self._debug_directory = None
         if self.config.save_gallery_debug_images:
             configured = Path(self.config.gallery_debug_directory)
@@ -469,17 +465,14 @@ class PersonTrackingService:
         self._reset_target()
         self._target_tracking_active = True
         self._last_console_debug_key = None
-        self._write_debug_line(
-            f"[PERSON_TRACK] session=start wall_time="
-            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}"
-        )
 
     def stop_target_tracking(self):
         """Discard identity state when no tracking action owns a target."""
-        self._write_debug_line(
-            f"[PERSON_TRACK] session=stop wall_time="
-            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}"
-        )
+        self._write_debug_event({
+            "state": "stopped",
+            "mode": self.scene_mode,
+            "decision": "tracking_session_stopped",
+        }, time.monotonic())
         self._target_tracking_active = False
         self._reset_target()
         with self._snapshot_lock:
@@ -799,20 +792,22 @@ class PersonTrackingService:
             return "inf"
         return f"{float(value):.3f}"
 
-    def _write_debug_line(self, line):
-        """Persist the full-rate trace while keeping its disk use bounded."""
-        path = self._debug_log_path
-        if path is None:
-            return
-        try:
-            if (path.exists()
-                    and path.stat().st_size >= _DEBUG_TRACKING_LOG_MAX_BYTES):
-                path.replace(path.with_suffix(".log.1"))
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(line + "\n")
-        except OSError:
-            # Tracking must never fail because debug storage is unavailable.
-            self._debug_log_path = None
+    @staticmethod
+    def _debug_json_number(value):
+        if value is None:
+            return None
+        if math.isinf(value):
+            return "infinity"
+        return float(value)
+
+    def _write_debug_event(self, event, now):
+        """Update the person-tracking section of central diagnostics."""
+        return smallbrain_diagnostics.update(
+            "person_tracking",
+            event,
+            tally_group="decisions",
+            tally_value=event.get("decision") or "unknown",
+        )
 
     def _print_debug_state(self, sequence, people, now):
         track = self._target()
@@ -822,6 +817,13 @@ class PersonTrackingService:
                 f"people={len(people)} decision={self._debug_decision}"
             )
             console_key = ("none", self.scene_mode, self._debug_decision)
+            event = {
+                "sequence": sequence,
+                "state": "none",
+                "mode": self.scene_mode,
+                "people": len(people),
+                "decision": self._debug_decision,
+            }
         else:
             person = track.person if track.visible else None
             confidence = _confidence(person) if person is not None else None
@@ -856,7 +858,39 @@ class PersonTrackingService:
                 self._debug_decision,
                 self._debug_gallery_decision,
             )
-        self._write_debug_line(line)
+            event = {
+                "sequence": sequence,
+                "state": track.state,
+                "mode": self.scene_mode,
+                "visible": track.visible,
+                "people": len(people),
+                "track_id": track.track_id,
+                "candidate_id": track.candidate_id,
+                "confirmation_hits": track.consecutive_hits,
+                "confirmation_required": self.config.confirmation_hits,
+                "missing_seconds": round(missing, 3),
+                "confidence": confidence,
+                "keypoints": keypoints,
+                "credible": clear,
+                "geometry_index": self._debug_geometry_index,
+                "geometry_score": self._debug_json_number(
+                    self._debug_geometry_score),
+                "reid_score": self._debug_json_number(self._debug_reid_best),
+                "reid_minimum": self._debug_json_number(
+                    self._debug_reid_threshold),
+                "reid_margin": self._debug_json_number(
+                    self._debug_reid_margin),
+                "reid_source": self._debug_reid_source,
+                "reid_role": self._debug_reid_role,
+                "gallery_size": len(track.gallery),
+                "gallery_action": self._debug_gallery_decision,
+                "recovery_hits": self._reacquisition_hits,
+                "recovery_required": (
+                    self.config.reacquisition_confirmation_frames),
+                "decision": self._debug_decision,
+                "candidates": self._debug_candidates,
+            }
+        self._write_debug_event(event, now)
         if console_key != self._last_console_debug_key:
             print(line, flush=True)
             self._last_console_debug_key = console_key

@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -97,8 +98,10 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
         service = self.make_service()
         output = io.StringIO()
 
-        with tempfile.TemporaryDirectory() as directory:
-            service._debug_log_path = Path(directory) / "person_tracking.log"
+        with patch(
+            "services.vision.person_tracking_service."
+            "smallbrain_diagnostics.update"
+        ) as update:
             with redirect_stdout(output):
                 await service.update(
                     1,
@@ -106,7 +109,6 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
                     [person("target", 0.5, [1, 0, 0])],
                     captured_at=10.0,
                 )
-            saved_trace = service._debug_log_path.read_text(encoding="utf-8")
 
         debug_line = output.getvalue()
         self.assertIn("[PERSON_TRACK] seq=1 state=confirmed mode=solo", debug_line)
@@ -114,7 +116,10 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reid=--", debug_line)
         self.assertIn("gallery_action=updated", debug_line)
         self.assertIn("decision=acquisition_confirmed_geometry", debug_line)
-        self.assertIn(debug_line.strip(), saved_trace)
+        event = update.call_args.args[1]
+        self.assertEqual(event["sequence"], 1)
+        self.assertEqual(event["state"], "confirmed")
+        self.assertEqual(event["decision"], "acquisition_confirmed_geometry")
 
     async def test_idle_service_does_not_create_person_identity(self):
         service = self.make_service(tracking_active=False)
@@ -421,23 +426,28 @@ class PersonTrackingServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_solo_reid_debug_score_does_not_control_tracking(self):
         service = self.make_service()
-        with tempfile.TemporaryDirectory() as directory:
-            service._debug_log_path = Path(directory) / "person_tracking.log"
+        with patch(
+            "services.vision.person_tracking_service."
+            "smallbrain_diagnostics.update"
+        ) as update:
             await service.update(
                 1, self.frame(),
                 [person("target", 0.50, [1, 0, 0])], captured_at=97.0)
             tracks = await service.update(
                 2, self.frame(),
                 [person("target", 0.51, [0.8, 0.6, 0])],
-                captured_at=97.1,
+                captured_at=98.1,
             )
-            trace = service._debug_log_path.read_text(encoding="utf-8")
 
         self.assertTrue(tracks[0].visible)
-        self.assertIn("seq=2 state=confirmed mode=solo", trace)
-        self.assertIn("reid=0.800 reid_min=--", trace)
-        self.assertIn("reid_role=solo_debug", trace)
-        self.assertIn("decision=solo_geometry", trace)
+        event = update.call_args.args[1]
+        self.assertEqual(event["sequence"], 2)
+        self.assertEqual(event["state"], "confirmed")
+        self.assertEqual(event["mode"], "solo")
+        self.assertAlmostEqual(event["reid_score"], 0.8, places=6)
+        self.assertIsNone(event["reid_minimum"])
+        self.assertEqual(event["reid_role"], "solo_debug")
+        self.assertEqual(event["decision"], "solo_geometry")
 
     async def test_recovery_rejects_stranger_even_inside_recent_geometry(self):
         service = self.make_service()

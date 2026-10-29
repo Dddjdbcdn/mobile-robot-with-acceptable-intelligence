@@ -61,11 +61,46 @@ class FollowGoalGeneratorTests(unittest.TestCase):
         expected = math.atan2(1.0 - goal.y, 1.0 - goal.x)
         self.assertAlmostEqual(goal.yaw, expected)
 
+    def test_distant_person_goal_is_capped_inside_rolling_costmap(self):
+        goal = self.generate(20.0)
+
+        self.assertAlmostEqual(
+            goal.x,
+            self.generator.settings.max_goal_distance_m,
+        )
+        self.assertAlmostEqual(goal.y, 0.0)
+        self.assertAlmostEqual(goal.yaw, 0.0)
+
+    def test_diagonal_goal_cap_preserves_person_bearing(self):
+        goal = self.generator.generate(
+            person_x=20.0,
+            person_y=20.0,
+            robot_x=1.0,
+            robot_y=2.0,
+        )
+
+        self.assertAlmostEqual(
+            math.hypot(goal.x - 1.0, goal.y - 2.0),
+            self.generator.settings.max_goal_distance_m,
+        )
+        self.assertAlmostEqual(
+            goal.yaw,
+            math.atan2(20.0 - 2.0, 20.0 - 1.0),
+        )
+
     def test_recovery_goal_has_zero_standoff(self):
         goal = self.generate(2.0, target_mode="recovery")
 
         self.assertAlmostEqual(goal.x, 2.0)
         self.assertAlmostEqual(goal.y, 0.0)
+
+    def test_distant_recovery_goal_is_capped(self):
+        goal = self.generate(20.0, target_mode="recovery")
+
+        self.assertAlmostEqual(
+            goal.x,
+            self.generator.settings.max_goal_distance_m,
+        )
 
     def test_recovery_goal_keeps_approach_bearing(self):
         goal = self.generator.generate(

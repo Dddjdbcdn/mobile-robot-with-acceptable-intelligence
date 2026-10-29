@@ -11,6 +11,7 @@ class StableTargetSeedTracker:
     MAX_SPREAD_M = 0.12
     MAX_AGE_SECONDS = 0.75
     INPUT_MAX_AGE_SECONDS = 0.50
+    MAX_DISTANCE_M = 6.0
 
     def __init__(self):
         self._samples = deque(maxlen=self.SAMPLE_COUNT)
@@ -21,6 +22,30 @@ class StableTargetSeedTracker:
         self._samples.clear()
         self._stable = None
         self._stable_since = None
+
+    @classmethod
+    def is_usable_coordinate(cls, camera, *, now=None):
+        """Return whether a fresh ToF seed is within the tracking range."""
+        camera = camera or {}
+        try:
+            tof_range = float(camera["camera_tof_range"])
+            object_x = float(camera["object_x"])
+            object_y = float(camera["object_y"])
+            timestamp = float(camera["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if not all(math.isfinite(value) for value in (
+            tof_range, object_x, object_y, timestamp,
+        )):
+            return False
+        if now is None:
+            now = time.monotonic()
+        return (
+            0.05 < tof_range <= cls.MAX_DISTANCE_M
+            and math.hypot(object_x, object_y) <= cls.MAX_DISTANCE_M
+            and now - timestamp <= cls.INPUT_MAX_AGE_SECONDS
+        )
 
     def update(
         self,
@@ -38,16 +63,14 @@ class StableTargetSeedTracker:
                 "timestamp",
             )
         ]
-        valid = all(
-            isinstance(value, (int, float)) and math.isfinite(float(value))
-            for value in values
-        )
-        if valid:
-            valid = (
-                float(camera["camera_tof_range"]) > 0.05
-                and now - float(camera["timestamp"])
-                <= self.INPUT_MAX_AGE_SECONDS
+        valid = (
+            all(
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                for value in values
             )
+            and self.is_usable_coordinate(camera, now=now)
+        )
 
         map_x = camera.get("object_map_x")
         map_y = camera.get("object_map_y")
@@ -136,9 +159,20 @@ class StableTargetSeedTracker:
         self._stable = stable
         return dict(stable)
 
-    def status(self, *, target=None, session_id=None):
+    def status(self, *, target=None, session_id=None, expire=True):
         """Return display-friendly progress for the current seed stream."""
-        seed = self.get(target=target, session_id=session_id)
+        if expire:
+            seed = self.get(target=target, session_id=session_id)
+        else:
+            seed = self._stable
+            if seed is not None and (
+                (target is not None and seed.get("target") != target)
+                or (session_id is not None
+                    and seed.get("session_id") != session_id)
+                or time.monotonic() - seed["validated_at"]
+                > self.MAX_AGE_SECONDS
+            ):
+                seed = None
         valid_since = self._stable_since if seed is not None else None
         samples_match = bool(self._samples) and (
             (target is None or self._samples[-1]["target"] == target)

@@ -167,9 +167,13 @@ class NavigationAction:
                 response.get("message", "navigation_rejected")
                 if isinstance(response, dict) else str(response)
             )
+            reason_code = (
+                response.get("reason_code") or "NAVIGATION_REJECTED"
+                if isinstance(response, dict)
+                else "NAVIGATION_REJECTED"
+            )
             return self._finish(
-                "failed", "rejected", "NAVIGATION_REJECTED",
-                {"message": message},
+                "failed", "rejected", reason_code, {"message": message}
             )
         if not self.active and self.completion_future.done():
             return self.completion_future.result()

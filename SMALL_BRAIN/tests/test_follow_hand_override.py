@@ -2,7 +2,7 @@ import asyncio
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from actions.action_result import ActionResult
 from cognition.manager.cognition_manager import CognitionManager
@@ -368,6 +368,41 @@ class FollowHandGestureRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.manager.follow_person_executor.clear_count,
             1,
         )
+
+    async def test_missing_hand_location_is_reported_as_rejected(self):
+        self.manager.events = asyncio.Queue()
+        with patch(
+            "cognition.manager.cognition_manager."
+            "smallbrain_diagnostics.update"
+        ) as update:
+            accepted = await self.manager.handle_hand_command(
+                "approach_target", {"target": "hand"})
+            cognition = update.call_args.args[1]
+
+        self.assertFalse(accepted)
+        self.assertFalse(cognition["last_hand_command"]["accepted"])
+        self.assertEqual(
+            cognition["last_hand_command"]["reason"],
+            "HAND_LOCATION_UNAVAILABLE",
+        )
+
+    async def test_saved_hand_location_is_reported_with_action_id(self):
+        self.manager.events = asyncio.Queue()
+        self.manager._hand_location = {
+            "x": 0.4, "y": 0.1, "angle": 0.2, "tof_range": 0.5,
+        }
+        with patch(
+            "cognition.manager.cognition_manager."
+            "smallbrain_diagnostics.update"
+        ) as update:
+            accepted = await self.manager.handle_hand_command(
+                "approach_target", {"target": "hand"})
+            cognition = update.call_args.args[1]
+
+        self.assertTrue(accepted)
+        self.assertTrue(cognition["last_hand_command"]["accepted"])
+        self.assertTrue(
+            cognition["last_hand_command"]["action_id"].startswith("hand-"))
 
 
 if __name__ == "__main__":

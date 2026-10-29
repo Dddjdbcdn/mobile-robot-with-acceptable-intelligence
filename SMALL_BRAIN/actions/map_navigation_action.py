@@ -301,7 +301,10 @@ class MapNavigationAction:
         try:
             snapshot = await self.request_map_snapshot(request)
         except (asyncio.TimeoutError, TimeoutError, RuntimeError, zmq.ZMQError) as error:
-            raise NavigationError("MAP_STREAM_UNAVAILABLE", str(error)) from error
+            raise NavigationError(
+                getattr(error, "reason_code", "MAP_STREAM_UNAVAILABLE"),
+                str(error),
+            ) from error
 
         metadata = snapshot["metadata"]
         if str(metadata.get("snapshot_request_id")) != map_request_id:

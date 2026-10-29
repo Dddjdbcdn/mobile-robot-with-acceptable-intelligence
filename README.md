@@ -281,6 +281,12 @@ python main.py
 
 The ROS layer must run first because it owns the ZeroMQ endpoints used by `SMALL_BRAIN`.
 
+Each ROS hardware startup also creates a lightweight micro-ROS flight-recorder
+file under `diagnostics/microros-sessions/`. The JSON-lines log contains STM32
+health reports, micro-topic liveness transitions, ST-Link device and agent
+process transitions, and relevant USB kernel events. It records message counts,
+not IMU, range, ToF, or wheel-state payloads.
+
 ### Build and flash firmware
 
 After regenerating the ignored STM32 vendor code and micro-ROS library per the setup guide:

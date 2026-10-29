@@ -19,6 +19,7 @@ from actions.tracking.target_catalog import (
     normalize_object_target,
 )
 from cognition.manager.world_state import robot_state
+from services.diagnostic_session import smallbrain_diagnostics
 from services.display.camera_display import pose_body_mask, project_tof_region
 
 HORIZONTAL_FOV_DEG = 85
@@ -33,8 +34,10 @@ class TrackingService:
     YOLO_OBJECT_DETECTION_TIMEOUT_SECONDS = 1.0
     TARGET_SEED_SAMPLES = StableTargetSeedTracker.SAMPLE_COUNT
     PERSON_POINT_MAX_AGE_SECONDS = StableTargetSeedTracker.INPUT_MAX_AGE_SECONDS
+    PERSON_SEED_MAX_DISTANCE_M = StableTargetSeedTracker.MAX_DISTANCE_M
     PERSON_SEED_UPDATE_HZ = 5.0
     PERSON_TARGET_SMOOTHING_ALPHA = 0.35
+    PERSON_KEYPOINT_LOSS_TOLERANCE_SECONDS = 1.0
     PERSON_ID_ACQUISITION_TIMEOUT_SECONDS = 1.0
 
     def __init__(
@@ -76,6 +79,84 @@ class TrackingService:
         self.person_path_index = 0
         self._tracked_person_id = None
 
+    def _write_track_debug(
+        self,
+        pipeline,
+        *,
+        sequence=None,
+        target_xy=None,
+        centered=None,
+        seed_target=None,
+        camera_state=None,
+        tof_on_person=None,
+    ):
+        """Record compact tracking evidence without affecting tracking."""
+        try:
+            now = time.monotonic()
+            override = getattr(self, "_visual_target_override", None)
+            override_age = (
+                max(0.0, now - float(override["updated_at"]))
+                if isinstance(override, dict) else None
+            )
+            query_target = seed_target or (
+                "hand" if override is not None else self.target)
+            seed = self.stable_seeds.status(
+                target=query_target,
+                session_id=self.action_id,
+                expire=False,
+            )
+            camera = dict(camera_state or robot_state.get("camera") or {})
+            captured_at = camera.get("timestamp")
+            tof_age = (
+                max(0.0, now - float(captured_at))
+                if isinstance(captured_at, (int, float)) else None
+            )
+            tof_range = camera.get("camera_tof_range")
+            tof_valid = self._valid_tof_coordinate(camera)
+            event = {
+                "pipeline": pipeline,
+                "action_id": self.action_id,
+                "active": bool(self.active),
+                "target": self.target,
+                "sequence": sequence,
+                "follow": bool(self._follow_person_active),
+                "tracked_person_id": self._tracked_person_id,
+                "target_xy": target_xy,
+                "centered": centered,
+                "center_threshold": self.stable_threshold,
+                "visual_override": ({
+                    "x": override.get("x"),
+                    "y": override.get("y"),
+                    "age_seconds": round(override_age, 3),
+                } if isinstance(override, dict) else None),
+                "seed": {
+                    "target": query_target,
+                    "valid": seed["valid"],
+                    "samples": seed["sample_count"],
+                    "required": seed["sample_target"],
+                    "valid_for_seconds": round(
+                        float(seed["valid_for_seconds"]), 3),
+                },
+                "tof": {
+                    "valid": tof_valid,
+                    "range_m": tof_range,
+                    "age_seconds": (
+                        round(tof_age, 3) if tof_age is not None else None),
+                    "object_x": camera.get("object_x"),
+                    "object_y": camera.get("object_y"),
+                    "on_person": tof_on_person,
+                },
+            }
+            smallbrain_diagnostics.update(
+                "track_action",
+                event,
+                tally_group="pipelines",
+                tally_value=pipeline,
+            )
+        except Exception:
+            # Diagnostics must never alter camera tracking or robot commands.
+            return
+
     @property
     def session_id(self):
         return self.action_id
@@ -94,12 +175,14 @@ class TrackingService:
         }
         if override_started:
             self.stable_seeds.clear()
+        self._write_track_debug("visual_override_updated")
 
     def clear_visual_target_override(self):
         if self._visual_target_override is None:
             return
         self._visual_target_override = None
         self.stable_seeds.clear()
+        self._write_track_debug("visual_override_cleared", seed_target="hand")
 
     def set_follow_person_active(self, active):
         """Mirror follow-action state for tracking timeout and seed behavior."""
@@ -131,6 +214,8 @@ class TrackingService:
         if time.monotonic() - override["updated_at"] > max_age_seconds:
             self.stable_seeds.clear()
             self._visual_target_override = None
+            self._write_track_debug(
+                "visual_override_expired", seed_target="hand")
             return None
         return override["x"], override["y"]
 
@@ -444,9 +529,23 @@ class TrackingService:
                     )
                 else:
                     self.stable_seeds.clear()
+                self._write_track_debug(
+                    "object_centered" if centered else "object_not_centered",
+                    sequence=tracking_update.sequence,
+                    target_xy=(target_x, target_y),
+                    centered=centered,
+                    seed_target=self.target,
+                    camera_state=robot_state["camera"],
+                )
             else:
                 self.stable_seeds.clear()
                 failure_frames += 1
+                self._write_track_debug(
+                    "object_tracking_failed",
+                    sequence=tracking_update.sequence,
+                    seed_target=self.target,
+                    camera_state=robot_state["camera"],
+                )
                 if failure_frames >= self.OBJECT_FAILURE_GRACE_FRAMES:
                     reacquired = False
                     for _attempt in range(self.OBJECT_REACQUIRE_ATTEMPTS):
@@ -597,6 +696,17 @@ class TrackingService:
         """Publish each captured ToF seed at most once."""
         if self.person_tracker_pub_socket is None:
             return False
+        try:
+            seed_x = float(seed["x"])
+            seed_y = float(seed["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            not math.isfinite(seed_x)
+            or not math.isfinite(seed_y)
+            or math.hypot(seed_x, seed_y) > self.PERSON_SEED_MAX_DISTANCE_M
+        ):
+            return False
         captured_at = float(seed["captured_at"])
         seed_key = (
             str(seed["session_id"]),
@@ -609,9 +719,9 @@ class TrackingService:
             "type":
             "person_tof_position",
             "x":
-            seed["x"],
+            seed_x,
             "y":
-            seed["y"],
+            seed_y,
             "frame_id":
             "base_footprint",
             "target":
@@ -709,10 +819,9 @@ class TrackingService:
 
     def _valid_tof_coordinate(self, camera_state):
         """Return whether the current base-frame ToF coordinate is usable."""
-        return (
-            camera_state["camera_tof_range"] > 0.05
-            and time.monotonic() - camera_state["timestamp"]
-            <= self.PERSON_POINT_MAX_AGE_SECONDS
+        return StableTargetSeedTracker.is_usable_coordinate(
+            camera_state,
+            now=time.monotonic(),
         )
 
     def _person_tof_intersects_mask(self, person, camera_state):
@@ -763,7 +872,7 @@ class TrackingService:
         person_timeout_seconds = float(getattr(
             self.person_tracking_service,
             "lost_timeout_seconds",
-            2.0,
+            3.0,
         ))
         loop = asyncio.get_running_loop()
         last_inference_sequence = None
@@ -774,7 +883,35 @@ class TrackingService:
         filtered_target_name = None
         pan_reset_for_current_absence = False
         prediction_attempted = False
+        prediction_wait_started_at = None
+        keypoint_missing_since = None
         torso_estimator = TorsoTargetEstimator()
+
+        def restart_from_best_visible_keypoint(person):
+            nonlocal current_reached
+            nonlocal predicted_target
+            nonlocal prediction_attempted
+            nonlocal prediction_wait_started_at
+            nonlocal keypoint_missing_since
+            nonlocal filtered_target
+            nonlocal filtered_target_name
+
+            recovery_path = find_best_person_path(person, self.target)
+            if not recovery_path:
+                return False
+
+            self.person_path = recovery_path
+            self.person_path_index = 0
+            current_reached = False
+            predicted_target = None
+            prediction_attempted = False
+            prediction_wait_started_at = None
+            keypoint_missing_since = None
+            filtered_target = None
+            filtered_target_name = None
+            self.stable_seeds.clear()
+            print(f"\nRETRACING FROM: {recovery_path[0]}\n")
+            return True
 
         while self.active:
             (
@@ -851,6 +988,12 @@ class TrackingService:
                 )
             if person is None:
                 self.stable_seeds.clear()
+                self._write_track_debug(
+                    "person_not_visible",
+                    sequence=inference_sequence,
+                    seed_target=("hand" if visual_override is not None
+                                 else self.target),
+                )
                 if missing_person_since is None:
                     missing_person_since = loop.time()
                 elif (loop.time() - missing_person_since
@@ -901,6 +1044,8 @@ class TrackingService:
                     current_reached = False
                     predicted_target = None
                     prediction_attempted = False
+                    prediction_wait_started_at = None
+                    keypoint_missing_since = None
                     print(f"\nTRACING TO: {current_name}\n")
                     break
 
@@ -911,12 +1056,61 @@ class TrackingService:
                     current_name,
                     torso_target=torso_target,
                 )
+
+            waiting_after_prediction = (
+                current_reached and prediction_attempted
+            )
+            if current_keypoint is None and not waiting_after_prediction:
+                now = loop.time()
+                if keypoint_missing_since is None:
+                    keypoint_missing_since = now
+                missing_for = now - keypoint_missing_since
+                if (missing_for
+                        < self.PERSON_KEYPOINT_LOSS_TOLERANCE_SECONDS):
+                    self.stable_seeds.clear()
+                    self._write_track_debug(
+                        "keypoint_temporarily_missing",
+                        sequence=inference_sequence,
+                        seed_target=("hand" if visual_override is not None
+                                     else self.target),
+                    )
+                    await asyncio.sleep(0.05)
+                    continue
+                if not restart_from_best_visible_keypoint(person):
+                    self.stable_seeds.clear()
+                    self._write_track_debug(
+                        "keypoint_recovery_unavailable",
+                        sequence=inference_sequence,
+                        seed_target=("hand" if visual_override is not None
+                                     else self.target),
+                    )
+                    await asyncio.sleep(0.05)
+                    continue
+                current_name = self.person_path[0]
+                torso_target = torso_estimator.update(
+                    person,
+                    allow_bootstrap=current_name == "torso_center",
+                )
+                current_keypoint = person_keypoint(
+                    person,
+                    current_name,
+                    torso_target=torso_target,
+                )
+            elif current_keypoint is not None:
+                keypoint_missing_since = None
+
             using_prediction = False
             selected_target_name = current_name
 
             if not current_reached:
                 if current_keypoint is None:
                     self.stable_seeds.clear()
+                    self._write_track_debug(
+                        "keypoint_unavailable",
+                        sequence=inference_sequence,
+                        seed_target=("hand" if visual_override is not None
+                                     else self.target),
+                    )
                     await asyncio.sleep(0.05)
                     continue
                 target_x = current_keypoint["normalized_x"]
@@ -931,7 +1125,19 @@ class TrackingService:
                         using_prediction = True
                         selected_target_name = f"prediction:{next_name}"
                     else:
+                        now = loop.time()
+                        if prediction_wait_started_at is None:
+                            prediction_wait_started_at = now
+                        prediction_wait = now - prediction_wait_started_at
+                        if (prediction_attempted and prediction_wait >=
+                                self.PERSON_KEYPOINT_LOSS_TOLERANCE_SECONDS):
+                            restart_from_best_visible_keypoint(person)
                         self.stable_seeds.clear()
+                        self._write_track_debug(
+                            "waiting_for_next_keypoint",
+                            sequence=inference_sequence,
+                            seed_target=self.target,
+                        )
                         await asyncio.sleep(0.05)
                         continue
 
@@ -947,6 +1153,9 @@ class TrackingService:
                         # extrapolate from. In that case the torso estimator's
                         # configured hip offset is the next step immediately.
                         prediction_attempted = predicted_target is None
+                        prediction_wait_started_at = (
+                            loop.time() if prediction_attempted else None
+                        )
                         current_reached = True
 
             if visual_override is not None:
@@ -1012,6 +1221,7 @@ class TrackingService:
                 # attached to the person. Apply it once, then use the latest
                 # reached keypoint until the intended keypoint becomes visible.
                 prediction_attempted = True
+                prediction_wait_started_at = loop.time()
 
             final_keypoint = self.person_path_index == len(
                 self.person_path) - 1
@@ -1029,6 +1239,16 @@ class TrackingService:
 
             if seed_target is None:
                 self.stable_seeds.clear()
+                self._write_track_debug(
+                    ("hand_not_centered" if visual_override is not None else
+                     "person_seed_not_ready"),
+                    sequence=inference_sequence,
+                    target_xy=(target_x, target_y),
+                    centered=target_centered,
+                    seed_target=("hand" if visual_override is not None
+                                 else self.target),
+                    camera_state=robot_state["camera"],
+                )
                 await asyncio.sleep(0.01)
                 continue
 
@@ -1040,7 +1260,12 @@ class TrackingService:
 
                 camera_state = robot_state["camera"]
 
-                if visual_override is not None or self._person_tof_intersects_mask(person, camera_state):
+                tof_on_person = None
+                if visual_override is None:
+                    tof_on_person = self._person_tof_intersects_mask(
+                        person, camera_state)
+
+                if visual_override is not None or tof_on_person:
 
                     stable_seed = self.stable_seeds.update(
                         camera_state,
@@ -1060,6 +1285,25 @@ class TrackingService:
                         await self._publish_lidar_seed(stable_seed)
                 else:
                     self.stable_seeds.clear()
+
+                seed_status = self.stable_seeds.status(
+                    target=seed_target,
+                    session_id=self.action_id,
+                )
+                pipeline = (
+                    "seed_valid" if seed_status["valid"] else
+                    "seed_building" if seed_status["sample_count"] else
+                    "tof_not_usable"
+                )
+                self._write_track_debug(
+                    pipeline,
+                    sequence=inference_sequence,
+                    target_xy=(target_x, target_y),
+                    centered=target_centered,
+                    seed_target=seed_target,
+                    camera_state=camera_state,
+                    tof_on_person=tof_on_person,
+                )
 
             await asyncio.sleep(0.01)
 

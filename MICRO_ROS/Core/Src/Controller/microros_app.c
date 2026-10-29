@@ -50,6 +50,7 @@ extern volatile uint8_t tof_last_read_status;
 #define AGENT_PING_ATTEMPTS 3
 #define AGENT_RETRY_DELAY_MS 500
 #define AGENT_RUNTIME_PING_PERIOD_MS 2000
+#define AGENT_RUNTIME_FAILURE_LIMIT 1U
 #define ENTITY_CREATION_TIMEOUT_MS 2000
 #define ENTITY_DESTROY_TIMEOUT_MS 100
 #define IMU_STALE_TIMEOUT_MS 200U
@@ -214,10 +215,16 @@ void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
       imu_gyro_msg.x = fresh ? Gx : NAN;
       imu_gyro_msg.y = fresh ? Gy : NAN;
       imu_gyro_msg.z = fresh ? Gz : NAN;
-      MicroRosDiagnostics_PublishPair(
+      rcl_ret_t publish_result = MicroRosDiagnostics_PublishPair(
           &diagnostics, PUB_IMU,
           &imu_accel_publisher, &imu_accel_msg,
           &imu_gyro_publisher, &imu_gyro_msg);
+      if (fresh && publish_result == RCL_RET_OK) {
+          MicroRosDiagnostics_RecordImuSample(
+              &diagnostics,
+              imu_accel_msg.x, imu_accel_msg.y, imu_accel_msg.z,
+              imu_gyro_msg.x, imu_gyro_msg.y, imu_gyro_msg.z);
+      }
     }
 }
 
@@ -433,8 +440,10 @@ static bool create_microros_entities(void)
                      "stm32/wheel_states"),
                  "pub_wheel");
 
+    /* Wheel commands are state, not events. Best effort prevents an old
+       reliable command from being replayed after a transport outage. */
     INIT_OR_FAIL(diagnostics.subscriptions[SUB_WHEEL_CMD].init_ret,
-                 rclc_subscription_init_default(
+                 rclc_subscription_init_best_effort(
                      &wheel_cmd_subscriber, &node,
                      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
                      "stm32/wheel_commands"),
@@ -593,6 +602,8 @@ void run_microros_app()
     wire_message_memory();
 
     for (;;) {
+        uint32_t failed_runtime_pings = 0U;
+
         while (rmw_uros_ping_agent(AGENT_PING_TIMEOUT_MS,
                                    AGENT_PING_ATTEMPTS) != RMW_RET_OK) {
             osDelay(AGENT_RETRY_DELAY_MS);
@@ -603,43 +614,64 @@ void run_microros_app()
             osDelay(AGENT_RETRY_DELAY_MS);
             continue;
         }
-        break;
-    }
 
-    uint32_t previous_agent_ping_ms = HAL_GetTick();
-    diagnostics.previous_health_report_ms = previous_agent_ping_ms;
-    diagnostics.previous_tof_irq_count = tof_irq_count;
-    diagnostics.previous_tof_frame_count = tof_frame_count;
+        uint32_t previous_agent_ping_ms = HAL_GetTick();
+        diagnostics.previous_health_report_ms = previous_agent_ping_ms;
+        diagnostics.previous_system_report_ms = previous_agent_ping_ms;
+        diagnostics.previous_tof_irq_count = tof_irq_count;
+        diagnostics.previous_tof_frame_count = tof_frame_count;
 
-    if (entity_creation_attempts > 1U) {
-        MicroRosDiagnostics_Log(
-            &diagnostics, &debug_publisher,
-            "[MICROROS] startup recovered attempts=%lu last_stage=%s rc=%ld error=%s",
-            (unsigned long)entity_creation_attempts,
-            last_init_failure_stage, last_init_failure_rc,
-            last_init_failure_error);
-    } else {
-        MicroRosDiagnostics_Log(
-            &diagnostics, &debug_publisher,
-            "[MICROROS] connected attempts=%lu",
-            (unsigned long)entity_creation_attempts);
-    }
+        if (entity_creation_attempts > 1U) {
+            MicroRosDiagnostics_Log(
+                &diagnostics, &debug_publisher,
+                "[MICROROS] session_recreated attempts=%lu last_stage=%s rc=%ld error=%s",
+                (unsigned long)entity_creation_attempts,
+                last_init_failure_stage, last_init_failure_rc,
+                last_init_failure_error);
+        } else {
+            MicroRosDiagnostics_Log(
+                &diagnostics, &debug_publisher,
+                "[MICROROS] connected attempts=%lu",
+                (unsigned long)entity_creation_attempts);
+        }
+        MicroRosDiagnostics_ReportBoot(&diagnostics, &debug_publisher);
 
-    for (;;) {
-        rcl_ret_t spin_result =
-            rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-        MicroRosDiagnostics_RecordExecutor(&diagnostics, spin_result);
+        for (;;) {
+            rcl_ret_t spin_result =
+                rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+            MicroRosDiagnostics_RecordExecutor(
+                &diagnostics, spin_result, HAL_GetTick());
 
-        uint32_t now = HAL_GetTick();
-        if ((now - previous_agent_ping_ms) >= AGENT_RUNTIME_PING_PERIOD_MS) {
-            rmw_ret_t ping_result = rmw_uros_ping_agent(
-                AGENT_PING_TIMEOUT_MS, AGENT_PING_ATTEMPTS);
-            MicroRosDiagnostics_RecordAgentPing(&diagnostics, ping_result);
-            previous_agent_ping_ms = now;
+            uint32_t now = HAL_GetTick();
+            if ((now - previous_agent_ping_ms) >=
+                AGENT_RUNTIME_PING_PERIOD_MS) {
+                rmw_ret_t ping_result = rmw_uros_ping_agent(
+                    AGENT_PING_TIMEOUT_MS, AGENT_PING_ATTEMPTS);
+                MicroRosDiagnostics_RecordAgentPing(
+                    &diagnostics, ping_result, now);
+                previous_agent_ping_ms = now;
+
+                if (ping_result == RMW_RET_OK) {
+                    failed_runtime_pings = 0U;
+                } else if (++failed_runtime_pings >=
+                           AGENT_RUNTIME_FAILURE_LIMIT) {
+                    Motor_SetWheelTargets(0.0f, 0.0f);
+                    MicroRosDiagnostics_Log(
+                        &diagnostics, &debug_publisher,
+                        "[MICROROS] session_lost failed_ping_checks=%lu",
+                        (unsigned long)failed_runtime_pings);
+                    break;
+                }
+            }
+
+            MicroRosDiagnostics_ReportIfDue(
+                &diagnostics, &debug_publisher, now);
+            osDelay(1);
         }
 
-        MicroRosDiagnostics_ReportIfDue(
-            &diagnostics, &debug_publisher, now);
-        osDelay(1);
+        /* No more executor spins are allowed after declaring the link lost,
+           so a queued motion command cannot refresh the motor watchdog. */
+        destroy_microros_entities(false);
+        osDelay(AGENT_RETRY_DELAY_MS);
     }
 }

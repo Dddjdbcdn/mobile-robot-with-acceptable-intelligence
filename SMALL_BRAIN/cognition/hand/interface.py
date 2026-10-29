@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 import time
 
 from cognition.hand.gestures import FrameConfirmation, HandGestureClassifier
+from services.diagnostic_session import smallbrain_diagnostics
 
 
 class HandGestureInterface:
@@ -33,6 +35,10 @@ class HandGestureInterface:
         self._latest_status = None
         self._armed_gesture = None
         self._armed_frames_remaining = 0
+        self._diagnostic_decision = "starting"
+        self._command_dispatch_count = 0
+        self._last_command = None
+        self._last_sequence = None
 
         self._idle_welcome = FrameConfirmation(
             "welcome",
@@ -93,7 +99,16 @@ class HandGestureInterface:
         """Send semantic input without knowing or owning robot actions."""
         if self._dispatch_handler is None:
             raise RuntimeError("Hand gesture dispatcher is not configured")
-        return await self._dispatch_handler(command, data)
+        result = await self._dispatch_handler(command, data)
+        if command != "observe_gesture":
+            self._command_dispatch_count += 1
+            self._last_command = {
+                "name": command,
+                "data": data,
+                "count": self._command_dispatch_count,
+                "timestamp": datetime.now().astimezone().isoformat(),
+            }
+        return result
 
     @staticmethod
     def classify_hand_pose(hand):
@@ -127,6 +142,61 @@ class HandGestureInterface:
         self._reset_sequence()
         self._idle_welcome.reset()
         self._movement_push.reset()
+
+    @staticmethod
+    def _confirmation_status(confirmation):
+        return {
+            "count": confirmation.count,
+            "required": confirmation.required_frames,
+            "misses": confirmation.misses,
+            "miss_tolerance": confirmation.miss_tolerance,
+            "latched": confirmation.latched,
+        }
+
+    def _write_diagnostic_status(self, status):
+        """Update the gesture section of the central diagnostics snapshot."""
+        confirmations = {
+            "idle_welcome": self._confirmation_status(self._idle_welcome),
+            "tracking_stop": self._confirmation_status(
+                self._tracking_thumb_up),
+            "movement_stop": self._confirmation_status(self._movement_push),
+            "tracking_direction": {
+                name: self._confirmation_status(item)
+                for name, item in self._tracking_direction_confirmations.items()
+            },
+            "modifier": {
+                name: self._confirmation_status(item)
+                for name, item in self._modifier_confirmations.items()
+            },
+            "command": {
+                name: self._confirmation_status(item)
+                for name, item in self._command_confirmations.items()
+            },
+        }
+        debug = status.get("debug") or {}
+        event = {
+            "sequence": status.get("sequence"),
+            "inference_sequence": status.get("inference_sequence"),
+            "state": status.get("state"),
+            "gesture": status.get("gesture"),
+            "modifier": self._armed_gesture,
+            "modifier_frames_remaining": self._armed_frames_remaining,
+            "decision": self._diagnostic_decision,
+            "person_detected": status.get("person") is not None,
+            "hand_detected": status.get("hand") is not None,
+            "palm_center": debug.get("palm_center"),
+            "gesture_checks": debug.get("gesture_checks"),
+            "confirmations": confirmations,
+            "commands_dispatched": self._command_dispatch_count,
+            "last_command": self._last_command,
+            "last_sequence": self._last_sequence,
+        }
+        smallbrain_diagnostics.update(
+            "hand_gesture",
+            event,
+            tally_group="gestures",
+            tally_value=status.get("gesture") or "unavailable",
+        )
 
     async def _sample(self, yolo):
         frame_source = None
@@ -187,6 +257,7 @@ class HandGestureInterface:
             "debug": pose,
             "armed_gesture": self._armed_gesture,
         }
+        self._write_diagnostic_status(self._latest_status)
 
     @classmethod
     def _welcome_person_candidate(cls, detections, palm_center):
@@ -222,16 +293,20 @@ class HandGestureInterface:
         tracking_person = bool(context.get("tracking_person"))
         if context.get("movement_active"):
             if context.get("mode") == "following":
+                self._diagnostic_decision = "following_waiting_for_thumb_up"
                 self._reset_command_sequence()
                 # During follow, push is a continuous hand-position override
                 # that asks the base to restore its normal standoff.
                 self._movement_push.reset()
                 if self._tracking_thumb_up.observe(gesture):
+                    self._diagnostic_decision = "stop_follow_dispatched"
                     await self._dispatch("stop_follow", reason="HAND_THUMB_UP")
                     self._reset_all()
             else:
+                self._diagnostic_decision = "movement_waiting_for_push"
                 self._reset_sequence()
                 if self._movement_push.observe(gesture):
+                    self._diagnostic_decision = "stop_movement_dispatched"
                     await self._dispatch("stop_movement", reason="HAND_PUSH")
             return context
 
@@ -243,7 +318,11 @@ class HandGestureInterface:
                 palm_center,
             )
             observed_gesture = gesture if welcome_person is not None else None
+            self._diagnostic_decision = (
+                "idle_confirming_welcome" if welcome_person is not None else
+                "idle_no_person_bound_to_hand")
             if self._idle_welcome.observe(observed_gesture):
+                self._diagnostic_decision = "watch_target_dispatched"
                 await self._dispatch(
                     "watch_target",
                     target="person",
@@ -254,6 +333,7 @@ class HandGestureInterface:
             return context
 
         if self._tracking_thumb_up.observe(gesture):
+            self._diagnostic_decision = "stop_watching_dispatched"
             await self._dispatch("stop_watching_target",
                                  reason="HAND_THUMB_UP")
             self._reset_all()
@@ -266,6 +346,7 @@ class HandGestureInterface:
         for name, confirmation in (
                 self._tracking_direction_confirmations.items()):
             if confirmation.observe(gesture):
+                self._diagnostic_decision = f"{name}_navigation_dispatched"
                 await self._dispatch(
                     "explicit_navigation",
                     local_command=person_movements[name],
@@ -275,38 +356,60 @@ class HandGestureInterface:
                 return context
 
         if self._armed_gesture is None:
+            self._diagnostic_decision = "tracking_waiting_for_modifier"
             for name, confirmation in self._modifier_confirmations.items():
                 if confirmation.observe(gesture):
                     self._armed_gesture = name
                     self._armed_frames_remaining = self.COMMAND_TIMEOUT_FRAMES
                     for item in self._command_confirmations.values():
                         item.reset()
+                    self._diagnostic_decision = f"modifier_{name}_armed"
                     break
             return context
 
         self._armed_frames_remaining -= 1
+        self._diagnostic_decision = "modifier_armed_waiting_for_command"
         if self._armed_frames_remaining <= 0:
+            self._diagnostic_decision = "modifier_timed_out"
             self._reset_sequence()
             return context
 
         for name, confirmation in self._command_confirmations.items():
             if confirmation.observe(gesture):
+                self._diagnostic_decision = f"command_{name}_confirmed"
                 await self._execute_sequence(self._armed_gesture, name)
                 break
         return context
 
     async def _execute_sequence(self, modifier, command):
+        self._last_sequence = {
+            "modifier": modifier,
+            "command_gesture": command,
+            "modifier_confirmation": self._confirmation_status(
+                self._modifier_confirmations[modifier]),
+            "command_confirmation": self._confirmation_status(
+                self._command_confirmations[command]),
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "outcome": "unsupported_modifier_command_pair",
+        }
         self._reset_sequence()
 
         if modifier == "welcome" and command == "follow":
+            self._diagnostic_decision = "follow_person_dispatched"
+            self._last_sequence["outcome"] = "follow_person_dispatched"
             await self._dispatch("follow_person", target="person")
             return
 
         if modifier == "welcome" and command == "finger_curl_up":
+            self._diagnostic_decision = "approach_target_dispatched"
+            self._last_sequence["outcome"] = "approach_target_dispatched"
             await self._dispatch("approach_target", target="hand")
             return
 
         if modifier == "push" and command == "get_space":
+            self._diagnostic_decision = "open_space_navigation_dispatched"
+            self._last_sequence["outcome"] = (
+                "open_space_navigation_dispatched")
             await self._dispatch(
                 "explicit_navigation",
                 local_command="open_space_middle",
@@ -316,12 +419,18 @@ class HandGestureInterface:
             return
 
         if modifier == "push" and command == "finger_curl_down":
+            self._diagnostic_decision = "backward_navigation_dispatched"
+            self._last_sequence["outcome"] = (
+                "backward_navigation_dispatched")
             await self._dispatch(
                 "explicit_navigation",
                 local_command="nudge_backward",
                 room_id=None,
                 face_person=True,
             )
+            return
+
+        self._diagnostic_decision = "unsupported_modifier_command_pair"
 
     async def run(self, yolo):
         self._running = True

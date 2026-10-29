@@ -1,5 +1,6 @@
 #include "range.h"
 #include "main.h"
+#include "microros_dma_transport.h"
 #include "usart.h"
 volatile uint16_t range_mm[3];
 volatile uint8_t range_measurement_valid[3];
@@ -11,12 +12,15 @@ volatile uint32_t range_response_frame_count[3];
 volatile uint32_t range_valid_frame_count[3];
 volatile uint32_t range_checksum_error_count[3];
 volatile uint32_t range_rejected_frame_count[3];
+volatile uint16_t range_last_status_code[3];
 volatile uint16_t range_last_reject_code[3];
 volatile uint32_t range_uart_error_count[3];
 volatile uint32_t range_restart_count[3];
 
 #define RANGE_RETRY_INTERVAL_MS 1000U
 #define RANGE_RESTART_AGE_MS    1000U
+#define VL53L1X_STATUS_VALID     0U
+#define VL53L1X_STATUS_WRAP      7U
 
 typedef struct
 {
@@ -162,8 +166,10 @@ static void Parse_VL53L1X_Byte(VL53L1X_Receiver *receiver)
 
         if (checksum != receiver->frame[7]) {
             range_checksum_error_count[receiver->output_index]++;
-        } else if (range_status != 0U) {
+        } else if (range_status != VL53L1X_STATUS_VALID &&
+                   range_status != VL53L1X_STATUS_WRAP) {
             uint32_t now = HAL_GetTick();
+            range_last_status_code[receiver->output_index] = range_status;
             range_last_response_ms[receiver->output_index] = now;
             range_response_frame_count[receiver->output_index]++;
             range_measurement_valid[receiver->output_index] = 0U;
@@ -171,12 +177,16 @@ static void Parse_VL53L1X_Byte(VL53L1X_Receiver *receiver)
             range_last_reject_code[receiver->output_index] = range_status;
             range_last_rejected_ms[receiver->output_index] = now;
         } else {
+            /* Experimental policy: publish status 7 as requested.  The
+             * VL53L1X calls this a wrap-target failure, so the distance can
+             * look plausible while still being ambiguous. */
             uint16_t distance =
                 ((uint16_t)receiver->frame[4] << 8) |
                 receiver->frame[5];
             uint32_t now = HAL_GetTick();
 
             range_mm[receiver->output_index] = distance;
+            range_last_status_code[receiver->output_index] = range_status;
             range_measurement_valid[receiver->output_index] = 1U;
             range_last_response_ms[receiver->output_index] = now;
             range_last_valid_ms[receiver->output_index] = now;
@@ -231,10 +241,12 @@ static void Parse_TFminiS_Byte(uint8_t byte)
                 distance != 0xFFFC)
             {
                 range_mm[1] = distance * 10U;
+                range_last_status_code[1] = 0U;
                 range_measurement_valid[1] = 1U;
                 range_last_valid_ms[1] = now;
                 range_valid_frame_count[1]++;
             } else {
+                range_last_status_code[1] = distance;
                 range_measurement_valid[1] = 0U;
                 range_rejected_frame_count[1]++;
                 range_last_reject_code[1] = distance;
@@ -293,7 +305,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART2)
+    if (huart->Instance == USART1)
+    {
+        MicroRosTransport_RequestRxRestart();
+    }
+    else if (huart->Instance == USART2)
     {
         range_uart_error_count[0]++;
         HAL_UART_AbortReceive(huart);

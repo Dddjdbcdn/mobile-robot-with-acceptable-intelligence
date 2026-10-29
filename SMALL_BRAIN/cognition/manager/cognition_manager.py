@@ -12,6 +12,7 @@ from actions.action_result import ActionResult
 from actions.navigation_action import PERSON_RELATIVE_COMMANDS
 from cognition.manager.action_reporting import action_envelope
 from cognition.manager.action_state import ActionState
+from services.diagnostic_session import smallbrain_diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +119,7 @@ class CognitionManager:
         self._proximity_candidate_count = 0
         self._hand_location = None
         self._hand_approach_started_at = None
+        self._diagnostic_state = {}
         self._lift_reset_active = False
         self._last_lift_state = None
 
@@ -131,6 +133,33 @@ class CognitionManager:
 
         self.proximity_cooldown = proximity_cooldown
         self.hand_gesture_interface.set_dispatcher(self.handle_hand_command)
+
+    @staticmethod
+    def _diagnostic_result(result):
+        if result is None:
+            return None
+        return {
+            "action_id": getattr(result, "action_id", None),
+            "action_type": getattr(result, "action_type", None),
+            "status": getattr(result, "status", None),
+            "target": getattr(result, "target", None),
+            "outcome": getattr(result, "outcome", None),
+            "reason_code": getattr(result, "reason_code", None),
+            "data": dict(getattr(result, "data", {}) or {}),
+        }
+
+    def _write_cognition_debug(self, **state):
+        try:
+            current = dict(getattr(self, "_diagnostic_state", {}) or {})
+            current.update(state)
+            self._diagnostic_state = current
+            smallbrain_diagnostics.update("cognition", current)
+        except Exception:
+            return
+
+    @staticmethod
+    def _record_cognition_event(event, **data):
+        smallbrain_diagnostics.record_event("cognition", event, **data)
 
     async def handle_tool_call(
         self,
@@ -161,6 +190,12 @@ class CognitionManager:
             )
             return
         self.navigation_action.handle_navigation_event(message)
+        if message.get("event") == "navigation":
+            self._write_cognition_debug(
+                navigation_event=dict(message),
+            )
+            self._record_cognition_event(
+                "navigation_event", payload=dict(message))
         await self.follow_person_executor.handle_navigation_event(message)
         self.map_navigation_action.handle_navigation_event(message)
 
@@ -228,6 +263,14 @@ class CognitionManager:
                     self._hand_location = None
                 if isinstance(seed, dict):
                     self._hand_location = dict(seed)
+                    self._write_cognition_debug(
+                        hand_location_valid=True,
+                        hand_location={
+                            key: seed.get(key)
+                            for key in ("x", "y", "angle", "tof_range",
+                                        "captured_at", "validated_at")
+                        },
+                    )
                     if following:
                         await self.follow_person_executor.update_hand_target_override(
                             seed, gesture=gesture)
@@ -247,12 +290,35 @@ class CognitionManager:
             if not (self.navigation_action.active
                     and self.navigation_action.mode == "approach"):
                 self._hand_approach_started_at = None
+            self._write_cognition_debug(
+                gesture=gesture,
+                hand_location_valid=self._hand_location is not None,
+                navigation={
+                    "active": bool(self.navigation_action.active),
+                    "mode": self.navigation_action.mode,
+                    "action_id": getattr(
+                        self.navigation_action, "action_id", None),
+                },
+            )
             return self.action_state.gesture_context
 
         arguments = dict(data)
         if command == "approach_target":
             location = self._hand_location
             if location is None:
+                self._write_cognition_debug(
+                    last_hand_command={
+                        "command": command,
+                        "accepted": False,
+                        "reason": "HAND_LOCATION_UNAVAILABLE",
+                    },
+                    hand_location_valid=False,
+                )
+                self._record_cognition_event(
+                    "hand_command_rejected",
+                    command=command,
+                    reason="HAND_LOCATION_UNAVAILABLE",
+                )
                 return False
             arguments.update({
                 "location": dict(location),
@@ -273,12 +339,33 @@ class CognitionManager:
         self.track_action.clear_visual_target_override()
 
         request_id = uuid.uuid4().hex
+        call_id = f"hand-gesture-{request_id}"
+        action_id = f"hand-{request_id}"
+        self._write_cognition_debug(
+            last_hand_command={
+                "command": command,
+                "accepted": True,
+                "call_id": call_id,
+                "action_id": action_id,
+                "location": ({
+                    key: arguments["location"].get(key)
+                    for key in ("x", "y", "angle", "tof_range")
+                } if isinstance(arguments.get("location"), dict) else None),
+            },
+            hand_location_valid=False,
+        )
+        self._record_cognition_event(
+            "hand_command_queued",
+            command=command,
+            call_id=call_id,
+            action_id=action_id,
+        )
         await self.events.put(
             ToolRequest(
                 function_name=command,
                 arguments=arguments,
-                call_id=f"hand-gesture-{request_id}",
-                action_id=f"hand-{request_id}",
+                call_id=call_id,
+                action_id=action_id,
                 response_metadata={
                     "source": "hand_gesture",
                     "silent": True,
@@ -776,6 +863,14 @@ class CognitionManager:
                 },
             )
         self.action_results.append(result)
+        self._write_cognition_debug(
+            action_phase="started",
+            action_result=self._diagnostic_result(result),
+        )
+        self._record_cognition_event(
+            "action_started",
+            result=self._diagnostic_result(result),
+        )
 
         if not event.request.silent:
             await self.response_manager.send_function_output(
@@ -835,6 +930,14 @@ class CognitionManager:
                 },
             )
         self.action_results.append(result)
+        self._write_cognition_debug(
+            action_phase="finished",
+            action_result=self._diagnostic_result(result),
+        )
+        self._record_cognition_event(
+            "action_finished",
+            result=self._diagnostic_result(result),
+        )
 
         if not event.request.silent:
             summary = ("🌳 [ACTION LIFECYCLE FINISHED] " + json.dumps(

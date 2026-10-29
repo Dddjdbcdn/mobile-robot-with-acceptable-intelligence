@@ -7,15 +7,27 @@
       <RateController hz="2.0">
         <RecoveryNode number_of_retries="3" name="ComputeFollowPath">
           <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
-            <ComputePathToPose goal="{updated_goal}" path="{follow_path}"
-              planner_id="{selected_planner}"
-              error_code_id="{compute_path_error_code}"
-            />
+            <Fallback name="ReplanFollowPathWhenNeeded">
+              <ReactiveSequence name="ReuseValidFollowPath">
+                <Inverter>
+                  <PathExpiringTimer seconds="5.0" path="{follow_path}"/>
+                </Inverter>
+                <Inverter>
+                  <GlobalUpdatedGoal goal="{updated_goal}"/>
+                </Inverter>
+                <IsPathValid path="{follow_path}"/>
+              </ReactiveSequence>
+              <ComputeFollowPathToPose goal="{updated_goal}"
+                path="{follow_path}"
+                planner_id="{selected_planner}"
+                error_code_id="{compute_path_error_code}"
+              />
+            </Fallback>
           </GoalUpdater>
           <Fallback name="RecoverComputeFollowPath">
-            <Sequence name="WaitForPlannerTf-Follow">
+            <Sequence name="WaitForTransientPlannerFailure-Follow">
               <AreErrorCodesPresent error_code="{compute_path_error_code}"
-                error_codes_to_check="202"/>
+                error_codes_to_check="202;204"/>
               <Wait wait_duration="0.25"/>
             </Sequence>
             <Sequence>
@@ -28,23 +40,29 @@
         </RecoveryNode>
       </RateController>
       <KeepRunningUntilFailure>
-        <RecoveryNode number_of_retries="3" name="FollowPersonPath">
-          <FollowPath path="{follow_path}" controller_id="FollowPath"
-            goal_checker_id="approach_goal_checker"
-            error_code_id="{follow_path_error_code}"/>
-          <Fallback name="RecoverFollowPersonPath">
-            <Sequence name="WaitForControllerTf-Follow">
-              <AreErrorCodesPresent error_code="{follow_path_error_code}"
-                error_codes_to_check="102"/>
-              <Wait wait_duration="0.25"/>
-            </Sequence>
-            <Sequence>
-              <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-              <ClearEntireCostmap name="ClearLocalCostmap-Follow"
-                service_name="local_costmap/clear_entirely_local_costmap"/>
-            </Sequence>
-          </Fallback>
-        </RecoveryNode>
+        <Sequence name="FollowThenWaitForNewGoal">
+          <RecoveryNode number_of_retries="3" name="FollowPersonPath">
+            <FollowPath path="{follow_path}" controller_id="FollowPath"
+              goal_checker_id="approach_goal_checker"
+              error_code_id="{follow_path_error_code}"/>
+            <Fallback name="RecoverFollowPersonPath">
+              <Sequence name="WaitForControllerTf-Follow">
+                <AreErrorCodesPresent error_code="{follow_path_error_code}"
+                  error_codes_to_check="102"/>
+                <Wait wait_duration="0.25"/>
+              </Sequence>
+              <Sequence>
+                <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+                <ClearEntireCostmap name="ClearLocalCostmap-Follow"
+                  service_name="local_costmap/clear_entirely_local_costmap"/>
+              </Sequence>
+            </Fallback>
+          </RecoveryNode>
+          <ReactiveFallback name="WaitForNewFollowGoal">
+            <GlobalUpdatedGoal goal="{updated_goal}"/>
+            <Wait wait_duration="86400.0"/>
+          </ReactiveFallback>
+        </Sequence>
       </KeepRunningUntilFailure>
     </PipelineSequence>
   </BehaviorTree>

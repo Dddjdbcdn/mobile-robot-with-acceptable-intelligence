@@ -28,6 +28,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from robot.person_pose.follow_goal_generator import FollowGoalGenerator
+from robot.map.map_stream import MapAnalysisTimeout
 
 
 NAVIGATION_COMMANDS = {
@@ -43,6 +44,14 @@ SEQUENCE_COMMANDS = {
     "open_space_middle", "exit_room", "go_to_another_room",
 }
 ROOM_SEQUENCE_COMMANDS = {"exit_room", "go_to_another_room"}
+PERSON_RELATIVE_COMMANDS = {
+    "move_to_person_front", "move_to_person_right", "move_to_person_left",
+}
+NUDGE_COMMANDS = {
+    "nudge_forward", "nudge_backward", "nudge_left", "nudge_right",
+}
+ROBOT_WINDOW_METERS = 6.0
+SMALL_WINDOW_METERS = 3.0
 
 
 @dataclass
@@ -84,7 +93,7 @@ class NavigationController:
     PERSON_VISUAL_RECOVERY_SWEEP_RAD = math.pi
     PERSON_VISUAL_RECOVERY_TIMEOUT_SECONDS = 8.0
     FATAL_FOLLOW_ERROR_CODES = {101, 103, 201}
-    MAP_UPDATE_TIMEOUT_SECONDS = 5.0
+    MAP_UPDATE_TIMEOUT_SECONDS = 3.0
 
     def __init__(
         self,
@@ -828,6 +837,22 @@ class NavigationController:
 
     # Explicit, local, and approach navigation -------------------------
 
+    def _person_state_in_frame(self, frame_id):
+        person = self.get_person_state()
+        if not isinstance(person, dict):
+            return None
+        source_frame = str(person.get("frame_id") or frame_id)
+        if source_frame == frame_id:
+            return dict(person)
+        point = self.map_stream.transform_point(
+            person["x"], person["y"], source_frame, frame_id
+        )
+        if point is None:
+            return None
+        transformed = dict(person)
+        transformed.update(x=float(point[0]), y=float(point[1]), frame_id=frame_id)
+        return transformed
+
     def navigate_to_pose(self, request, approach=False):
         try:
             destination = {
@@ -837,7 +862,9 @@ class NavigationController:
                 "frame_id": str(request.get("frame_id", "base_footprint")),
             }
             if approach:
-                prepared, pose = self.map_stream.prepare_map()
+                prepared, pose = self.map_stream.prepare_global_costmap_window(
+                    ROBOT_WINDOW_METERS
+                )
                 destination = self.map_stream.logic.resolve_approach_destination(
                     prepared,
                     pose,
@@ -863,31 +890,85 @@ class NavigationController:
 
     def navigate_local(self, request):
         try:
-            prepared, pose = self.map_stream.prepare_map()
-            start_pose = dict(pose)
-            self.stop()
             local_command = str(request.get("local_command") or "")
             if local_command in {"go_to_room", "return_to_initial_place"}:
+                _, pose = self.map_stream.prepare_map()
+                start_pose = dict(pose)
                 room_id = (
                     1
                     if local_command == "return_to_initial_place"
                     else request.get("room_id")
                 )
                 destination = self.map_stream.room_registry.destination(room_id)
+            elif local_command == "previous_position":
+                robot_pose = self.get_robot_pose()
+                if not isinstance(robot_pose, dict):
+                    raise ValueError("robot pose is unavailable")
+                start_pose = dict(robot_pose)
+                if not isinstance(self.previous_pose, dict):
+                    raise ValueError("previous position is unavailable")
+                destination = {
+                    "x": float(self.previous_pose["x"]),
+                    "y": float(self.previous_pose["y"]),
+                    "angle": float(self.previous_pose.get("yaw", 0.0)),
+                    "frame_id": str(
+                        self.previous_pose.get("frame_id") or "map"
+                    ),
+                }
+                if bool(request.get("face_person")):
+                    person = self._person_state_in_frame(
+                        destination["frame_id"]
+                    )
+                    if person is not None:
+                        destination["angle"] = math.atan2(
+                            float(person["y"]) - destination["y"],
+                            float(person["x"]) - destination["x"],
+                        )
             else:
+                raw_person = self.get_person_state()
+                if (
+                    local_command in PERSON_RELATIVE_COMMANDS
+                    and not isinstance(raw_person, dict)
+                ):
+                    raise ValueError("fresh person pose is unavailable")
+                window_center = (
+                    raw_person
+                    if local_command in PERSON_RELATIVE_COMMANDS else None
+                )
+                window_size = (
+                    SMALL_WINDOW_METERS
+                    if local_command in PERSON_RELATIVE_COMMANDS | NUDGE_COMMANDS
+                    else ROBOT_WINDOW_METERS
+                )
+                prepared, pose = (
+                    self.map_stream.prepare_global_costmap_window(
+                        window_size, center=window_center
+                    )
+                )
+                robot_pose = self.get_robot_pose()
+                start_pose = (
+                    dict(robot_pose) if isinstance(robot_pose, dict) else dict(pose)
+                )
                 destination = self.map_stream.logic.resolve_local_destination(
                     prepared,
                     pose,
                     local_command,
-                    previous_pose=self.previous_pose,
-                    person_pose=self.get_person_state(),
+                    previous_pose=None,
+                    person_pose=self._person_state_in_frame(pose["frame_id"]),
                     face_person=bool(request.get("face_person")),
                 )
+            self.stop()
             error = self._send_goal(destination, request.get("action_id"), "local")
             if error:
                 raise ValueError(error)
             self.previous_pose = start_pose
             return {"status": "accepted"}
+        except MapAnalysisTimeout as error:
+            return {
+                "status": "error",
+                "message": str(error),
+                "reason_code": error.reason_code,
+            }
         except (KeyError, TypeError, ValueError) as error:
             return {"status": "error", "message": str(error)}
 
@@ -898,7 +979,13 @@ class NavigationController:
             command = str(request.get("sequence_command") or "")
             if command not in SEQUENCE_COMMANDS:
                 raise ValueError(f"Unknown navigation sequence: {command}")
-            prepared, pose = self.map_stream.prepare_map()
+            prepared, pose = (
+                self.map_stream.prepare_global_costmap_window(
+                    ROBOT_WINDOW_METERS
+                )
+                if command == "open_space_middle"
+                else self.map_stream.prepare_map()
+            )
             start_pose = dict(pose)
             self.stop()
             self.sequence = {
@@ -912,6 +999,13 @@ class NavigationController:
             self._advance_sequence(prepared, pose)
             self.previous_pose = start_pose
             return {"status": "accepted"}
+        except MapAnalysisTimeout as error:
+            self.sequence = None
+            return {
+                "status": "error",
+                "message": str(error),
+                "reason_code": error.reason_code,
+            }
         except (KeyError, TypeError, ValueError) as error:
             self.sequence = None
             return {"status": "error", "message": str(error)}
@@ -936,7 +1030,10 @@ class NavigationController:
                 prepared,
                 pose,
                 state,
-                person_pose=self.get_person_state() if sequence["face_person"] else None,
+                person_pose=(
+                    self._person_state_in_frame(pose["frame_id"])
+                    if sequence["face_person"] else None
+                ),
                 face_person=sequence["face_person"],
             )
 
@@ -988,8 +1085,19 @@ class NavigationController:
             self.node.destroy_timer(self.sequence_map_timer)
             self.sequence_map_timer = None
             try:
-                prepared, pose = self.map_stream.prepare_map()
+                prepared, pose = (
+                    self.map_stream.prepare_global_costmap_window(
+                        ROBOT_WINDOW_METERS
+                    )
+                    if sequence["command"] == "open_space_middle"
+                    else self.map_stream.prepare_map()
+                )
                 self._advance_sequence(prepared, pose)
+            except MapAnalysisTimeout as error:
+                self.logger.warning(f"Navigation map analysis timed out: {error}")
+                self._finish_sequence(
+                    "failed", "map_too_large", error.reason_code
+                )
             except (KeyError, TypeError, ValueError) as error:
                 self.logger.warning(f"Navigation sequence resolution failed: {error}")
                 self._finish_sequence(

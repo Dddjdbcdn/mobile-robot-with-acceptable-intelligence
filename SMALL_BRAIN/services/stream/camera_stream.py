@@ -16,7 +16,7 @@ class CameraSnapshot:
 
 class CameraStream:
     USB_RECONNECT_DELAY = 0.5
-    USB_READ_FAILURE_LIMIT = 5
+    USB_READ_FAILURE_LIMIT = 1
 
     USB_CONTROL_ENV = {
         "USB_CAMERA_BRIGHTNESS": "brightness",

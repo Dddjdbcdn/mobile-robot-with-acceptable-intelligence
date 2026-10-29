@@ -29,6 +29,16 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
 
+    microros_recorder = Node(
+        package='robot',
+        executable='microros_recorder.py',
+        name='microros_recorder',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+        arguments=['--ros-args', '--log-level', 'rmw_cyclonedds_cpp:=error'],
+    )
+
     stm32_reset = ExecuteProcess(
         cmd=['st-flash', '--serial', '066BFF485270535067113035', 'reset'],
         output='screen',
@@ -60,6 +70,7 @@ def generate_launch_description():
     return LaunchDescription([
         start_agent_after_serial_setup,
         setup_serial,
+        microros_recorder,
         lidar_node,
         depth_camera_node,
     ])

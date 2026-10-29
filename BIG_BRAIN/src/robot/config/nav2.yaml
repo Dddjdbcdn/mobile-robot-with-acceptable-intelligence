@@ -25,6 +25,7 @@ bt_navigator:
       - blind_backup_plugin
       - DJGoalValidator_plugin
       - DJPathValidator_plugin
+      - compute_follow_path_to_pose_plugin
 
 controller_server:
   ros__parameters:
@@ -69,10 +70,10 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      vx_max: 0.5
+      vx_max: 0.65
       vx_min: -0.2
       vy_max: 0.5
-      wz_max: 2.5
+      wz_max: 3.0
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.5
@@ -172,6 +173,7 @@ local_costmap:
           max_obstacle_height: 2.0
           clearing: True
           marking: True
+          inf_is_valid: true
           data_type: "LaserScan"
           raytrace_max_range: 3.0
           raytrace_min_range: 0.0
@@ -238,7 +240,7 @@ local_costmap:
         clear_on_max_reading: true
       cliff_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
-        enabled: True
+        enabled: False
         observation_sources: "cliff_points"
         cliff_points:
           topic: /cliff_layer
@@ -259,14 +261,16 @@ global_costmap:
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map
-      rolling_window: false
+      rolling_window: true
+      width: 16
+      height: 16
       robot_base_frame: base_footprint
       transform_tolerance: 0.5
       footprint: "[ [0.12, 0.12], [0.12, -0.12], [-0.12, -0.12], [-0.12, 0.12] ]"
       footprint_padding: 0.05
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer","range_layer","obstacle_layer","stvl_layer","cliff_layer","inflation_layer"]
+      plugins: ["range_layer","obstacle_layer","stvl_layer","cliff_layer","inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -276,10 +280,11 @@ global_costmap:
           max_obstacle_height: 2.0
           clearing: True
           marking: True
+          inf_is_valid: true
           data_type: "LaserScan"
-          raytrace_max_range: 3.0
+          raytrace_max_range: 6.5
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 6.0
           obstacle_min_range: 0.0
         pointcloud:
           topic: /tof_pointcloud
@@ -335,12 +340,6 @@ global_costmap:
           horizontal_fov_angle: 1.019     # 58.4 degrees in radians
           decay_acceleration: 15.0
           model_type: 0
-      static_layer:
-        plugin: "nav2_costmap_2d::StaticLayer"
-        enabled: False
-        map_topic: /map
-        map_subscribe_transient_local: true
-        subscribe_to_updates: false
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: True
@@ -353,7 +352,7 @@ global_costmap:
         clear_on_max_reading: true
       cliff_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
-        enabled: True
+        enabled: False
         observation_sources: "cliff_points"
         cliff_points:
           topic: /cliff_layer

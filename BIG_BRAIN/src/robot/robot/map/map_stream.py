@@ -1,6 +1,7 @@
 """ROS/TF orchestration and ZeroMQ publication for map snapshots."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import threading
 import time
 import uuid
@@ -15,6 +16,13 @@ from robot.map.room_registry import RoomRegistry
 
 BASE_FRAME = "base_footprint"
 IMAGE_ENDPOINT = "tcp://127.0.0.1:5559"
+GLOBAL_MAP_TIMEOUT_SECONDS = 3.0
+
+
+class MapAnalysisTimeout(TimeoutError):
+    """The global map could not be analyzed within the transport budget."""
+
+    reason_code = "MAP_TOO_LARGE_FOR_ACTION"
 
 
 class MapImageStream:
@@ -49,6 +57,10 @@ class MapImageStream:
         self._map_revision = 0
         self._map_received_at_unix_ns = 0
         self.analysis_lock = threading.Lock()
+        self.window_analysis_lock = threading.Lock()
+        self.analysis_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="global-map-analysis"
+        )
         self.stop_event = threading.Event()
         self.sequence = 0
 
@@ -198,6 +210,13 @@ class MapImageStream:
              ty + sine * float(x) + cosine * float(y))
             for x, y in points
         ]
+
+    def transform_point(self, x, y, source_frame, target_frame):
+        """Transform one map-planning point, or return ``None`` without TF."""
+        points = self._transform_points(
+            [(float(x), float(y))], source_frame, target_frame
+        )
+        return points[0] if points else None
 
     def _diagnostic_overlays(self, target_frame):
         """Build bounded, target-frame overlay arrays for one snapshot."""
@@ -374,9 +393,32 @@ class MapImageStream:
                 normalized[key] = view[key]
         return normalized
 
-    def prepare_map(self):
-        """Analyze the latest messages into one map-and-pose context."""
-        with self.analysis_lock:
+    @staticmethod
+    def _map_timeout_message():
+        return (
+            f"Global map analysis exceeded {GLOBAL_MAP_TIMEOUT_SECONDS:.0f} seconds; "
+            "the map is too large to use this action"
+        )
+
+    def prepare_map(self, timeout=GLOBAL_MAP_TIMEOUT_SECONDS):
+        """Analyze the global map, returning control by the given deadline."""
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+        future = self.analysis_executor.submit(self._prepare_map_until, deadline)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout as error:
+            future.cancel()
+            raise MapAnalysisTimeout(self._map_timeout_message()) from error
+
+    def _prepare_map_until(self, deadline):
+        """Worker implementation with cooperative checks inside map analysis."""
+        acquired = self.analysis_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+        if not acquired:
+            raise MapAnalysisTimeout(self._map_timeout_message())
+        try:
             with self.state_lock:
                 map_msg = self.map_msg
                 cost_msg = self.cost_msg
@@ -397,12 +439,19 @@ class MapImageStream:
 
             started_at = time.monotonic()
             try:
-                prepared = self.logic.prepare(map_msg, cost_msg, pose)
+                prepared = self.logic.prepare(
+                    map_msg, cost_msg, pose, deadline=deadline
+                )
+            except TimeoutError as error:
+                raise MapAnalysisTimeout(self._map_timeout_message()) from error
             except Exception as error:
                 self.node.get_logger().warning(f"Map analysis: {error}")
                 raise ValueError(
                     f"Map analysis failed: {type(error).__name__}: {error}"
                 ) from error
+
+            if time.monotonic() >= deadline:
+                raise MapAnalysisTimeout(self._map_timeout_message())
 
             finished_at = time.monotonic()
             prepared["analysis_ms"] = round(
@@ -412,29 +461,140 @@ class MapImageStream:
             prepared["prepared_at_unix_ns"] = time.time_ns()
             prepared["map_revision"] = map_revision
             prepared["map_received_at_unix_ns"] = map_received_at_unix_ns
+            if time.monotonic() >= deadline:
+                raise MapAnalysisTimeout(self._map_timeout_message())
             self.room_registry.ensure_startup_room(prepared, pose)
+            if time.monotonic() >= deadline:
+                raise MapAnalysisTimeout(self._map_timeout_message())
             return prepared, pose
+        finally:
+            self.analysis_lock.release()
+
+    @staticmethod
+    def _crop_costmap(msg, center_x, center_y, size_m):
+        """Copy only a bounded square from an OccupancyGrid."""
+        from nav_msgs.msg import OccupancyGrid
+
+        resolution = float(msg.info.resolution)
+        if resolution <= 0.0:
+            raise ValueError("global costmap has invalid resolution")
+        size_m = float(size_m)
+        if not math.isfinite(size_m) or size_m <= 0.0:
+            raise ValueError("costmap window size must be positive and finite")
+
+        # Compute cell indices directly so this never converts or copies the
+        # complete growing global costmap into a NumPy array.
+        origin = msg.info.origin.position
+        orientation = msg.info.origin.orientation
+        yaw = math.atan2(
+            2 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        dx, dy = float(center_x) - origin.x, float(center_y) - origin.y
+        center_col = math.floor((cosine * dx + sine * dy) / resolution)
+        center_row = math.floor((-sine * dx + cosine * dy) / resolution)
+        source_width = int(msg.info.width)
+        source_height = int(msg.info.height)
+        if not (
+            0 <= center_col < source_width
+            and 0 <= center_row < source_height
+        ):
+            raise ValueError("costmap window center is outside the global costmap")
+
+        cells = max(1, math.ceil(size_m / resolution))
+        crop_width = min(cells, source_width)
+        crop_height = min(cells, source_height)
+        col0 = max(0, min(center_col - crop_width // 2, source_width - crop_width))
+        row0 = max(0, min(center_row - crop_height // 2, source_height - crop_height))
+
+        cropped = OccupancyGrid()
+        cropped.header = msg.header
+        cropped.info.resolution = resolution
+        cropped.info.width = crop_width
+        cropped.info.height = crop_height
+        cropped.info.map_load_time = msg.info.map_load_time
+        cropped.info.origin.orientation = orientation
+        offset_x = col0 * resolution
+        offset_y = row0 * resolution
+        cropped.info.origin.position.x = (
+            origin.x + cosine * offset_x - sine * offset_y
+        )
+        cropped.info.origin.position.y = (
+            origin.y + sine * offset_x + cosine * offset_y
+        )
+        cropped.info.origin.position.z = origin.z
+
+        data = []
+        for row in range(row0, row0 + crop_height):
+            start = row * source_width + col0
+            data.extend(msg.data[start:start + crop_width])
+        cropped.data = data
+        return cropped
+
+    def prepare_global_costmap_window(self, size_m, center=None):
+        """Analyze a bounded global-costmap window without full-map work."""
+        with self.window_analysis_lock:
+            with self.state_lock:
+                cost_msg = self.cost_msg
+            if cost_msg is None:
+                raise ValueError(
+                    "Waiting for OccupancyGrid on /global_costmap/costmap"
+                )
+            frame_id = str(cost_msg.header.frame_id)
+            pose = self._pose(frame_id)
+            if pose is None:
+                raise ValueError(
+                    f"TF unavailable: {frame_id} -> {self.base_frame}"
+                )
+            center_x, center_y = pose["x"], pose["y"]
+            if center is not None:
+                if not isinstance(center, dict):
+                    raise ValueError("costmap window center must be a pose")
+                source_frame = str(center.get("frame_id") or frame_id)
+                point = self.transform_point(
+                    center["x"], center["y"], source_frame, frame_id
+                )
+                if point is None:
+                    raise ValueError(
+                        f"TF unavailable: {source_frame} -> {frame_id}"
+                    )
+                center_x, center_y = point
+            window = self._crop_costmap(
+                cost_msg, center_x, center_y, size_m
+            )
+            return self.logic.prepare_window(window, pose), pose
 
     def _stream_loop(self):
         """Serve ordered map requests without background map analysis."""
-        self.socket = self.context.socket(zmq.REP)
-        self.socket.setsockopt(zmq.LINGER, 0)
-
-        try:
-            self.socket.bind(IMAGE_ENDPOINT)
-            poller = zmq.Poller()
-            poller.register(self.socket, zmq.POLLIN)
-
-            while not self.stop_event.is_set():
-                events = dict(poller.poll(timeout=100))
-                if self.socket in events:
-                    self._handle_request(self.socket.recv_json())
-        except Exception as error:
-            if not self.stop_event.is_set():
-                self.node.get_logger().error(f"Map stream: {error}")
-        finally:
-            self.socket.close(0)
-            self.socket = None
+        while not self.stop_event.is_set():
+            socket = self.context.socket(zmq.REP)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, 200)
+            socket.setsockopt(zmq.SNDTIMEO, 200)
+            socket.setsockopt(zmq.RCVHWM, 1)
+            socket.setsockopt(zmq.SNDHWM, 1)
+            self.socket = socket
+            try:
+                socket.bind(IMAGE_ENDPOINT)
+                while not self.stop_event.is_set():
+                    try:
+                        message = socket.recv_json()
+                        self._handle_request(message)
+                    except zmq.Again:
+                        continue
+            except zmq.ZMQError as error:
+                if not self.stop_event.is_set():
+                    self.node.get_logger().warning(
+                        f"Map stream transport reset: {error}"
+                    )
+            except Exception as error:
+                if not self.stop_event.is_set():
+                    self.node.get_logger().error(f"Map stream: {error}")
+            finally:
+                socket.close(linger=0)
+                if self.socket is socket:
+                    self.socket = None
 
     def _handle_request(self, message):
         try:
@@ -463,6 +623,14 @@ class MapImageStream:
                 return
             try:
                 prepared, pose = self.prepare_map()
+            except MapAnalysisTimeout as error:
+                self.socket.send_json({
+                    "ok": False,
+                    "error": str(error),
+                    "reason_code": error.reason_code,
+                    "retryable": False,
+                })
+                return
             except ValueError as error:
                 self.socket.send_json({
                     "ok": False,
@@ -727,3 +895,4 @@ class MapImageStream:
         self.stop_event.set()
         if self.stream_thread is not threading.current_thread():
             self.stream_thread.join()
+        self.analysis_executor.shutdown(wait=False, cancel_futures=True)

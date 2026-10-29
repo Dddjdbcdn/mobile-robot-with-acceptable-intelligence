@@ -27,6 +27,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "microros_diagnostics.h"
 
 /* USER CODE END Includes */
 
@@ -105,6 +106,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+
+  MicroRosDiagnostics_CaptureResetCause();
 
   /* USER CODE END 1 */
 

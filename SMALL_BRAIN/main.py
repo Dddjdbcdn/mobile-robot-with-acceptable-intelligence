@@ -15,6 +15,7 @@ import zmq.asyncio
 from typing import Any
 
 from services.display.camera_display import display_camera_loop
+from services.diagnostic_session import smallbrain_diagnostics
 
 from actions.search_action import SearchAction
 from actions.yolo_search_action import YoloSearchAction
@@ -27,6 +28,7 @@ from actions.map_navigation_action import MapNavigationAction
 from services.stream.audio_stream import AudioApp, send_mic_audio
 from services.stream.camera_stream import CameraStream
 from services.stream.map_client import MapClient
+from services.stream.robot_command_client import RobotCommandClient
 from services.stream.response_manager import ResponseManager
 
 from services.vision.groundingdino_service import GroundingDINOService
@@ -44,9 +46,6 @@ from cognition.manager.world_state import update_state
 
 context = zmq.asyncio.Context()
 
-zmq_req_socket = context.socket(zmq.REQ)
-zmq_req_socket.connect("tcp://localhost:5555")
-
 zmq_sub_socket = context.socket(zmq.SUB)
 zmq_sub_socket.connect("tcp://localhost:5556")
 zmq_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -58,8 +57,6 @@ person_tracker_pub_socket = context.socket(zmq.PUB)
 person_tracker_pub_socket.setsockopt(zmq.SNDHWM, 10)
 person_tracker_pub_socket.connect(
     os.environ.get("PERSON_TRACKER_ENDPOINT", "tcp://localhost:5560"))
-
-zmq_req_lock = asyncio.Lock()
 
 SMALL_BRAIN_ROOT = Path(__file__).resolve().parent
 IDENTITY_PATH = SMALL_BRAIN_ROOT / "database" / "identity.json"
@@ -393,6 +390,12 @@ async def main():
         context,
         endpoint=os.environ.get("MAP_STREAM_ENDPOINT", "tcp://127.0.0.1:5559"),
     )
+    robot_command_client = RobotCommandClient(
+        context,
+        endpoint=os.environ.get(
+            "ROBOT_COMMAND_ENDPOINT", "tcp://127.0.0.1:5555"
+        ),
+    )
 
     camera = CameraStream(
         camera_index=0,
@@ -437,13 +440,7 @@ async def main():
         await yolo.wait_until_ready()
         print("\n✅ YOLO IS READY")
 
-    async def send_robot_command(payload):
-        async with zmq_req_lock:
-            await zmq_req_socket.send_json(payload)
-            return await asyncio.wait_for(
-                zmq_req_socket.recv_json(),
-                timeout=5.0,
-            )
+    send_robot_command = robot_command_client.command
 
     headers = {
         "Authorization": "Bearer " + OPENAI_API_KEY,
@@ -612,6 +609,7 @@ async def main():
                     connection_status,
                     cognitive_manager,
                 ), person_tracking.run(), hand_gesture_interface.run(yolo),
+                smallbrain_diagnostics.run(),
                 wait_for_dino(),
                 wait_for_yolo())
     except websockets.exceptions.ConnectionClosed:
@@ -632,6 +630,7 @@ async def main():
         await yolo.close()
         await hand_landmarks.close()
         map_client.close()
+        robot_command_client.close()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ class MapClient:
         self,
         context,
         endpoint="tcp://127.0.0.1:5559",
-        timeout=8.0,
+        timeout=3.0,
         save_dir=None,
     ):
         self.context = context
@@ -89,14 +89,25 @@ class MapClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
-                    raise TimeoutError(last_error or "Timed out waiting for the map service")
+                    raise MapServiceError(
+                        "MAP_TOO_LARGE_FOR_ACTION",
+                        last_error or (
+                            "Global map was not usable within "
+                            f"{self.timeout:.1f} seconds"
+                        ),
+                    )
                 try:
                     parts = await self._exchange(payload, remaining)
                 except asyncio.TimeoutError as error:
                     if last_error is not None:
-                        raise RuntimeError(last_error) from error
-                    raise TimeoutError(
-                        f"Timed out waiting {self.timeout:.1f}s for the map service"
+                        message = last_error
+                    else:
+                        message = (
+                            f"Global map request exceeded {self.timeout:.1f} seconds; "
+                            "the map is too large or unavailable for this action"
+                        )
+                    raise MapServiceError(
+                        "MAP_TOO_LARGE_FOR_ACTION", message
                     ) from error
                 if len(parts) in {2, 3}:
                     metadata = json.loads(parts[0].decode("utf-8"))
@@ -120,13 +131,28 @@ class MapClient:
                 if response.get("ok"):
                     raise RuntimeError("Map service returned no snapshot")
                 last_error = response.get("error") or "Map is not ready"
+                reason_code = response.get("reason_code")
                 if response.get("retryable") is False:
+                    if reason_code:
+                        raise MapServiceError(reason_code, last_error)
                     raise RuntimeError(last_error)
                 if time.monotonic() + 0.1 >= deadline:
-                    raise RuntimeError(last_error)
+                    raise MapServiceError(
+                        "MAP_TOO_LARGE_FOR_ACTION",
+                        f"{last_error}; global map was not usable within "
+                        f"{self.timeout:.1f} seconds",
+                    )
                 await asyncio.sleep(0.1)
 
     def close(self):
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
+
+
+class MapServiceError(RuntimeError):
+    """A structured terminal failure returned by the BIG_BRAIN map service."""
+
+    def __init__(self, reason_code, message):
+        super().__init__(message)
+        self.reason_code = str(reason_code)

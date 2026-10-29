@@ -14,6 +14,7 @@ class _FollowGoalSettings:
     standoff_m: float = 0.60
     move_start_distance_m: float = 0.80
     hand_standoff_m: float = 0.25
+    max_goal_distance_m: float = 6.0
     position_update_m: float = 0.10
     yaw_update_deg: float = 20.0
 
@@ -78,6 +79,11 @@ class FollowGoalGenerator:
             travel = person_range - effective_standoff
             if target_mode != "push":
                 travel = max(0.0, travel)
+
+        # Keep the moving goal comfortably inside the rolling global costmap.
+        # A distant person is approached through successive goals as the
+        # window follows the robot instead of aborting with GOAL_OUTSIDE_MAP.
+        travel = min(travel, self.settings.max_goal_distance_m)
         goal_x = robot_x + travel * math.cos(lidar_bearing)
         goal_y = robot_y + travel * math.sin(lidar_bearing)
         destination_bearing = (

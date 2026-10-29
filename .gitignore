@@ -92,3 +92,7 @@ SMALL_BRAIN/database/memory.json
 *.db3
 *.mcap
 kernel.errors.txt
+diagnostics/microros-sessions/
+diagnostics/hand_gesture.jsonl*
+diagnostics/person_tracking.jsonl*
+diagnostics/smallbrain_sessions/

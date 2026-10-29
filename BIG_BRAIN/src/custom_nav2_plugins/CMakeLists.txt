@@ -17,6 +17,7 @@ find_package(behaviortree_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(nav2_behavior_tree REQUIRED)
 
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -88,6 +89,29 @@ target_compile_definitions(
 
 
 # -----------------------------------------------------------------------------
+# Follow-specific ComputePathToPose BT plugin
+# -----------------------------------------------------------------------------
+
+add_library(compute_follow_path_to_pose_plugin SHARED
+  src/compute_follow_path_to_pose.cpp
+)
+
+ament_target_dependencies(compute_follow_path_to_pose_plugin
+  rclcpp
+  behaviortree_cpp
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  nav2_behavior_tree
+)
+
+target_compile_definitions(
+  compute_follow_path_to_pose_plugin
+  PRIVATE BT_PLUGIN_EXPORT
+)
+
+
+# -----------------------------------------------------------------------------
 # Install plugin libraries
 # -----------------------------------------------------------------------------
 
@@ -96,6 +120,7 @@ install(
     blind_backup_plugin
     DJGoalValidator_plugin
     DJPathValidator_plugin
+    compute_follow_path_to_pose_plugin
 
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

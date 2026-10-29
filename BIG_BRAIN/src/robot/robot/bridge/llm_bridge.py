@@ -50,10 +50,7 @@ class LLMRosBridge(Node):
 
         # ZMQ transport to and from SMALL_BRAIN.
         self.zmq_context = zmq.Context()
-        self.rep_socket = self.zmq_context.socket(zmq.REP)
-        self.rep_socket.setsockopt(zmq.LINGER, 0)
-        self.rep_socket.setsockopt(zmq.RCVTIMEO, 200)
-        self.rep_socket.bind("tcp://*:5555")
+        self.rep_socket = self._create_command_socket()
         self.pub_socket = self.zmq_context.socket(zmq.PUB)
         self.pub_socket.setsockopt(zmq.LINGER, 0)
         self.pub_socket.bind("tcp://*:5556")
@@ -159,6 +156,23 @@ class LLMRosBridge(Node):
         )
         self.llm_thread.start()
         self.tracking_thread.start()
+
+    def _create_command_socket(self):
+        """Create a bounded REP socket; callers replace it after any ZMQ fault."""
+        socket = self.zmq_context.socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, 200)
+        socket.setsockopt(zmq.SNDTIMEO, 200)
+        socket.setsockopt(zmq.RCVHWM, 1)
+        socket.setsockopt(zmq.SNDHWM, 1)
+        socket.bind("tcp://*:5555")
+        return socket
+
+    def _reset_command_socket(self):
+        old_socket = self.rep_socket
+        if old_socket is not None:
+            old_socket.close(linger=0)
+        self.rep_socket = self._create_command_socket()
 
     # ROS state ---------------------------------------------------------
 
@@ -413,7 +427,14 @@ class LLMRosBridge(Node):
                     return
                 if rclpy.ok(context=self.context):
                     self.get_logger().error(f"LLM transport failed: {error}")
-                return
+                try:
+                    self._reset_command_socket()
+                except zmq.ZMQError as reset_error:
+                    if rclpy.ok(context=self.context):
+                        self.get_logger().error(
+                            f"LLM transport reset failed: {reset_error}"
+                        )
+                    return
             except Exception as error:
                 if (
                     not self._stop_event.is_set()

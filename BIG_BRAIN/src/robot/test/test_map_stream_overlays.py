@@ -1,10 +1,13 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import threading
 import time
 import unittest
 
-from robot.map.map_stream import MapImageStream
+from nav_msgs.msg import OccupancyGrid
+
+from robot.map.map_stream import MapAnalysisTimeout, MapImageStream
 
 
 def record(**values):
@@ -106,6 +109,41 @@ class MapStreamOverlayTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "between 1 and 20"):
             MapImageStream._normalize_crop_size(0)
+
+    def test_global_map_timeout_returns_control(self):
+        stream = MapImageStream.__new__(MapImageStream)
+        stream.analysis_executor = ThreadPoolExecutor(max_workers=1)
+        stream._prepare_map_until = lambda deadline: time.sleep(0.1)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(MapAnalysisTimeout):
+                stream.prepare_map(timeout=0.01)
+            self.assertLess(time.monotonic() - started, 0.08)
+        finally:
+            stream.analysis_executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_costmap_crop_copies_only_requested_square(self):
+        message = OccupancyGrid()
+        message.header.frame_id = "map"
+        message.info.resolution = 1.0
+        message.info.width = 10
+        message.info.height = 8
+        message.info.origin.orientation.w = 1.0
+        message.data = [index % 100 for index in range(80)]
+
+        cropped = MapImageStream._crop_costmap(
+            message, center_x=5.5, center_y=4.5, size_m=3.0
+        )
+
+        self.assertEqual((3, 3), (cropped.info.width, cropped.info.height))
+        self.assertEqual((4.0, 3.0), (
+            cropped.info.origin.position.x,
+            cropped.info.origin.position.y,
+        ))
+        self.assertEqual(
+            [34, 35, 36, 44, 45, 46, 54, 55, 56],
+            list(cropped.data),
+        )
 
 
 if __name__ == "__main__":

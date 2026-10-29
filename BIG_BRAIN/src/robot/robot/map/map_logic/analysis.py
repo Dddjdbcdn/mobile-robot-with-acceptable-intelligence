@@ -1,6 +1,7 @@
 """Costmap projection, reachability, and frontier analysis."""
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -9,14 +10,26 @@ from .grid import Grid
 
 
 class MapAnalysisMixin:
-    def prepare(self, map_msg, cost_msg, pose):
+    @staticmethod
+    def _check_deadline(deadline):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("global map analysis deadline exceeded")
+
+    def prepare(self, map_msg, cost_msg, pose, *, deadline=None):
+        """Prepare the complete SLAM map, including expensive frontiers."""
+        self._check_deadline(deadline)
         grid = Grid(map_msg)
         costmap = Grid(cost_msg)
         costs = self._costs_on_map(grid, costmap)
+        self._check_deadline(deadline)
         reachable = self._reachable(grid, costs, pose, self.cfg.clearance)
-        frontiers, frontier_mask = self._frontiers(grid, costs, pose)
+        self._check_deadline(deadline)
+        frontiers, frontier_mask = self._frontiers(
+            grid, costs, pose, deadline=deadline
+        )
         for index, frontier in enumerate(frontiers, 1):
             frontier["id"] = f"F{index}"
+        self._check_deadline(deadline)
         return {
             "frame_id": pose["frame_id"],
             "grid": grid,
@@ -25,6 +38,21 @@ class MapAnalysisMixin:
             "reachable": reachable,
             "frontiers": frontiers,
             "frontier_mask": frontier_mask,
+        }
+
+    def prepare_window(self, cost_msg, pose):
+        """Prepare one bounded costmap window for nearby commands."""
+        grid = Grid(cost_msg)
+        costs = np.asarray(grid.data, dtype=np.int16)
+        reachable = self._reachable(grid, costs, pose, self.cfg.clearance)
+        return {
+            "frame_id": pose["frame_id"],
+            "grid": grid,
+            "costmap": grid,
+            "costs": costs,
+            "reachable": reachable,
+            "frontiers": [],
+            "frontier_mask": np.zeros_like(grid.data, dtype=bool),
         }
 
     def _costs_on_map(self, grid, costmap):
@@ -83,14 +111,16 @@ class MapAnalysisMixin:
         )
         return connected & (safe | egress)
 
-    def _ray_gain(self, grid, row, col):
+    def _ray_gain(self, grid, row, col, *, deadline=None):
         visible = set()
         max_cells = self.cfg.frontier_gain_radius / grid.resolution
 
         distances = np.arange(0.5, max_cells + 0.5, 0.5)
-        for angle in np.linspace(
+        for ray_index, angle in enumerate(np.linspace(
             0, 2 * math.pi, self.cfg.frontier_rays, endpoint=False
-        ):
+        )):
+            if ray_index % 8 == 0:
+                self._check_deadline(deadline)
             cols = np.rint(col + math.cos(angle) * distances).astype(int)
             rows = np.rint(row + math.sin(angle) * distances).astype(int)
 
@@ -143,7 +173,7 @@ class MapAnalysisMixin:
 
         return np.asarray(selected, dtype=int)
 
-    def _useful_unknown(self, grid):
+    def _useful_unknown(self, grid, *, deadline=None):
         unknown = grid.data < 0
         count, labels = cv2.connectedComponents(
             unknown.astype(np.uint8),
@@ -154,6 +184,7 @@ class MapAnalysisMixin:
         h, w = unknown.shape
 
         for label in range(1, count):
+            self._check_deadline(deadline)
             component = labels == label
             rows, cols = np.nonzero(component)
 
@@ -174,8 +205,9 @@ class MapAnalysisMixin:
 
         return useful
 
-    def _frontiers(self, grid, costs, pose):
-        unknown = self._useful_unknown(grid)
+    def _frontiers(self, grid, costs, pose, *, deadline=None):
+        unknown = self._useful_unknown(grid, deadline=deadline)
+        self._check_deadline(deadline)
         reachable = self._reachable(grid, costs, pose)
 
         kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], np.uint8)
@@ -190,6 +222,7 @@ class MapAnalysisMixin:
         frontiers = []
 
         for label in range(1, count):
+            self._check_deadline(deadline)
             rows, cols = np.nonzero(labels == label)
             if len(rows) < min_cells:
                 continue
@@ -201,7 +234,9 @@ class MapAnalysisMixin:
             best = None
             for i in samples:
                 row, col = int(rows[i]), int(cols[i])
-                gain = self._ray_gain(grid, row, col)
+                gain = self._ray_gain(
+                    grid, row, col, deadline=deadline
+                )
                 if best is None or gain > best[0]:
                     best = gain, row, col
 
@@ -242,6 +277,7 @@ class MapAnalysisMixin:
         )
         selected = []
         for frontier in ranked:
+            self._check_deadline(deadline)
             if any(
                 math.hypot(
                     frontier["x"] - other["x"],
@@ -257,4 +293,3 @@ class MapAnalysisMixin:
             accepted[labels == frontier.pop("_component_label")] = True
 
         return selected, accepted
-

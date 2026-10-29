@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from cognition.hand.interface import HandGestureInterface
 
@@ -117,6 +118,44 @@ class WelcomePersonDispatchTests(unittest.IsolatedAsyncioTestCase):
         stop_calls = [item for item in calls if item[0] == "stop_follow"]
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(stop_calls[0][1]["reason"], "HAND_THUMB_UP")
+
+    async def test_diagnostic_json_preserves_sequence_and_is_rate_limited(self):
+        interface = HandGestureInterface(hand_landmarks=None)
+
+        async def dispatch(command, data):
+            if command == "observe_gesture":
+                return {"tracking_person": True, "movement_active": False}
+            return True
+
+        interface.set_dispatcher(dispatch)
+        for _ in range(interface.MODIFIER_CONFIRM_FRAMES):
+            await interface._observe_gesture("welcome", (0.5, 0.5), [])
+        for _ in range(interface.COMMAND_CONFIRM_FRAMES):
+            await interface._observe_gesture("follow", (0.5, 0.5), [])
+
+        status = {
+            "sequence": 12,
+            "inference_sequence": 7,
+            "state": "watching",
+            "gesture": "follow",
+            "person": {"class": "person"},
+            "hand": {"detected": True},
+            "debug": {"palm_center": (0.5, 0.5), "gesture_checks": {}},
+        }
+        with patch(
+            "cognition.hand.interface.smallbrain_diagnostics.update"
+        ) as update:
+            interface._write_diagnostic_status(status)
+            event = update.call_args.args[1]
+
+        self.assertEqual(event["commands_dispatched"], 1)
+        self.assertEqual(event["last_command"]["name"], "follow_person")
+        self.assertEqual(event["last_sequence"]["modifier"], "welcome")
+        self.assertEqual(event["last_sequence"]["command_gesture"], "follow")
+        self.assertEqual(
+            event["last_sequence"]["command_confirmation"]["count"],
+            interface.COMMAND_CONFIRM_FRAMES,
+        )
 
 
 if __name__ == "__main__":
